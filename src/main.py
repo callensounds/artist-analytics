@@ -16,8 +16,10 @@ except ImportError:  # The workers runtime exists on Cloudflare, not in local te
 app = FastAPI(title="Average Analytics")
 app.add_middleware(WorkerSessionMiddleware, fallback_secret=FALLBACK_SESSION_SECRET)
 
-_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
-templates = Jinja2Templates(directory=str(_TEMPLATE_DIR if _TEMPLATE_DIR.is_dir() else "templates"))
+# Keep templates next to this module. The Worker bundle includes src/, not the repo root,
+# so a ../templates path exists locally and 500s on every HTML route after deploy.
+_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
 # Demo login stays available even when accounts are only in memory.
 USERS = {

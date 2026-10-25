@@ -41,6 +41,28 @@ def setup_function():
     main.NEXT_ID = 2
 
 
+def test_templates_are_bundled_beside_the_worker_and_login_renders():
+    from pathlib import Path
+
+    module_dir = Path(main.__file__).resolve().parent
+    template_dir = Path(main.templates.env.loader.searchpath[0]).resolve()
+    assert template_dir == module_dir / "templates"
+    assert (template_dir / "login.html").is_file()
+    assert (template_dir / "base.html").is_file()
+    wrangler = (module_dir.parent / "wrangler.jsonc").read_text()
+    assert '"preview_urls": false' in wrangler
+    for name in ("base.html", "index.html", "login.html", "register.html", "dashboard.html"):
+        assert (template_dir / name).is_file()
+    client = TestClient(main.app)
+    home = client.get("/")
+    assert home.status_code == 200
+    assert "Average Analytics" in home.text
+    login = client.get("/login")
+    assert login.status_code == 200
+    assert "Welcome back" in login.text
+    assert "Average Analytics" in login.text
+
+
 def test_demo_login_and_dashboard_do_not_fabricate_metrics(monkeypatch):
     async def fake_collect(name, env=None, http=None, cache=None):
         return EMPTY
