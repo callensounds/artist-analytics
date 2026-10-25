@@ -13,7 +13,7 @@ try:
 except ImportError:  # The workers runtime exists on Cloudflare, not in local tests.
     asgi = None
 
-app = FastAPI(title="Artist Analytics")
+app = FastAPI(title="Average Analytics")
 app.add_middleware(WorkerSessionMiddleware, fallback_secret=FALLBACK_SESSION_SECRET)
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"

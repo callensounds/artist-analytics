@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Artist Analytics{% endblock %}</title>
+    <title>{% block title %}Average Analytics{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -28,7 +28,7 @@
             <div class="flex justify-between h-16 items-center">
                 <a href="/" class="flex items-center space-x-2 text-xl font-bold">
                     <span class="text-emerald-400">♪</span>
-                    <span>Artist Analytics</span>
+                    <span>Average Analytics</span>
                 </a>
                 <div class="flex items-center space-x-4">
                     {% if user is defined and user %}
@@ -49,7 +49,7 @@
     </main>
 
     <footer class="border-t border-slate-800 mt-16 py-8 text-center text-slate-500 text-sm">
-        Artist Analytics Beta — Exact timestamps & patterns that other platforms bury.
+        Average Analytics Beta — Exact timestamps & patterns that other platforms bury.
     </footer>
 </body>
 </html>

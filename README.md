@@ -1,4 +1,4 @@
-# Artist Analytics
+# Average Analytics
 
 Public release times and post times for an artist, on Cloudflare Python Workers (FastAPI).
 
