@@ -53,7 +53,7 @@ Cloudflare Workers Builds (Git-connected) should deploy this repo from `main`.
 uv run pywrangler deploy
 ```
 
-The Worker config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`). `public/` exists so the static assets directory in that config is valid. Routes are served by FastAPI (`run_worker_first`).
+The Worker config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`, `preview_urls` false). `public/` exists so the static assets directory in that config is valid. HTML templates live in `src/templates`. Wrangler uploads `**/*.html` from that directory with the Worker (its default module rules). A `templates/` directory at the repo root is outside the bundle, which is why HTML routes 500'd after deploy. Routes are served by FastAPI (`run_worker_first`).
 
 **Secrets**
 

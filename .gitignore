@@ -1,4 +1,7 @@
 .venv/
+.venv-workers/
+python_modules/
+pylock.toml
 __pycache__/
 .pytest_cache/
 .dev.vars
