@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Create Account — Artist Analytics{% endblock %}
+
+{% block content %}
+<div class="max-w-md mx-auto mt-12">
+    <h1 class="text-3xl font-bold mb-2">Claim your artist profile</h1>
+    <p class="text-slate-400 mb-8">Create an account to unlock your analytics dashboard.</p>
+
+    {% if error %}
+    <div class="bg-red-900/40 border border-red-700 text-red-200 px-4 py-3 rounded-lg mb-6">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" class="space-y-5">
+        <div>
+            <label class="block text-sm font-medium mb-1">Artist / Stage Name</label>
+            <input type="text" name="artist_name" required placeholder="e.g. Your Artist Name" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:border-emerald-500">
+        </div>
+        <div>
+            <label class="block text-sm font-medium mb-1">Email</label>
+            <input type="email" name="email" required class="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:border-emerald-500">
+        </div>
+        <div>
+            <label class="block text-sm font-medium mb-1">Password</label>
+            <input type="password" name="password" required minlength="6" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:border-emerald-500">
+        </div>
+        <button type="submit" class="w-full bg-emerald-500 hover:bg-emerald-600 py-3 rounded-lg font-semibold">Create Account</button>
+    </form>
+
+    <p class="text-center mt-6 text-slate-400">
+        Already have an account? <a href="/login" class="text-emerald-400 hover:underline">Log in</a>
+    </p>
+</div>
+{% endblock %}

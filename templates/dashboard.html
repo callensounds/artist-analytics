@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — {{ user.artist_name }}{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h1 class="text-4xl font-bold">{{ user.artist_name }}</h1>
+    <p class="text-slate-400">Your analytics overview — exact timestamps highlighted</p>
+</div>
+
+<!-- Metric Cards -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-10">
+    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <div class="text-slate-400 text-sm">Analytics Score</div>
+        <div class="text-3xl font-bold text-emerald-400">{{ demo_metrics.score }}</div>
+        <div class="text-xs text-slate-500 mt-1">{{ demo_metrics.rank }}</div>
+    </div>
+    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <div class="text-slate-400 text-sm">Career Stage</div>
+        <div class="text-2xl font-semibold">{{ demo_metrics.career_stage }}</div>
+        <div class="text-xs text-emerald-400 mt-1">{{ demo_metrics.momentum }}</div>
+    </div>
+    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <div class="text-slate-400 text-sm">Monthly Listeners</div>
+        <div class="text-2xl font-semibold">{{ demo_metrics.monthly_listeners }}</div>
+        <div class="text-xs text-slate-500">Spotify (demo)</div>
+    </div>
+    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <div class="text-slate-400 text-sm">Social Reach</div>
+        <div class="text-2xl font-semibold">{{ demo_metrics.tiktok_followers }}</div>
+        <div class="text-xs text-slate-500">TikTok (demo)</div>
+    </div>
+</div>
+
+<div class="grid lg:grid-cols-2 gap-8">
+    <!-- Releases -->
+    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
+        <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
+            <span class="text-emerald-400">📅</span> Exact Release Dates
+        </h2>
+        {% if releases %}
+        <div class="space-y-3 max-h-96 overflow-y-auto">
+            {% for r in releases %}
+            <div class="flex justify-between items-center py-2 border-b border-slate-700 last:border-0">
+                <div>
+                    <div class="font-medium">{{ r.title }}</div>
+                    <div class="text-xs text-slate-400">{{ r.type }}</div>
+                </div>
+                <div class="text-right">
+                    <div class="font-mono text-emerald-400">{{ r.date }}</div>
+                    <div class="text-xs text-slate-500">{{ r.weekday }}</div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-slate-400">No dated releases found for this artist name on MusicBrainz. Try registering with a well-known artist name to see real data.</p>
+        {% endif %}
+    </div>
+
+    <!-- Time-of-Day Placeholder + Chart -->
+    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
+        <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
+            <span class="text-emerald-400">⏱️</span> Post Time Patterns
+        </h2>
+        <p class="text-slate-400 text-sm mb-4">
+            {% if youtube_key_set %}
+            YouTube API key detected — full timestamps available in future update.
+            {% else %}
+            Set <code>YOUTUBE_API_KEY</code> env var for live upload times. Demo distribution shown below.
+            {% endif %}
+        </p>
+        <canvas id="timeChart" height="200"></canvas>
+    </div>
+</div>
+
+<!-- Insights -->
+<div class="mt-8 bg-slate-800 rounded-2xl p-6 border border-slate-700">
+    <h2 class="text-xl font-semibold mb-4">Key Insights</h2>
+    <ul class="space-y-2 text-slate-300">
+        <li>• Exact release dates let you see weekday patterns (many artists drop on Fridays).</li>
+        <li>• Time-of-day data from YouTube reveals when your audience is most likely to engage.</li>
+        <li>• Demo metrics show the dashboard layout; plug in Chartmetric/Songstats APIs for live social & streaming numbers.</li>
+        <li>• This is the differentiator vs aggregate-only tools: we surface the *when*.</li>
+    </ul>
+</div>
+
+<script>
+const ctx = document.getElementById('timeChart').getContext('2d');
+new Chart(ctx, {
+    type: 'bar',
+    data: {
+        labels: ['Morning', 'Afternoon', 'Evening', 'Night'],
+        datasets: [{
+            label: 'Posts / Uploads',
+            data: [12, 28, 35, 18],
+            backgroundColor: '#10b981',
+            borderRadius: 6
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+            y: { beginAtZero: true, grid: { color: '#334155' } },
+            x: { grid: { display: false } }
+        }
+    }
+});
+</script>
+{% endblock %}

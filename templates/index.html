@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Artist Analytics — Know Exactly When to Drop{% endblock %}
+
+{% block content %}
+<div class="text-center py-16">
+    <h1 class="text-5xl md:text-6xl font-bold mb-6">
+        Know the <span class="text-emerald-400">exact time</span><br>your music drops & posts
+    </h1>
+    <p class="text-xl text-slate-400 max-w-2xl mx-auto mb-10">
+        Most analytics tools hide timestamps or show “3 days ago.” We surface full dates, times of day, and patterns so you can optimize release strategy and understand your audience better.
+    </p>
+    <div class="flex justify-center gap-4">
+        <a href="/register" class="bg-emerald-500 hover:bg-emerald-600 px-8 py-3 rounded-xl font-semibold text-lg">Start Free</a>
+        <a href="/login" class="border border-slate-600 hover:border-slate-500 px-8 py-3 rounded-xl font-semibold text-lg">Login</a>
+    </div>
+</div>
+
+<div class="grid md:grid-cols-3 gap-6 mt-16">
+    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
+        <div class="text-emerald-400 text-3xl mb-4">📅</div>
+        <h3 class="text-xl font-semibold mb-2">Exact Release Dates</h3>
+        <p class="text-slate-400">Full first-release-date from MusicBrainz, including weekday. No more guessing.</p>
+    </div>
+    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
+        <div class="text-emerald-400 text-3xl mb-4">⏱️</div>
+        <h3 class="text-xl font-semibold mb-2">Time-of-Day Insights</h3>
+        <p class="text-slate-400">YouTube upload timestamps broken down by hour and morning/afternoon/evening/night.</p>
+    </div>
+    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
+        <div class="text-emerald-400 text-3xl mb-4">📊</div>
+        <h3 class="text-xl font-semibold mb-2">Competitive Overview</h3>
+        <p class="text-slate-400">Dashboard metrics styled after industry tools, with room to plug in deeper paid data sources.</p>
+    </div>
+</div>
+
+<div class="mt-20 text-center">
+    <h2 class="text-3xl font-bold mb-4">Why artists choose this over buried analytics</h2>
+    <p class="text-slate-400 max-w-3xl mx-auto">
+        Chartmetric and similar platforms are excellent for aggregate streams and social counts. They rarely highlight the precise moment content goes live. That timing data is gold for planning future drops, social campaigns, and understanding when your fans are most active.
+    </p>
+</div>
+{% endblock %}

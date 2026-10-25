@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Artist Analytics{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#10b981',
+                        darkbg: '#0f172a',
+                        card: '#1e293b'
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    {% block head %}{% endblock %}
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+    <nav class="border-b border-slate-700 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16 items-center">
+                <a href="/" class="flex items-center space-x-2 text-xl font-bold">
+                    <span class="text-emerald-400">♪</span>
+                    <span>Artist Analytics</span>
+                </a>
+                <div class="flex items-center space-x-4">
+                    {% if user %}
+                        <a href="/dashboard" class="hover:text-emerald-400">Dashboard</a>
+                        <span class="text-slate-400">{{ user.artist_name }}</span>
+                        <a href="/logout" class="text-slate-400 hover:text-white">Logout</a>
+                    {% else %}
+                        <a href="/login" class="hover:text-emerald-400">Login</a>
+                        <a href="/register" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg text-sm font-medium">Get Started</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="border-t border-slate-800 mt-16 py-8 text-center text-slate-500 text-sm">
+        Artist Analytics Beta — Exact timestamps & patterns that other platforms bury.
+    </footer>
+</body>
+</html>
