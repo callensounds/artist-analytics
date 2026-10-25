@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Artist Analytics — Know Exactly When to Drop{% endblock %}
+{% block title %}Average Analytics — Know Exactly When to Drop{% endblock %}
 
 {% block content %}
 <div class="text-center py-16">
@@ -18,18 +18,18 @@
 <div class="grid md:grid-cols-3 gap-6 mt-16">
     <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
         <div class="text-emerald-400 text-3xl mb-4">📅</div>
-        <h3 class="text-xl font-semibold mb-2">Exact Release Dates</h3>
-        <p class="text-slate-400">Full first-release-date from MusicBrainz, including weekday. No more guessing.</p>
+        <h3 class="text-xl font-semibold mb-2">Release times, as published</h3>
+        <p class="text-slate-400">Apple Music, via the public iTunes API, is the exact release clock. Spotify's public artist page and MusicBrainz keep the precision they actually publish, often a year or a full day. A partial date is never upgraded to a fake clock time.</p>
     </div>
     <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
         <div class="text-emerald-400 text-3xl mb-4">⏱️</div>
-        <h3 class="text-xl font-semibold mb-2">Time-of-Day Insights</h3>
-        <p class="text-slate-400">YouTube upload timestamps broken down by hour and morning/afternoon/evening/night.</p>
+        <h3 class="text-xl font-semibold mb-2">Post time of day</h3>
+        <p class="text-slate-400">YouTube publishedAt, Instagram embed timestamps, and TikTok createTime are charted by UTC hour and weekday. Official profile links come from MusicBrainz. Handles are not guessed.</p>
     </div>
     <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
         <div class="text-emerald-400 text-3xl mb-4">📊</div>
-        <h3 class="text-xl font-semibold mb-2">Competitive Overview</h3>
-        <p class="text-slate-400">Dashboard metrics styled after industry tools, with room to plug in deeper paid data sources.</p>
+        <h3 class="text-xl font-semibold mb-2">Unavailable means unavailable</h3>
+        <p class="text-slate-400">If a key is missing, a page is login-walled, or a source has no clock time, the dashboard says so. It does not fill the gap with sample listeners or a demo chart.</p>
     </div>
 </div>
 

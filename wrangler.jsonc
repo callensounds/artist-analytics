@@ -12,4 +12,20 @@
   "observability": {
     "enabled": true
   }
+  // Secrets are set with `npx wrangler secret put`, not in this file:
+  //   SECRET_KEY
+  //   YOUTUBE_API_KEY
+  // Optional, off unless both are set (not required; Spotify Premium gates Web API apps):
+  //   SPOTIFY_CLIENT_ID
+  //   SPOTIFY_CLIENT_SECRET
+  // Optional response cache. Create it, then uncomment and paste the id.
+  // The app uses an in-memory cache until CACHE is bound, so deploy works
+  // before this exists.
+  //   npx wrangler kv namespace create CACHE
+  // "kv_namespaces": [
+  //   {
+  //     "binding": "CACHE",
+  //     "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+  //   }
+  // ]
 }
