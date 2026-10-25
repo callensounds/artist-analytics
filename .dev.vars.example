@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `pywrangler dev`. Leave a value blank to exercise the
+# unavailable / needs-secret states. Do not commit .dev.vars.
+SECRET_KEY=replace-with-a-long-random-string
+YOUTUBE_API_KEY=
+# Optional. Leave unset. Spotify is read from public pages unless BOTH are set.
+# SPOTIFY_CLIENT_ID=
+# SPOTIFY_CLIENT_SECRET=

@@ -1,114 +1,185 @@
 {% extends "base.html" %}
-{% block title %}Dashboard — {{ user.artist_name }}{% endblock %}
+{% block title %}{{ query }} — Artist Analytics{% endblock %}
 
 {% block head %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 {% endblock %}
 
 {% block content %}
-<div class="mb-8">
-    <h1 class="text-4xl font-bold">{{ user.artist_name }}</h1>
-    <p class="text-slate-400">Your analytics overview — exact timestamps highlighted</p>
+<div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-6">
+    <div>
+        <h1 class="text-3xl font-bold">{{ query }}</h1>
+        <p class="text-slate-400 text-sm mt-1">Public release times and post times. Missing data stays blank.</p>
+    </div>
+    <form method="get" action="/dashboard" class="flex gap-2 w-full md:w-auto">
+        <label class="sr-only" for="artist">Artist</label>
+        <input id="artist" name="artist" value="{{ query }}" required maxlength="120"
+               class="flex-1 md:w-72 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:border-emerald-500"
+               placeholder="Artist name">
+        <button type="submit" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Analyze</button>
+    </form>
 </div>
 
-<!-- Metric Cards -->
-<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-10">
-    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <div class="text-slate-400 text-sm">Analytics Score</div>
-        <div class="text-3xl font-bold text-emerald-400">{{ demo_metrics.score }}</div>
-        <div class="text-xs text-slate-500 mt-1">{{ demo_metrics.rank }}</div>
-    </div>
-    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <div class="text-slate-400 text-sm">Career Stage</div>
-        <div class="text-2xl font-semibold">{{ demo_metrics.career_stage }}</div>
-        <div class="text-xs text-emerald-400 mt-1">{{ demo_metrics.momentum }}</div>
-    </div>
-    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <div class="text-slate-400 text-sm">Monthly Listeners</div>
-        <div class="text-2xl font-semibold">{{ demo_metrics.monthly_listeners }}</div>
-        <div class="text-xs text-slate-500">Spotify (demo)</div>
-    </div>
-    <div class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <div class="text-slate-400 text-sm">Social Reach</div>
-        <div class="text-2xl font-semibold">{{ demo_metrics.tiktok_followers }}</div>
-        <div class="text-xs text-slate-500">TikTok (demo)</div>
-    </div>
+<div class="flex flex-wrap gap-2 mb-6">
+    {% for source in sources %}
+    <span class="text-xs px-3 py-1 rounded-full border
+        {% if source.status == 'ok' %}border-emerald-500/60 text-emerald-300
+        {% elif source.status == 'missing_credentials' %}border-amber-500/60 text-amber-200
+        {% elif source.status == 'error' %}border-red-500/60 text-red-200
+        {% else %}border-slate-600 text-slate-300{% endif %}">
+        {{ source.label }}
+        ·
+        {% if source.status == 'ok' %}Live
+        {% elif source.status == 'missing_credentials' %}Needs secret
+        {% elif source.status == 'error' %}Error
+        {% else %}Unavailable{% endif %}
+    </span>
+    {% endfor %}
 </div>
 
-<div class="grid lg:grid-cols-2 gap-8">
-    <!-- Releases -->
-    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
-        <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
-            <span class="text-emerald-400">📅</span> Exact Release Dates
-        </h2>
-        {% if releases %}
-        <div class="space-y-3 max-h-96 overflow-y-auto">
-            {% for r in releases %}
-            <div class="flex justify-between items-center py-2 border-b border-slate-700 last:border-0">
-                <div>
-                    <div class="font-medium">{{ r.title }}</div>
-                    <div class="text-xs text-slate-400">{{ r.type }}</div>
+<div class="grid lg:grid-cols-2 gap-6 mb-6">
+    <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <h2 class="font-semibold mb-1">Release clock times</h2>
+        <p class="text-xs text-slate-400 mb-3">Apple Music is the exact release clock. Its US storefront time is often midnight Pacific, so a spike at 07:00 or 08:00 UTC is that convention. Spotify and MusicBrainz stay at the precision they publish.</p>
+        {% if patterns.release_hours %}
+        <div class="relative h-56"><canvas id="releaseHourChart"></canvas></div>
+        {% else %}
+        <p class="text-slate-400 text-sm">No release source returned a clock time for this artist.</p>
+        {% endif %}
+    </section>
+    <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <h2 class="font-semibold mb-1">Post clock times</h2>
+        <p class="text-xs text-slate-400 mb-3">YouTube, Instagram, and TikTok timestamps, grouped by UTC hour.</p>
+        {% if patterns.social_hours %}
+        <div class="relative h-56"><canvas id="socialHourChart"></canvas></div>
+        {% else %}
+        <p class="text-slate-400 text-sm">No post source returned an exact timestamp. Check the source cards for the reason.</p>
+        {% endif %}
+    </section>
+</div>
+
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-1">Day of week</h2>
+    <p class="text-xs text-slate-400 mb-3">Counted only when the source published at least a full calendar day.</p>
+    {% if patterns.weekdays %}
+    <div class="relative h-56"><canvas id="weekdayChart"></canvas></div>
+    {% else %}
+    <p class="text-slate-400 text-sm">No day-level dates yet, so a weekday pattern would be a guess.</p>
+    {% endif %}
+</section>
+
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-8">
+    <h2 class="font-semibold mb-3">What the timestamps say</h2>
+    <ul class="space-y-2 text-sm text-slate-300">
+        {% for line in insights %}
+        <li>{{ line }}</li>
+        {% endfor %}
+    </ul>
+</section>
+
+<div class="grid lg:grid-cols-2 gap-6">
+    {% for source in sources %}
+    <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <div class="flex items-start justify-between gap-3 mb-3">
+            <div>
+                <h2 class="text-lg font-semibold flex items-center gap-2">
+                    {% if source.image_url %}
+                    <img src="{{ source.image_url }}" alt="" class="w-8 h-8 rounded-md object-cover">
+                    {% endif %}
+                    {{ source.label }}
+                </h2>
+                {% if source.profile_name %}
+                <p class="text-sm text-slate-300">
+                    {% if source.profile_url %}
+                    <a href="{{ source.profile_url }}" class="text-emerald-400 hover:underline">{{ source.profile_name }}</a>
+                    {% else %}
+                    {{ source.profile_name }}
+                    {% endif %}
+                </p>
+                {% endif %}
+            </div>
+            <span class="text-xs uppercase tracking-wide text-slate-400">{{ source.status|replace('_', ' ') }}</span>
+        </div>
+
+        {% if source.reason %}
+        <p class="text-sm text-slate-300 mb-3">{{ source.reason }}</p>
+        {% endif %}
+
+        {% if source.metrics %}
+        <dl class="grid grid-cols-2 gap-3 mb-4">
+            {% for metric in source.metrics %}
+            <div class="bg-slate-900/50 rounded-xl p-3">
+                <dt class="text-xs text-slate-400">{{ metric.label }}</dt>
+                {% if metric.available and metric.value is not none %}
+                <dd class="text-sm font-medium mt-1 break-words">{{ metric.value }}</dd>
+                {% else %}
+                <dd class="text-sm text-slate-500 mt-1">Unavailable{% if metric.reason %} — {{ metric.reason }}{% endif %}</dd>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </dl>
+        {% endif %}
+
+        {% if source["items"] %}
+        <div class="max-h-80 overflow-y-auto divide-y divide-slate-700">
+            {% for item in source["items"][:20] %}
+            <div class="py-2 flex justify-between gap-3">
+                <div class="min-w-0">
+                    <div class="text-sm font-medium truncate">
+                        {% if item.url %}<a href="{{ item.url }}" class="hover:text-emerald-300">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}
+                    </div>
+                    <div class="text-xs text-slate-500">{{ item.detail or item.kind }}</div>
                 </div>
-                <div class="text-right">
-                    <div class="font-mono text-emerald-400">{{ r.date }}</div>
-                    <div class="text-xs text-slate-500">{{ r.weekday }}</div>
+                <div class="text-right shrink-0">
+                    <div class="font-mono text-sm text-emerald-300">{{ item.display }}</div>
+                    <div class="text-xs text-slate-500">{{ item.precision_label }}{% if item.weekday %} · {{ item.weekday }}{% endif %}</div>
                 </div>
             </div>
             {% endfor %}
         </div>
-        {% else %}
-        <p class="text-slate-400">No dated releases found for this artist name on MusicBrainz. Try registering with a well-known artist name to see real data.</p>
+        {% elif source.status == 'ok' %}
+        <p class="text-sm text-slate-400">This source returned profile data, but no dated rows.</p>
         {% endif %}
-    </div>
 
-    <!-- Time-of-Day Placeholder + Chart -->
-    <div class="bg-slate-800 rounded-2xl p-6 border border-slate-700">
-        <h2 class="text-xl font-semibold mb-4 flex items-center gap-2">
-            <span class="text-emerald-400">⏱️</span> Post Time Patterns
-        </h2>
-        <p class="text-slate-400 text-sm mb-4">
-            {% if youtube_key_set %}
-            YouTube API key detected — full timestamps available in future update.
-            {% else %}
-            Set <code>YOUTUBE_API_KEY</code> env var for live upload times. Demo distribution shown below.
-            {% endif %}
-        </p>
-        <canvas id="timeChart" height="200"></canvas>
-    </div>
+        {% for note in source.notices %}
+        <p class="text-xs text-slate-500 mt-3">{{ note }}</p>
+        {% endfor %}
+    </section>
+    {% endfor %}
 </div>
 
-<!-- Insights -->
-<div class="mt-8 bg-slate-800 rounded-2xl p-6 border border-slate-700">
-    <h2 class="text-xl font-semibold mb-4">Key Insights</h2>
-    <ul class="space-y-2 text-slate-300">
-        <li>• Exact release dates let you see weekday patterns (many artists drop on Fridays).</li>
-        <li>• Time-of-day data from YouTube reveals when your audience is most likely to engage.</li>
-        <li>• Demo metrics show the dashboard layout; plug in Chartmetric/Songstats APIs for live social & streaming numbers.</li>
-        <li>• This is the differentiator vs aggregate-only tools: we surface the *when*.</li>
-    </ul>
-</div>
-
+<script id="pattern-data" type="application/json">{{ patterns | tojson }}</script>
 <script>
-const ctx = document.getElementById('timeChart').getContext('2d');
-new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: ['Morning', 'Afternoon', 'Evening', 'Night'],
-        datasets: [{
-            label: 'Posts / Uploads',
-            data: [12, 28, 35, 18],
-            backgroundColor: '#10b981',
-            borderRadius: 6
-        }]
-    },
-    options: {
-        responsive: true,
-        plugins: { legend: { display: false } },
-        scales: {
-            y: { beginAtZero: true, grid: { color: '#334155' } },
-            x: { grid: { display: false } }
+const patterns = JSON.parse(document.getElementById("pattern-data").textContent);
+
+function drawChart(canvasId, labels, datasets) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !datasets || !datasets.length) return;
+    new Chart(canvas, {
+        type: "bar",
+        data: {
+            labels: labels,
+            datasets: datasets.map((series) => ({
+                label: series.label,
+                data: series.data,
+                backgroundColor: series.color,
+                borderRadius: 3
+            }))
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: "#cbd5e1" } } },
+            scales: {
+                y: { beginAtZero: true, stacked: true, ticks: { precision: 0, color: "#94a3b8" }, grid: { color: "#334155" } },
+                x: { stacked: true, ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true }, grid: { display: false } }
+            }
         }
-    }
-});
+    });
+}
+
+drawChart("releaseHourChart", patterns.hour_labels, patterns.release_hours);
+drawChart("socialHourChart", patterns.hour_labels, patterns.social_hours);
+drawChart("weekdayChart", patterns.weekday_labels, patterns.weekdays);
 </script>
 {% endblock %}

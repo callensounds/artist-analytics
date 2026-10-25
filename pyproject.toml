@@ -16,4 +16,11 @@ dependencies = [
 dev = [
     "workers-py",
     "workers-runtime-sdk",
+    "pytest",
+    "httpx",
+    "uvicorn",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

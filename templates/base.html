@@ -31,7 +31,7 @@
                     <span>Artist Analytics</span>
                 </a>
                 <div class="flex items-center space-x-4">
-                    {% if user %}
+                    {% if user is defined and user %}
                         <a href="/dashboard" class="hover:text-emerald-400">Dashboard</a>
                         <span class="text-slate-400">{{ user.artist_name }}</span>
                         <a href="/logout" class="text-slate-400 hover:text-white">Logout</a>
