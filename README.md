@@ -55,7 +55,7 @@ Cloudflare Workers Builds (Git-connected) should deploy this repo from `main`.
 uv run pywrangler deploy
 ```
 
-The Worker config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`, `preview_urls` false). `public/` exists so the static assets directory in that config is valid. HTML templates live in `src/templates`. Wrangler uploads `**/*.html` from that directory with the Worker (its default module rules). A `templates/` directory at the repo root is outside the bundle, which is why HTML routes 500'd after deploy. Routes are served by FastAPI (`run_worker_first`).
+The Worker config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`, `preview_urls` false). `public/` exists so the static assets directory in that config is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`, so both are inside the Worker bundle. Wrangler uploads `**/*.html` from that directory with the Worker (its default module rules). Routes are served by FastAPI (`run_worker_first`).
 
 Styles are the prebuilt file `src/static/app.css`, served at `/static/app.css`. A Text rule with `fallthrough: true` uploads `**/*.css` without replacing the default HTML rule. `/favicon.ico` is a small inline SVG. Rebuild CSS after template class changes:
 
@@ -91,6 +91,16 @@ npx wrangler kv namespace create CACHE
 
 Paste the id into the commented `kv_namespaces` block in `wrangler.jsonc` (binding name `CACHE`) and deploy again. A missing or broken KV binding falls back to memory.
 
+## Crawl
+
+`wrangler.jsonc` binds the existing D1 database `artist-analytics` (`DB`, id `52a9190e-4147-402e-8f75-16f5de58bf84`, migrations in `src/migrations`) and the existing queue `artist-analytics-crawl` (producer `CRAWL_QUEUE`; consumer `max_batch_size` 1, `max_concurrency` 1, `max_retries` 3). A cron trigger runs at `*/15 * * * *` UTC. Workers Builds deploys with `uv run pywrangler deploy` and attaches those bindings. That command does not run `wrangler d1 migrations apply`. Migration `0001_crawl.sql` is already applied on the remote database; do not rename or edit it. A later schema change is a new file under `src/migrations`. On each request or cron tick the Worker applies any migration file it has not recorded in `schema_migrations`. Every statement in `0001_crawl.sql` is `CREATE TABLE IF NOT EXISTS` or `CREATE INDEX IF NOT EXISTS`, so recording it again does not change the remote schema.
+
+Each cron invocation refreshes one stale tracked artist (`CRAWL_BATCH_SIZE`, default 1, maximum 5). When `CRAWL_QUEUE` is bound, the cron only enqueues up to `CRAWL_ENQUEUE_LIMIT` artist ids (default 10) and the consumer crawls one message per invocation. If the binding is missing or a send fails, that invocation crawls one batch in process. The cursor is stored and wraps after the last artist. An artist is stale 6 hours after `last_crawled_at` (`CRAWL_STALE_SECONDS`). A MusicBrainz error does not mark the artist fresh. If `DB` is missing, the cron logs that it skipped and does not invent snapshots. Local `uvicorn` uses `data/artist-analytics.sqlite` when it is not running under pytest.
+
+Searching an artist on the dashboard stores that artist, an exact audience snapshot, first-seen rows for releases and posts, and Spotify "Fans also like" edges. Related artists in the top 5 are auto-tracked until `RELATED_AUTOTRACK_CAP` (default 25). Set the cap to `0` to keep the edges without enqueueing anyone new. Logged-in users can open `/admin` to see runs and refresh one batch.
+
+Audience charts plot only exact integers (monthly listeners, followers, subscribers). A rounded `1.2M` string is not turned into a point. First-seen is when this app stored the row. The source's own timestamp stays separate.
+
 ## Caveats
 
 - MusicBrainz dates are calendar dates. The weekday chart uses day-level dates only. The catalog sample is the first 100 release groups and 100 official releases.
@@ -105,7 +115,8 @@ Paste the id into the commented `kv_namespaces` block in `wrangler.jsonc` (bindi
 
 ## Next steps
 
-- Persist accounts in D1 (do not add a placeholder database id to `wrangler.jsonc`; an unknown id fails deploy).
+- Accounts are still in memory. Crawl history uses the bound D1 database.
+- Add a new file under `src/migrations/` for any schema change. Do not edit `0001_crawl.sql`.
 - Turn on the KV `CACHE` binding in production.
 - Add the YouTube secret so that card goes live. Spotify already reads public pages without a secret.
 - Let a viewer switch Apple's clock between UTC and the storefront timezone.

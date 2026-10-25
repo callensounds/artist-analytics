@@ -22,6 +22,7 @@ class Metric:
     available: bool
     value: str | None = None
     reason: str | None = None
+    exact: int | None = None
 
 
 @dataclass
@@ -52,11 +53,17 @@ class SourceResult:
     items: list[TimedItem] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     links: dict = field(default_factory=dict)
+    related: list = field(default_factory=list)
     cacheable: bool = True
     ttl: int = 2700
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _fields(cls, item: dict) -> dict:
+    names = {field.name for field in cls.__dataclass_fields__.values()}
+    return {key: value for key, value in item.items() if key in names}
 
 
 def source_from_dict(data: dict) -> SourceResult:
@@ -68,10 +75,11 @@ def source_from_dict(data: dict) -> SourceResult:
         profile_name=data.get("profile_name"),
         profile_url=data.get("profile_url"),
         image_url=data.get("image_url"),
-        metrics=[Metric(**item) for item in data.get("metrics") or []],
-        items=[TimedItem(**item) for item in data.get("items") or []],
+        metrics=[Metric(**_fields(Metric, item)) for item in data.get("metrics") or []],
+        items=[TimedItem(**_fields(TimedItem, item)) for item in data.get("items") or []],
         notices=list(data.get("notices") or []),
         links=dict(data.get("links") or {}),
+        related=list(data.get("related") or []),
         cacheable=bool(data.get("cacheable", True)),
         ttl=int(data.get("ttl") or 2700),
     )

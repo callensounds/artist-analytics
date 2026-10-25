@@ -1,0 +1,332 @@
+"""Persist audience counts, first-seen content, and Spotify related-artist edges."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta, timezone
+
+from analytics import SOURCE_COLORS, normalize_name
+from db import parse_utc, utc_now
+
+# Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
+AUDIENCE = {
+    ("spotify", "Monthly listeners"): "Spotify monthly listeners",
+    ("spotify", "Followers"): "Spotify followers",
+    ("instagram", "Followers"): "Instagram followers",
+    ("tiktok", "Followers"): "TikTok followers",
+    ("youtube", "Subscribers"): "YouTube subscribers",
+}
+SNAPSHOT_REPEAT_SECONDS = 3600
+RELATED_RANK_LIMIT = 5
+
+
+def _whole_number(value) -> int | None:
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value < 0 or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[\d,]+", text):
+            return int(text.replace(",", ""))
+    return None
+
+
+def audience_exact(metric: dict) -> int | None:
+    """An audience point is an integer. Rounded text such as 1.2M is not one."""
+    exact = _whole_number(metric.get("exact"))
+    if exact is not None:
+        return exact
+    return _whole_number(metric.get("value"))
+
+
+def build_growth(rows: list[dict]) -> dict:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (row["source"], row["metric"])
+        number = _whole_number(row.get("value"))
+        if key not in AUDIENCE or number is None:
+            continue
+        grouped.setdefault(key, []).append({**row, "value": number})
+    labels = sorted({row["captured_at"] for items in grouped.values() for row in items})
+    datasets = []
+    for key, items in grouped.items():
+        by_time = {item["captured_at"]: item["value"] for item in items}
+        datasets.append(
+            {
+                "label": AUDIENCE[key],
+                "platform": key[0],
+                "color": SOURCE_COLORS.get(key[0], "#94a3b8"),
+                "data": [by_time.get(label) for label in labels],
+            }
+        )
+    return {"labels": labels, "datasets": datasets}
+
+
+def empty_history(reason: str) -> dict:
+    return {
+        "available": False,
+        "reason": reason,
+        "growth": {"labels": [], "datasets": []},
+        "related": [],
+        "sightings": [],
+        "artist_id": None,
+    }
+
+
+def _links(bundle: dict) -> dict:
+    for source in bundle.get("sources") or []:
+        if source.get("platform") == "musicbrainz":
+            return dict(source.get("links") or {})
+    return {}
+
+
+def _mbid(bundle: dict) -> str | None:
+    for source in bundle.get("sources") or []:
+        if source.get("platform") != "musicbrainz":
+            continue
+        match = re.search(r"musicbrainz.org/artist/([0-9a-f-]{36})", source.get("profile_url") or "")
+        return match.group(1) if match else None
+    return None
+
+
+def _blank(value) -> str | None:
+    text = (value or "").strip() if isinstance(value, str) else ""
+    return text or None
+
+
+async def _latest_snapshot(db, artist_id: int, source: str, metric: str) -> dict | None:
+    return await db.query_one(
+        """
+        SELECT value, captured_at FROM metric_snapshots
+        WHERE artist_id = ? AND source = ? AND metric = ?
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 1
+        """,
+        (artist_id, source, metric),
+    )
+
+
+async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: datetime | None = None, related_cap: int = 25) -> dict:
+    moment = now or datetime.now(timezone.utc)
+    stamp = utc_now(moment)
+    normalized = normalize_name(name)
+    links = _links(bundle)
+    channel_ids = links.get("youtube_channel_ids") or []
+    await db.execute(
+        """
+        INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+        VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT(normalized_name) DO UPDATE SET
+            name = excluded.name,
+            tracked = 1,
+            origin = CASE WHEN excluded.origin = 'search' THEN 'search' ELSE artists.origin END
+        """,
+        (name.strip()[:120], normalized, origin, stamp),
+    )
+    artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalized,))
+    artist_id = int(artist["id"])
+    sources = bundle.get("sources") or []
+    musicbrainz_failed = any(
+        source.get("platform") == "musicbrainz" and source.get("status") == "error" for source in sources
+    )
+    await db.execute(
+        """
+        UPDATE artists SET
+            musicbrainz_id = COALESCE(?, musicbrainz_id),
+            spotify_id = COALESCE(?, spotify_id),
+            apple_id = COALESCE(?, apple_id),
+            youtube_channel_id = COALESCE(?, youtube_channel_id),
+            instagram_handle = COALESCE(?, instagram_handle),
+            tiktok_handle = COALESCE(?, tiktok_handle),
+            last_crawled_at = COALESCE(?, last_crawled_at)
+        WHERE id = ?
+        """,
+        (
+            _mbid(bundle),
+            _blank(links.get("spotify_id")),
+            _blank(links.get("apple_id")),
+            _blank(channel_ids[0] if channel_ids else None),
+            _blank(links.get("instagram")),
+            _blank(links.get("tiktok")),
+            None if musicbrainz_failed else stamp,
+            artist_id,
+        ),
+    )
+    snapshots = 0
+    for source in sources:
+        platform = source.get("platform") or ""
+        if source.get("status") == "error":
+            continue
+        for metric in source.get("metrics") or []:
+            label = metric.get("label") or ""
+            if (platform, label) not in AUDIENCE or not metric.get("available"):
+                continue
+            number = audience_exact(metric)
+            if number is None:
+                continue
+            previous = await _latest_snapshot(db, artist_id, platform, label)
+            previous_value = _whole_number(previous.get("value")) if previous else None
+            if previous and previous_value is not None and previous_value == number:
+                previous_at = parse_utc(previous.get("captured_at"))
+                if previous_at and moment - previous_at < timedelta(seconds=SNAPSHOT_REPEAT_SECONDS):
+                    continue
+            await db.execute(
+                """
+                INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (artist_id, platform, label, number, str(metric.get("value") or number), stamp),
+            )
+            snapshots += 1
+        for item in source.get("items") or []:
+            external = (item.get("url") or f"{item.get('kind')}:{item.get('title')}:{item.get('sort_key')}")[:300]
+            if not external or not item.get("title"):
+                continue
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO content_sightings
+                    (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artist_id,
+                    platform,
+                    external,
+                    str(item.get("title"))[:200],
+                    item.get("kind"),
+                    item.get("sort_key") or item.get("display"),
+                    item.get("precision"),
+                    stamp,
+                ),
+            )
+    edges, discovered = await _store_related(db, artist_id, bundle, stamp, related_cap)
+    return {
+        "artist_id": artist_id,
+        "snapshots": snapshots,
+        "edges": edges,
+        "discovered": discovered,
+    }
+
+
+async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_cap: int) -> tuple[int, int]:
+    related = []
+    for source in bundle.get("sources") or []:
+        if source.get("platform") == "spotify":
+            related = list(source.get("related") or [])
+            break
+    written = 0
+    for item in related:
+        spotify_id = _blank(item.get("spotify_id"))
+        to_name = _blank(item.get("name"))
+        if not spotify_id or not to_name:
+            continue
+        rank = int(item.get("rank") or written + 1)
+        await db.execute(
+            """
+            INSERT INTO related_edges
+                (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, 'spotify', ?, ?, ?)
+            ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
+                to_name = excluded.to_name,
+                rank = excluded.rank,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (artist_id, spotify_id, to_name[:120], rank, stamp, stamp),
+        )
+        written += 1
+    discovered = 0
+    if related_cap > 0:
+        row = await db.query_one(
+            "SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1"
+        )
+        room = related_cap - int((row or {}).get("n") or 0)
+        for item in related:
+            if room <= 0:
+                break
+            if int(item.get("rank") or 99) > RELATED_RANK_LIMIT:
+                continue
+            spotify_id = _blank(item.get("spotify_id"))
+            to_name = _blank(item.get("name"))
+            if not spotify_id or not to_name:
+                continue
+            if spotify_id == _blank(_links(bundle).get("spotify_id")):
+                continue
+            existing = await db.query_one(
+                "SELECT id FROM artists WHERE spotify_id = ? OR normalized_name = ?",
+                (spotify_id, normalize_name(to_name)),
+            )
+            if existing:
+                await db.execute(
+                    """
+                    UPDATE related_edges SET to_artist_id = ?
+                    WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
+                    """,
+                    (int(existing["id"]), artist_id, spotify_id),
+                )
+                continue
+            await db.execute(
+                """
+                INSERT INTO artists (name, normalized_name, spotify_id, origin, tracked, created_at)
+                VALUES (?, ?, ?, 'related', 1, ?)
+                """,
+                (to_name[:120], normalize_name(to_name), spotify_id, stamp),
+            )
+            created = await db.query_one("SELECT id FROM artists WHERE normalized_name = ?", (normalize_name(to_name),))
+            if created:
+                await db.execute(
+                    """
+                    UPDATE related_edges SET to_artist_id = ?
+                    WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
+                    """,
+                    (int(created["id"]), artist_id, spotify_id),
+                )
+            room -= 1
+            discovered += 1
+    return written, discovered
+
+
+async def load_artist_history(db, name: str) -> dict:
+    artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalize_name(name),))
+    if not artist:
+        return empty_history("This artist has no stored snapshots yet.")
+    artist_id = int(artist["id"])
+    rows = await db.query(
+        """
+        SELECT source, metric, value, captured_at FROM metric_snapshots
+        WHERE artist_id = ? AND value IS NOT NULL
+        ORDER BY captured_at, id
+        """,
+        (artist_id,),
+    )
+    related = await db.query(
+        """
+        SELECT to_name, to_spotify_id, rank, first_seen_at, last_seen_at
+        FROM related_edges
+        WHERE from_artist_id = ? AND source = 'spotify'
+        ORDER BY rank, to_name
+        """,
+        (artist_id,),
+    )
+    sightings = await db.query(
+        """
+        SELECT source, title, kind, published_at, precision, first_seen_at
+        FROM content_sightings
+        WHERE artist_id = ?
+        ORDER BY first_seen_at DESC, id DESC
+        LIMIT 8
+        """,
+        (artist_id,),
+    )
+    history = empty_history("")
+    history["available"] = True
+    history["reason"] = None
+    history["artist_id"] = artist_id
+    history["growth"] = build_growth(rows)
+    history["related"] = related
+    history["sightings"] = sightings
+    return history

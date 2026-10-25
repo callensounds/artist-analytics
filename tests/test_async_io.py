@@ -267,14 +267,79 @@ def test_concurrent_app_burst_on_workers_path(forbid_blocking, monkeypatch):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             login = await client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
             assert login.status_code == 303
-            paths = ["/", "/login", "/favicon.ico", "/static/app.css"]
             artists = ["Clairo", "Billie Eilish", "Bad Bunny", "Taylor Swift", "Drake"]
-            requests = [client.get(path) for path in paths * 5]
-            requests += [client.get("/dashboard", params={"artist": name}) for name in artists * 2]
+            requests = [client.get("/dashboard", params={"artist": name}) for name in artists * 10]
             return await asyncio.gather(*requests)
 
     responses = asyncio.run(run())
+    assert len(responses) == 50
     assert [r.status_code for r in responses] == [200] * len(responses)
+
+
+def test_concurrent_dashboards_with_async_d1_do_not_block(forbid_blocking, monkeypatch):
+    import sqlite3
+
+    import main
+    from db import D1Database
+
+    class Statement:
+        def __init__(self, conn, sql):
+            self.conn = conn
+            self.sql = sql
+            self.params = ()
+
+        def bind(self, *params):
+            self.params = params
+            return self
+
+        async def run(self):
+            cursor = self.conn.execute(self.sql, self.params)
+            self.conn.commit()
+            return {"meta": {"last_row_id": cursor.lastrowid}, "results": []}
+
+        async def all(self):
+            cursor = self.conn.execute(self.sql, self.params)
+            return {"results": [{key: row[key] for key in row.keys()} for row in cursor.fetchall()]}
+
+    class Database:
+        def __init__(self):
+            self.conn = sqlite3.connect(":memory:")
+            self.conn.row_factory = sqlite3.Row
+
+        def prepare(self, sql):
+            return Statement(self.conn, sql)
+
+    binding = Database()
+
+    class Env:
+        DB = binding
+
+    fetch = FakeJsFetch(_router)
+    monkeypatch.setattr(http_client, "default_transport", lambda: _transport(fetch))
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+    async def application(scope, receive, send):
+        if scope.get("type") == "http":
+            scope = dict(scope)
+            scope["env"] = Env()
+        await main.app(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            login = await client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
+            assert login.status_code == 303
+            artists = ["Clairo", "Billie Eilish", "Bad Bunny", "Taylor Swift", "Drake"]
+            return await asyncio.gather(
+                *(client.get("/dashboard", params={"artist": name}) for name in artists * 10)
+            )
+
+    responses = asyncio.run(run())
+    assert len(responses) == 50
+    assert [r.status_code for r in responses] == [200] * len(responses)
+    assert all("growth-data" in response.text for response in responses)
+    stored = asyncio.run(D1Database(binding).query("SELECT COUNT(*) AS n FROM artists"))
+    assert stored[0]["n"] >= 5
 
 
 def test_body_is_capped_and_the_stream_cancelled(forbid_blocking):

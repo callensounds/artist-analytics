@@ -5,7 +5,10 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from crawl import open_database, run_scheduled, settings, status_report
+from db import migrate
 from diag import diagnose
+from history import empty_history, load_artist_history, remember
 from http_client import HttpClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
@@ -42,6 +45,44 @@ USERS = {
     }
 }
 NEXT_ID = 2
+
+
+def _live_related(bundle: dict) -> list[dict]:
+    for source in bundle.get("sources") or []:
+        if source.get("platform") == "spotify":
+            return [
+                {
+                    "to_name": item.get("name"),
+                    "to_spotify_id": item.get("spotify_id"),
+                    "rank": item.get("rank"),
+                    "first_seen_at": None,
+                    "last_seen_at": None,
+                }
+                for item in source.get("related") or []
+                if item.get("name") and item.get("spotify_id")
+            ]
+    return []
+
+
+async def attach_history(name: str, bundle: dict, env) -> dict:
+    live = _live_related(bundle)
+    db = await open_database(env)
+    if db is None:
+        history = empty_history(
+            "Growth and first-seen times are stored when D1 is bound, or in the local sqlite file. "
+            "Related names from this page load are shown without first-seen dates."
+        )
+        history["related"] = live
+        return history
+    try:
+        await migrate(db)
+        await remember(db, name, bundle, origin="search", related_cap=settings(env)["related_cap"])
+        history = await load_artist_history(db, name)
+    except Exception:
+        history = empty_history("The history database could not be updated on this request.")
+    if not history["related"] and live:
+        history["related"] = live
+    return history
 
 
 def get_current_user(request: Request):
@@ -167,6 +208,10 @@ async def dashboard(request: Request, artist: str | None = None):
             "patterns": {"release_hours": [], "social_hours": [], "weekdays": [], "hour_labels": [], "weekday_labels": []},
             "insights": ["The dashboard could not load sources. Refresh to try again."],
         }
+    try:
+        history = await attach_history(query, bundle, request.scope.get("env"))
+    except Exception:
+        history = empty_history("The history database could not be read on this request.")
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -174,8 +219,15 @@ async def dashboard(request: Request, artist: str | None = None):
             "user": user,
             "query": query,
             "sources": bundle["sources"],
-            "patterns": bundle["patterns"],
-            "insights": bundle["insights"],
+            "patterns": bundle.get("patterns") or {
+                "release_hours": [],
+                "social_hours": [],
+                "weekdays": [],
+                "hour_labels": [],
+                "weekday_labels": [],
+            },
+            "insights": bundle.get("insights") or [],
+            "history": history,
         },
     )
 
@@ -202,5 +254,39 @@ async def admin_diag(request: Request):
     return templates.TemplateResponse(request, "diag.html", {"user": user, "report": report})
 
 
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    report = await status_report(request.scope.get("env"))
+    return templates.TemplateResponse(
+        request,
+        "admin.html",
+        {"user": user, "report": report},
+    )
+
+
+@app.post("/admin/crawl")
+async def admin_crawl(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    try:
+        await run_scheduled(request.scope.get("env"))
+    except Exception:
+        pass
+    return RedirectResponse("/admin", status_code=303)
+
+
 if asgi is not None:
-    Default = asgi.entrypoint(app)
+    _App = asgi.entrypoint(app)
+
+    class Default(_App):
+        async def scheduled(self, controller, env, ctx):
+            await run_scheduled(env)
+
+        async def queue(self, batch):
+            from crawl import run_queue_batch
+
+            await run_queue_batch(batch, getattr(self, "env", None))

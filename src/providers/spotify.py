@@ -27,6 +27,9 @@ SECTION_TITLES = {
     "Latest Release • Album",
     "Latest Release • Single",
     "Latest Release • EP",
+    "Fans also like",
+    "Appears On",
+    "Followers",
 }
 KIND_LINE = re.compile(
     r"^(?:(Album|Single|EP|Compilation)\s*[•·]\s*((?:19|20)\d{2})|"
@@ -126,6 +129,38 @@ def parse_embed_state(page: str) -> dict:
         if isinstance(track, dict) and track.get("title"):
             tracks.append(str(track["title"]))
     return {"name": entity.get("name") or entity.get("title"), "tracks": tracks}
+
+
+def parse_spotify_followers(lines: list[str]) -> int | None:
+    for index, line in enumerate(lines):
+        if line != "Followers" or index == 0:
+            continue
+        previous = lines[index - 1]
+        if PLAYS.fullmatch(previous):
+            return int(previous.replace(",", ""))
+    return None
+
+
+def parse_related_artists(page: str) -> list[dict]:
+    """Names and ids from the public 'Fans also like' cards. Order is Spotify's rank."""
+    start = (page or "").find("Fans also like")
+    if start < 0:
+        return []
+    end = page.find("Appears On", start)
+    chunk = page[start:end if end > start else start + 20000]
+    found = []
+    seen = set()
+    pattern = re.compile(r'href="/artist/([A-Za-z0-9]+)"[\s\S]{0,900}?>([^<]{1,80})</span>')
+    for match in pattern.finditer(chunk):
+        artist_id = match.group(1)
+        name = html.unescape(match.group(2)).strip()
+        if not name or artist_id in seen:
+            continue
+        seen.add(artist_id)
+        found.append({"name": name, "spotify_id": artist_id, "rank": len(found) + 1})
+        if len(found) >= 12:
+            break
+    return found
 
 
 def parse_oembed(payload: dict | None) -> dict:
@@ -252,6 +287,7 @@ async def _fetch_api(name: str, artist_id: str, env_secrets: tuple[str, str], ht
             return errored("spotify", "Spotify", str(exc))
         items = parse_albums(albums)
         followers = (artist.get("followers") or {}).get("total")
+        follower_exact = followers if isinstance(followers, int) and not isinstance(followers, bool) and followers >= 0 else None
         tracks = []
         for track in (top.get("tracks") or [])[:5]:
             score = track.get("popularity")
@@ -265,9 +301,10 @@ async def _fetch_api(name: str, artist_id: str, env_secrets: tuple[str, str], ht
             metrics=[
                 Metric(
                     label="Followers",
-                    available=isinstance(followers, int),
-                    value=f"{int(followers):,}" if isinstance(followers, int) else None,
-                    reason=None if isinstance(followers, int) else "Spotify did not return a follower count.",
+                    available=follower_exact is not None,
+                    value=f"{follower_exact:,}" if follower_exact is not None else None,
+                    exact=follower_exact,
+                    reason=None if follower_exact is not None else "Spotify did not return a follower count.",
                 ),
                 Metric(
                     label="Top tracks",
@@ -348,11 +385,21 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
         oembed = parse_oembed(oembed_payload if oembed_result and oembed_result.ok else None)
         lines = visible_lines(artist_page.text if artist_page.ok else "")
         listeners, listeners_exact = parse_monthly_listeners(artist_page.text if artist_page.ok else "")
+        follower_count = parse_spotify_followers(lines)
         discography = parse_discography(lines)
         popular = parse_popular(lines)
+        related = parse_related_artists(artist_page.text if artist_page.ok else "")
         embed = parse_embed_state(embed_page.text) if embed_page is not None and embed_page.ok else {}
         items = _release_items(discography)
-        if not items and listeners is None and not (embed.get("tracks") or popular) and not oembed.get("title"):
+        listener_exact = int(listeners.replace(",", "")) if listeners_exact and listeners else None
+        if (
+            not items
+            and listeners is None
+            and follower_count is None
+            and not related
+            and not (embed.get("tracks") or popular)
+            and not oembed.get("title")
+        ):
             return unavailable(
                 "spotify",
                 "Spotify",
@@ -379,11 +426,20 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
                     label="Monthly listeners",
                     available=listeners is not None,
                     value=listeners,
+                    exact=listener_exact,
                     reason=None if listeners is not None else "The public artist page did not include a monthly listener count.",
+                ),
+                Metric(
+                    label="Followers",
+                    available=follower_count is not None,
+                    value=f"{follower_count:,}" if follower_count is not None else None,
+                    exact=follower_count,
+                    reason=None if follower_count is not None else "The public artist page did not include a follower count.",
                 ),
                 _top_track_metric(embed.get("tracks") or [], popular),
                 Metric(label="Releases with a year", available=True, value=str(len(items))),
             ],
+            related=related,
             items=items[:40],
             notices=notices,
         )

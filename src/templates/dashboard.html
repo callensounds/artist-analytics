@@ -68,6 +68,67 @@
     {% endif %}
 </section>
 
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-1">Audience growth</h2>
+    <p class="text-xs text-slate-400 mb-3">Exact counts only, captured in UTC. A rounded figure is not plotted, and one reading is not a trend.</p>
+    {% if history.growth.datasets %}
+    <div class="relative h-64"><canvas id="growthChart"></canvas></div>
+    {% else %}
+    <p class="text-slate-400 text-sm">{{ history.reason or "No exact audience count has been stored yet." }}</p>
+    {% endif %}
+</section>
+
+<div class="grid lg:grid-cols-2 gap-6 mb-6">
+    <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <h2 class="font-semibold mb-1">Fans also like</h2>
+        <p class="text-xs text-slate-400 mb-3">From the public Spotify artist page, in the order Spotify prints. A name without that section is left off.</p>
+        {% if history.related %}
+        <ol class="space-y-2 text-sm">
+            {% for artist in history.related %}
+            <li class="flex flex-wrap items-baseline justify-between gap-2">
+                <span>
+                    <span class="text-slate-500 mr-2">{{ artist.rank }}</span>
+                    <a href="/dashboard?artist={{ artist.to_name | urlencode }}" class="hover:text-emerald-300">{{ artist.to_name }}</a>
+                </span>
+                <span class="text-xs text-slate-500">
+                    {% if artist.to_spotify_id %}
+                    <a href="https://open.spotify.com/artist/{{ artist.to_spotify_id }}" class="text-emerald-400 hover:underline">Spotify</a>
+                    {% endif %}
+                    {% if artist.first_seen_at %}
+                    · first {{ artist.first_seen_at }} · last {{ artist.last_seen_at }}
+                    {% endif %}
+                </span>
+            </li>
+            {% endfor %}
+        </ol>
+        {% else %}
+        <p class="text-slate-400 text-sm">The public Spotify page did not include a Fans also like list for this load.</p>
+        {% endif %}
+    </section>
+    <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <h2 class="font-semibold mb-1">First seen by this app</h2>
+        <p class="text-xs text-slate-400 mb-3">When a release or post was first stored. The source time is the published column, not this clock.</p>
+        {% if history.sightings %}
+        <ul class="space-y-2 text-sm">
+            {% for item in history.sightings %}
+            <li class="flex justify-between gap-3">
+                <span class="min-w-0">
+                    <span class="text-slate-500">{{ item.source }}</span>
+                    {{ item.title }}
+                </span>
+                <span class="text-right text-xs text-slate-400 shrink-0">
+                    <span class="block text-emerald-300">{{ item.published_at or "source time unavailable" }}</span>
+                    stored {{ item.first_seen_at }}
+                </span>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-slate-400 text-sm">{{ history.reason or "No releases or posts have been stored yet." }}</p>
+        {% endif %}
+    </section>
+</div>
+
 <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-8">
     <h2 class="font-semibold mb-3">What the timestamps say</h2>
     <ul class="space-y-2 text-sm text-slate-300">
@@ -149,6 +210,7 @@
 </div>
 
 <script id="pattern-data" type="application/json">{{ patterns | tojson }}</script>
+<script id="growth-data" type="application/json">{{ history.growth | tojson }}</script>
 <script>
 const patternNode = document.getElementById("pattern-data");
 let patterns = { hour_labels: [], weekday_labels: [], release_hours: [], social_hours: [], weekdays: [] };
@@ -196,5 +258,34 @@ function drawChart(canvasId, labels, datasets) {
 drawChart("releaseHourChart", patterns.hour_labels, patterns.release_hours);
 drawChart("socialHourChart", patterns.hour_labels, patterns.social_hours);
 drawChart("weekdayChart", patterns.weekday_labels, patterns.weekdays);
+
+const growth = JSON.parse(document.getElementById("growth-data").textContent);
+if (growth.datasets && growth.datasets.length) {
+    const labels = growth.labels.map((stamp) => stamp.replace("T", " ").replace("Z", " UTC"));
+    new Chart(document.getElementById("growthChart"), {
+        type: "line",
+        data: {
+            labels: labels,
+            datasets: growth.datasets.map((series) => ({
+                label: series.label,
+                data: series.data,
+                borderColor: series.color,
+                backgroundColor: series.color,
+                pointRadius: 3,
+                tension: 0.15,
+                spanGaps: false
+            }))
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: "#cbd5e1" } } },
+            scales: {
+                y: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+                x: { ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true }, grid: { display: false } }
+            }
+        }
+    });
+}
 </script>
 {% endblock %}

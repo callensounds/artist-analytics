@@ -101,7 +101,7 @@ async def _get(http, url: str):
 
 async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
     handle = (links or {}).get("tiktok") or ""
-    if (links or {}).get("_incomplete"):
+    if (links or {}).get("_incomplete") and not handle:
         return unavailable(
             "tiktok",
             "TikTok",
@@ -204,8 +204,18 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
                 items.append(result)
             if videos and not items:
                 notice = "Public video pages did not include createTime, so post timestamps are unavailable."
-        followers = compact_count(stats.get("followerCount"))
-        hearts = compact_count(stats.get("heartCount"))
+        follower_exact = stats.get("followerCount")
+        heart_exact = stats.get("heartCount")
+        try:
+            follower_exact = int(follower_exact) if follower_exact is not None else None
+        except (TypeError, ValueError):
+            follower_exact = None
+        try:
+            heart_exact = int(heart_exact) if heart_exact is not None else None
+        except (TypeError, ValueError):
+            heart_exact = None
+        followers = compact_count(follower_exact)
+        hearts = compact_count(heart_exact)
         return SourceResult(
             platform="tiktok",
             label="TikTok",
@@ -217,12 +227,14 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
                     label="Followers",
                     available=followers is not None,
                     value=followers,
+                    exact=follower_exact,
                     reason=None if followers is not None else "The profile payload had no followerCount.",
                 ),
                 Metric(
                     label="Likes",
                     available=hearts is not None,
                     value=hearts,
+                    exact=heart_exact,
                     reason=None if hearts is not None else "The profile payload had no heartCount.",
                 ),
                 Metric(label="Posts with timestamps", available=True, value=str(len(items))),
