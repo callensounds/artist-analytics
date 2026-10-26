@@ -9,9 +9,9 @@ The product difference is the timestamp itself: exact when a source publishes a 
 | Source | How it is read | Timestamp | Credentials |
 | --- | --- | --- | --- |
 | MusicBrainz | Official WS/2 API | Earliest release date, upgraded to a full day when a release event has one | None. Be polite: the client waits 1s between calls. |
-| Apple Music | iTunes Search first. If that is HTTP 403 or 429 with nothing cached, public `music.apple.com` artist and album pages. | iTunes `releaseDate`, or the album page `music:release_date`, or the shelf year | None. |
+| Apple Music | iTunes Search first. If that is HTTP 403 or 429 with nothing cached, one public album-shelf page (byte-capped) and at most 3 album pages. | iTunes `releaseDate`, or `music:release_date` from those album pages, or the shelf year | None. |
 | Spotify | Public oEmbed, artist page, and embed page. Artist id comes from MusicBrainz. | Year (or whatever the page prints). Not turned into a clock time. | None. Optional Web API secrets stay off unless both are set. |
-| YouTube | Data API v3. The key is sent in the `X-Goog-Api-Key` header. | `videoPublishedAt` / `publishedAt`, UTC to the second | `YOUTUBE_API_KEY`, read from the request env. Logged-in `/admin/diag` shows the type, JS typeof, length, and first 4 characters. |
+| YouTube | Data API v3. The key is sent in the `X-Goog-Api-Key` header. A value of `[REDACTED]`, or any value that does not start with `AIza`, is not sent to Google. | `videoPublishedAt` / `publishedAt`, UTC to the second | `YOUTUBE_API_KEY`, read from the request env. Logged-in `/admin/diag` shows the type, JS typeof, length, and first 4 characters. |
 | Instagram | Public `/<handle>/embed/` page only | `taken_at_timestamp` (Unix seconds, UTC) | None. The handle comes from MusicBrainz. Login redirects are not followed. |
 | TikTok | Public profile JSON, public embed listing, public video pages | `createTime` on the video page (Unix seconds, UTC) | None. The handle comes from MusicBrainz. |
 

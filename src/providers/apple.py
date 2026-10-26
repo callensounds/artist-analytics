@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from analytics import names_match
 from http_client import TransportError
 from models import Metric, SourceResult, TimedItem, errored, make_item, sort_items, unavailable
-from providers.common import cache_key, cached
+from providers.common import cache_key, cached, script_body
 
 LOOKUP = "https://itunes.apple.com/lookup"
 SEARCH = "https://itunes.apple.com/search"
@@ -24,22 +24,17 @@ NOTICE = (
 NAME_MATCH = "Matched by name on the public iTunes Search API, not from a MusicBrainz URL."
 WEB_NOTICE = (
     "iTunes Search was refused from this network. "
-    "These dates were read from public music.apple.com pages: music:release_date on the album page when it was present, "
-    "otherwise the year printed on the album shelf. No Apple login or token is used."
+    "These dates were read from the public music.apple.com album shelf. "
+    "At most 3 album pages are checked for music:release_date; every other release keeps the shelf year. "
+    "No Apple login or token is used."
 )
 FRESH_TTL = 6 * 60 * 60
 STALE_TTL = 7 * 24 * 60 * 60
-WEB_EXACT_LIMIT = 8
-SHELF_TITLES = {"Albums", "Singles & EPs", "Live Albums"}
-_SERVER_DATA = re.compile(
-    r'<script type="application/json" id="serialized-server-data">(.*?)</script>',
-    re.DOTALL,
-)
-_RELEASE_META = re.compile(
-    r'<meta[^>]+property="music:release_date"[^>]+content="([^"]+)"'
-    r'|<meta[^>]+content="([^"]+)"[^>]+property="music:release_date"',
-    re.IGNORECASE,
-)
+WEB_EXACT_LIMIT = 3
+SHELF_MAX_BYTES = 350_000
+ALBUM_MAX_BYTES = 120_000
+SHELF_TITLES = {"albums", "singles & eps", "live albums", "compilations"}
+_SERVER_MARKER = 'id="serialized-server-data"'
 
 
 class ItunesLimited(Exception):
@@ -183,14 +178,64 @@ def _album_row(node: dict) -> dict | None:
     }
 
 
+def _profile_name(block: dict) -> str | None:
+    seo = block.get("seoData")
+    if not isinstance(seo, dict) or not isinstance(seo.get("pageTitle"), str):
+        return None
+    title = seo["pageTitle"].replace("\xa0", " ").strip()
+    for sep in (" – ", " - ", " — ", " | "):
+        if sep in title:
+            title = title.split(sep)[0].strip()
+            break
+    for prefix in ("Albums by ", "Singles & EPs by ", "Singles by ", "Live Albums by "):
+        if title.startswith(prefix):
+            title = title[len(prefix) :].strip()
+            break
+    return title or None
+
+
+def _keep_section(title: str) -> bool:
+    """The full-albums page titles the shelf 'Albums by <name>', not 'Albums'."""
+    if not title:
+        return True
+    folded = title.casefold()
+    if folded in SHELF_TITLES:
+        return True
+    return folded.startswith(tuple(SHELF_TITLES))
+
+
+def _candidate_blocks(payload) -> list[dict]:
+    """Only the shelf objects. Do not walk artwork, playAction, or the rest of the tree."""
+    nodes = payload if isinstance(payload, list) else [payload]
+    blocks: list[dict] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        blocks.append(node)
+        data = node.get("data")
+        if isinstance(data, dict):
+            blocks.append(data)
+            continue
+        if not isinstance(data, list):
+            continue
+        for entry in data[:12]:
+            if not isinstance(entry, dict):
+                continue
+            blocks.append(entry)
+            inner = entry.get("data")
+            if isinstance(inner, dict):
+                blocks.append(inner)
+    return blocks
+
+
 def parse_apple_albums(html: str) -> tuple[str | None, list[dict]]:
-    """Albums embedded in a public music.apple.com page. Years only; album pages add the clock time."""
-    match = _SERVER_DATA.search(html or "")
-    if not match:
+    """Albums from the serialized-server-data script. Years only; a few album pages add the clock time."""
+    raw = script_body(html or "", _SERVER_MARKER)
+    if not raw:
         return None, []
     try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError, MemoryError, ValueError):
         return None, []
     profile = None
     albums: list[dict] = []
@@ -205,61 +250,66 @@ def parse_apple_albums(html: str) -> tuple[str | None, list[dict]]:
         seen.add(key)
         albums.append(row)
 
-    def walk_sections(node) -> None:
-        nonlocal profile
-        if isinstance(node, dict):
-            seo = node.get("seoData")
-            if isinstance(seo, dict) and isinstance(seo.get("pageTitle"), str) and profile is None:
-                title = seo["pageTitle"]
-                for sep in (" – ", " - ", " — "):
-                    if sep in title:
-                        title = title.split(sep)[0]
-                        break
-                title = title.removeprefix("Albums by ").removeprefix("Singles by ").strip(" ‎")
-                profile = title or None
-            sections = node.get("sections")
-            if isinstance(sections, list):
-                for section in sections:
-                    if not isinstance(section, dict):
-                        continue
-                    title = _shelf_title(section)
-                    if title and title not in SHELF_TITLES:
-                        continue
-                    for item in section.get("items") or []:
-                        if isinstance(item, dict):
-                            add(_album_row(item))
-            for value in node.values():
-                walk_sections(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk_sections(value)
-
-    walk_sections(payload)
-    if not albums:
-        def walk_all(node) -> None:
-            if isinstance(node, dict):
-                add(_album_row(node))
-                for value in node.values():
-                    walk_all(value)
-            elif isinstance(node, list):
-                for value in node:
-                    walk_all(value)
-
-        walk_all(payload)
+    for block in _candidate_blocks(payload):
+        if profile is None:
+            profile = _profile_name(block)
+        sections = block.get("sections")
+        if not isinstance(sections, list):
+            continue
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            title = _shelf_title(section)
+            if not _keep_section(title):
+                continue
+            for item in section.get("items") or []:
+                if isinstance(item, dict):
+                    add(_album_row(item))
     return profile, albums
 
 
+def _meta_content(tag: str) -> str | None:
+    for quote in ('"', "'"):
+        marker = f"content={quote}"
+        at = tag.lower().find(marker)
+        if at < 0:
+            continue
+        begin = at + len(marker)
+        stop = tag.find(quote, begin)
+        if stop < 0:
+            return None
+        return tag[begin:stop]
+    return None
+
+
 def parse_release_meta(html: str) -> str | None:
-    match = _RELEASE_META.search(html or "")
-    if not match:
+    if not html:
         return None
-    return match.group(1) or match.group(2)
+    cursor = 0
+    needle = "music:release_date"
+    while cursor < len(html):
+        at = html.find(needle, cursor)
+        if at < 0:
+            return None
+        start = html.rfind("<meta", max(0, at - 400), at + len(needle))
+        end = html.find(">", at)
+        if start >= 0 and end > start:
+            content = _meta_content(html[start:end])
+            if content:
+                return content
+        cursor = at + len(needle)
+    return None
 
 
-async def _get_html(http, url: str) -> str | None:
+async def _get_html(http, url: str, max_bytes: int) -> str | None:
     try:
-        result = await http.get_text(url, timeout=8, headers={"Accept": "text/html"})
-    except TransportError:
+        result = await http.get_text(
+            url,
+            timeout=8,
+            headers={"Accept": "text/html"},
+            max_bytes=max_bytes,
+        )
+    except (TransportError, MemoryError, Exception):
         return None
     if not result.ok or not result.text:
         return None
@@ -267,29 +317,44 @@ async def _get_html(http, url: str) -> str | None:
 
 
 async def fetch_public_apple(http, artist_id: str, name: str, status: int) -> SourceResult | None:
-    """Public artist and album pages. Used when iTunes answers 403 or 429 with nothing cached."""
-    artist_html, shelf_html = await asyncio.gather(
-        _get_html(http, f"https://music.apple.com/us/artist/{artist_id}"),
-        _get_html(http, f"https://music.apple.com/us/artist/{artist_id}/see-all?section=full-albums"),
-    )
-    profile, albums = (None, [])
-    if shelf_html:
-        profile, albums = parse_apple_albums(shelf_html)
-    if not albums and artist_html:
-        profile, albums = parse_apple_albums(artist_html)
+    """One album-shelf page, then at most 3 album pages. Used when iTunes answers 403 or 429."""
+    try:
+        return await _fetch_public_apple(http, artist_id, name, status)
+    except (MemoryError, Exception):
+        return None
+
+
+async def _canonical_artist_url(http, artist_id: str) -> str:
+    """The id-only shelf URL 404s. A 301 Location carries the slug, and that body is tiny."""
+    direct = f"https://music.apple.com/us/artist/{artist_id}"
+    try:
+        result = await http.get_text(
+            direct,
+            timeout=8,
+            headers={"Accept": "text/html"},
+            allow_redirects=False,
+            max_bytes=4096,
+        )
+    except (TransportError, MemoryError, Exception):
+        return direct
+    location = result.header("location") if result.status in {301, 302, 303, 307, 308} else ""
+    if location.startswith("https://music.apple.com/"):
+        return location.split("?", 1)[0].rstrip("/")
+    return direct
+
+
+async def _fetch_public_apple(http, artist_id: str, name: str, status: int) -> SourceResult | None:
+    # One shelf page (~230KB). The artist detail page is ~800KB and its JSON sits at the end.
+    canonical = await _canonical_artist_url(http, artist_id)
+    shelf_html = await _get_html(http, f"{canonical}/see-all?section=full-albums", SHELF_MAX_BYTES)
+    profile, albums = parse_apple_albums(shelf_html) if shelf_html else (None, [])
     if not albums:
         return None
-    exact = albums[:WEB_EXACT_LIMIT]
-
-    async def one(row: dict) -> str | None:
-        if not row.get("url"):
-            return None
-        html = await _get_html(http, row["url"])
-        if not html:
-            return None
-        return parse_release_meta(html)
-
-    dates = await asyncio.gather(*(one(row) for row in exact))
+    exact = [row for row in albums[:WEB_EXACT_LIMIT] if row.get("url")]
+    dates = []
+    for row in exact:
+        html = await _get_html(http, row["url"], ALBUM_MAX_BYTES)
+        dates.append(parse_release_meta(html) if html else None)
     items = []
     for row, raw in zip(albums, list(dates) + [None] * (len(albums) - len(dates))):
         item = make_item(

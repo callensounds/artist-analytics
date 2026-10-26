@@ -11,7 +11,7 @@ import time
 from analytics import compact_count, scrub, spotify_precision
 from http_client import TransportError
 from models import Metric, SourceResult, errored, make_item, sort_items, unavailable
-from providers.common import cache_key, cached
+from providers.common import cache_key, cached, drop_blocks, script_body, strip_tags
 from runtime import env_get
 
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -35,12 +35,14 @@ KIND_LINE = re.compile(
 LISTENERS_EXACT = re.compile(r"([\d,]{4,})\s+monthly listeners")
 LISTENERS_ROUNDED = re.compile(r"([\d.]+[KMB])\s+monthly listeners", re.I)
 PLAYS = re.compile(r"^[\d,]+$")
+# Open artist pages are large. Keep the head, where the visible shelf and listener text sit.
+PAGE_MAX_BYTES = 400_000
 
 
 def visible_lines(page: str) -> list[str]:
-    text = re.sub(r"<script[\s\S]*?</script>", " ", page or "", flags=re.I)
-    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "\n", text)
+    text = drop_blocks(page or "", "<script", "</script>")
+    text = drop_blocks(text, "<style", "</style>")
+    text = strip_tags(text)
     lines = []
     for line in text.splitlines():
         cleaned = html.unescape(re.sub(r"\s+", " ", line).strip())
@@ -103,12 +105,12 @@ def parse_popular(lines: list[str]) -> list[tuple[str, int | None]]:
 
 
 def parse_embed_state(page: str) -> dict:
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', page or "", re.S)
-    if not match:
+    raw = script_body(page or "", 'id="__NEXT_DATA__"')
+    if not raw:
         return {}
     try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, MemoryError, RecursionError, ValueError):
         return {}
     entity = (
         ((payload.get("props") or {}).get("pageProps") or {})
@@ -314,11 +316,21 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
         except TransportError:
             oembed_result, oembed_payload = None, None
         try:
-            artist_page = await http.get_text(artist_url, timeout=15, allow_redirects=False)
+            artist_page = await http.get_text(
+                artist_url,
+                timeout=15,
+                allow_redirects=False,
+                max_bytes=PAGE_MAX_BYTES,
+            )
         except TransportError as exc:
             return unavailable("spotify", "Spotify", str(exc))
         try:
-            embed_page = await http.get_text(embed_url, timeout=12, allow_redirects=False)
+            embed_page = await http.get_text(
+                embed_url,
+                timeout=12,
+                allow_redirects=False,
+                max_bytes=PAGE_MAX_BYTES,
+            )
         except TransportError:
             embed_page = None
 

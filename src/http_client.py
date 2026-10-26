@@ -24,6 +24,21 @@ class TransportError(Exception):
     pass
 
 
+def _read_body(response, max_bytes: int | None) -> str:
+    """Keep at most max_bytes of the body.
+
+    urllib3's emscripten streaming path calls pyodide.ffi.run_sync on
+    response.body.getReader().read(). That is a second promising task inside
+    the fetch that already used run_sync, which raises
+    SystemError: Cannot enter a promising task from inside another running
+    promising task. Slice the buffered body instead.
+    """
+    text = response.text or ""
+    if max_bytes and len(text) > max_bytes:
+        return text[:max_bytes]
+    return text
+
+
 @dataclass
 class HttpResult:
     status: int
@@ -71,6 +86,7 @@ class RequestsClient:
         data: dict | None = None,
         timeout: float = 12.0,
         allow_redirects: bool = True,
+        max_bytes: int | None = None,
     ) -> HttpResult:
         await self._wait(url)
         merged = {"User-Agent": USER_AGENT, "Accept": "application/json, text/html;q=0.9"}
@@ -78,6 +94,7 @@ class RequestsClient:
             merged.update(headers)
 
         def send():
+            response = None
             try:
                 response = requests.request(
                     method,
@@ -93,9 +110,15 @@ class RequestsClient:
             except requests.RequestException as exc:
                 raise TransportError("The service could not be reached.") from exc
             header_map = {key.lower(): value for key, value in response.headers.items()}
+            try:
+                text = _read_body(response, max_bytes)
+            finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
             return HttpResult(
                 status=response.status_code,
-                text=response.text or "",
+                text=text,
                 url=str(response.url),
                 headers=header_map,
             )

@@ -32,6 +32,64 @@ async def cached(cache, key: str, producer) -> SourceResult:
     return result
 
 
+def script_body(html: str, marker: str) -> str | None:
+    """The text inside the first <script> whose tag contains marker. Linear scan, no regex."""
+    if not html or not marker:
+        return None
+    at = html.find(marker)
+    if at < 0:
+        return None
+    start = html.find(">", at)
+    if start < 0 or start - at > 400:
+        return None
+    end = html.find("</script>", start)
+    if end < 0:
+        return None
+    return html[start + 1 : end]
+
+
+def drop_blocks(text: str, start_tag: str, end_tag: str) -> str:
+    """Remove start_tag...end_tag regions with str.find. Case-insensitive, non-overlapping."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    start_l = start_tag.lower()
+    end_l = end_tag.lower()
+    parts = []
+    cursor = 0
+    while cursor < len(text):
+        start = lowered.find(start_l, cursor)
+        if start < 0:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor:start])
+        end = lowered.find(end_l, start + len(start_l))
+        if end < 0:
+            break
+        cursor = end + len(end_l)
+    return "".join(parts)
+
+
+def strip_tags(text: str) -> str:
+    """Replace tags with newlines. The scan stops at the next '>' so it stays linear."""
+    if not text:
+        return ""
+    parts = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("<", cursor)
+        if start < 0:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor:start])
+        end = text.find(">", start + 1)
+        if end < 0:
+            break
+        parts.append("\n")
+        cursor = end + 1
+    return "".join(parts)
+
+
 def apple_artist_id(url: str) -> str | None:
     match = re.search(r"(?:music|itunes)\.apple\.com/.*/artist/(?:[^/]+/)?(\d+)", url or "")
     return match.group(1) if match else None

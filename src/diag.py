@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from providers.youtube import redact_key, youtube_url
-from runtime import describe_env, env_get
+from runtime import env_get
 
 PROBE_ARTIST = "159260351"
 YOUTUBE_PARAMS = {"part": "id", "forHandle": "@TaylorSwift"}
@@ -41,6 +41,9 @@ async def _probe(http, url: str, headers: dict | None = None, secret: str | None
 
 
 async def diagnose(env, http) -> dict:
+    # JS secret introspection is imported only when this logged-in page runs.
+    from diag_secrets import describe_env
+
     key = env_get(env, "YOUTUBE_API_KEY")
     plain = youtube_url("channels", YOUTUBE_PARAMS)
     built = youtube_url("channels", {**YOUTUBE_PARAMS, "key": key}) if key else None

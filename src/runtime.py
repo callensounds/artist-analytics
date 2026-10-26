@@ -17,315 +17,69 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 FALLBACK_SESSION_SECRET = "artist-analytics-demo-session-secret"
 
 
-# str() of a Worker secret is often "[object Object]" or "undefined".
-# Those are not the secret. Google then answers "API key not valid".
-_UNUSABLE_SECRET = {
+# A Worker binding sometimes stringifies to one of these. None of them is a secret.
+_REJECTED_SECRETS = {
     "",
     "none",
     "undefined",
     "null",
     "[object object]",
     "[object string]",
+    "[redacted]",
 }
 
-SECRET_NAMES = (
-    "YOUTUBE_API_KEY",
-    "SECRET_KEY",
-    "SPOTIFY_CLIENT_ID",
-    "SPOTIFY_CLIENT_SECRET",
-)
 
-
-def _usable_secret(text: str | None) -> str | None:
-    if not isinstance(text, str):
-        return None
-    text = text.strip()
-    if text.casefold() in _UNUSABLE_SECRET:
-        return None
-    if text.startswith("<") and ("JsProxy" in text or "object at 0x" in text):
-        return None
-    if "\n" in text or "\r" in text:
-        return None
-    return text
-
-
-def fingerprint(text: str | None) -> dict:
-    """Length and a 4-character prefix. Never the rest of the value."""
-    usable = _usable_secret(text) if isinstance(text, str) else None
-    raw = text.strip() if isinstance(text, str) else ""
-    folded = raw.casefold()
-    return {
-        "length": len(usable) if usable is not None else (len(raw) if isinstance(text, str) else None),
-        "prefix4": (usable or raw)[:4] if isinstance(text, str) and (usable or raw) else None,
-        "is_object_object": folded == "[object object]",
-        "is_undefined": folded in {"undefined", "null", "none"},
-        "usable": usable is not None,
-    }
-
-
-def _js_typeof(value) -> tuple[str | None, str | None]:
-    """Object.prototype.toString. new Function is banned in Workers."""
-    if isinstance(value, str):
-        return "string", None
-    if value is None:
-        return "undefined", None
-    if isinstance(value, bool):
-        return "boolean", None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return "number", None
-    try:
-        import js
-    except Exception as exc:
-        return None, f"import js: {type(exc).__name__}"
-    try:
-        tag = js.Object.prototype.toString.call(value)
-        tag = tag if isinstance(tag, str) else str(tag)
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"[:160]
-    if tag.startswith("[object ") and tag.endswith("]"):
-        kind = tag[8:-1]
-        return {
-            "String": "string",
-            "Number": "number",
-            "Boolean": "boolean",
-            "Undefined": "undefined",
-            "Null": "object",
-            "Array": "object",
-        }.get(kind, "object"), None
-    return None, tag[:80]
-
-
-def _json_stringify(value):
-    try:
-        import js
-    except Exception:
-        return None
-    try:
-        return js.JSON.stringify(value)
-    except Exception:
-        return None
-
-
-def _js_constructor(value) -> str | None:
-    try:
-        ctor = getattr(value, "constructor", None)
-        name = getattr(ctor, "name", None)
-    except Exception:
-        return None
-    if not isinstance(name, str) or not name or name in {"undefined", "None"}:
-        return None
-    return name
-
-
-def _json_string(value) -> str | None:
-    """JSON.stringify round-trips a real string, including a boxed String. No eval."""
-    encoded = _json_stringify(value)
-    if encoded is None:
-        return None
-    if not isinstance(encoded, str):
+def _iter_plain(env, name: str):
+    """Attribute and dict reads only. No js module, no workers.env, no to_py."""
+    if isinstance(env, dict):
+        yield env.get(name)
+    elif env is not None:
         try:
-            encoded = str(encoded)
+            yield getattr(env, name)
         except Exception:
-            return None
-    if encoded in {"", "undefined", "null"}:
-        return None
-    if len(encoded) >= 2 and encoded[0] == '"' and encoded[-1] == '"':
+            pass
+        nested = getattr(env, "_env", None)
+        if nested is not None and nested is not env:
+            try:
+                yield getattr(nested, name)
+            except Exception:
+                pass
+    if name in os.environ:
+        yield os.environ.get(name)
+
+
+def _as_text(value) -> str | None:
+    if isinstance(value, bytes):
         try:
-            text = json.loads(encoded)
-        except json.JSONDecodeError:
+            value = value.decode()
+        except UnicodeDecodeError:
             return None
-        if isinstance(text, str):
+    if not isinstance(value, str):
+        return None
+    return value.strip()
+
+
+def env_string(env, name: str) -> str | None:
+    """The first plain string on the binding, including a rejected placeholder."""
+    for value in _iter_plain(env, name):
+        text = _as_text(value)
+        if text:
             return text
     return None
 
 
-def _indexed_string(value) -> str | None:
-    """A boxed JS String has numeric indexes and a length. Join those characters."""
-    try:
-        length = int(value.length)
-    except Exception:
-        return None
-    if length <= 0 or length > 256:
-        return None
-    chars = []
-    for index in range(length):
-        try:
-            piece = value[index]
-        except Exception:
-            return None
-        if not isinstance(piece, str):
-            piece = _json_string(piece)
-        if not isinstance(piece, str) or len(piece) != 1:
-            return None
-        chars.append(piece)
-    return "".join(chars)
-
-
-def coercions(value) -> list[tuple[str, str | None]]:
-    """Every way to read one binding, in the order we trust them."""
-    found: list[tuple[str, str | None]] = []
-    if isinstance(value, bytes):
-        try:
-            found.append(("bytes", value.decode()))
-        except UnicodeDecodeError:
-            found.append(("bytes", None))
-    if isinstance(value, str):
-        found.append(("python-str", value))
-    found.append(("json-stringify", _json_string(value)))
-    to_py = getattr(value, "to_py", None)
-    if callable(to_py):
-        try:
-            converted = to_py()
-        except Exception:
-            converted = None
-        if isinstance(converted, bytes):
-            try:
-                converted = converted.decode()
-            except UnicodeDecodeError:
-                converted = None
-        found.append(("to_py", converted if isinstance(converted, str) else None))
-    value_of = getattr(value, "valueOf", None)
-    if callable(value_of):
-        try:
-            converted = value_of()
-        except Exception:
-            converted = None
-        if not isinstance(converted, str):
-            converted = _json_string(converted) if converted is not None else None
-        found.append(("valueOf", converted if isinstance(converted, str) else None))
-    found.append(("indexed-chars", _indexed_string(value)))
-    if not isinstance(value, str):
-        try:
-            found.append(("str", str(value)))
-        except Exception:
-            found.append(("str", None))
-    return found
-
-
-def _looks_like_api_key(text: str) -> bool:
-    if not text.startswith("AIza"):
-        return False
-    if not 30 <= len(text) <= 128:
-        return False
-    return all(char.isalnum() or char in "-_" for char in text)
-
-
-def _best_text(name: str, options: list[tuple[str, str]]) -> tuple[str | None, str | None]:
-    usable = [(path, text) for path, text in options if _usable_secret(text)]
-    if name == "YOUTUBE_API_KEY":
-        for path, text in usable:
-            if _looks_like_api_key(text):
-                return path, text
-    if usable:
-        return usable[0]
-    return None, None
-
-
-def _read_attr(source, name: str):
-    try:
-        return True, getattr(source, name)
-    except Exception as exc:
-        return False, exc
-
-
-def _read_item(source, name: str):
-    try:
-        return True, source[name]
-    except Exception as exc:
-        return False, exc
-
-
-def iter_bindings(env, name: str):
-    """Yield (path, ok, value_or_error) for each place a secret might live."""
-    if isinstance(env, dict):
-        yield "dict", True, env.get(name)
-    elif env is not None:
-        ok, value = _read_attr(env, name)
-        yield "env-attr", ok, value
-        ok, value = _read_item(env, name)
-        yield "env-item", ok, value
-        raw = getattr(env, "_env", None)
-        if raw is not None and raw is not env:
-            ok, value = _read_attr(raw, name)
-            yield "wrapper-env-attr", ok, value
-            ok, value = _read_item(raw, name)
-            yield "wrapper-env-item", ok, value
-    else:
-        yield "env", False, None
-    if name in os.environ:
-        yield "os.environ", True, os.environ.get(name)
-    else:
-        yield "os.environ", False, None
-    try:
-        from workers import env as workers_env
-    except Exception as exc:
-        yield "workers.env", False, exc
-    else:
-        ok, value = _read_attr(workers_env, name)
-        yield "workers.env-attr", ok, value
-
-
-def choose_secret(env, name: str) -> dict:
-    """Pick a secret string and record how each path looked. No full values leave this dict's text field."""
-    reads = []
-    options: list[tuple[str, str]] = []
-    for path, ok, value in iter_bindings(env, name):
-        if not ok:
-            error = value
-            reads.append(
-                {
-                    "path": path,
-                    "present": False,
-                    "python_type": type(error).__name__ if isinstance(error, BaseException) else None,
-                    "js_typeof": None,
-                    "js_error": None,
-                    "js_constructor": None,
-                    "coercions": [],
-                    "error": type(error).__name__ if isinstance(error, BaseException) else "missing",
-                }
-            )
-            continue
-        row_options = []
-        for method, text in coercions(value):
-            if text is None:
-                continue
-            row_options.append((f"{path}:{method}", text))
-            options.append((f"{path}:{method}", text))
-        js_typeof, js_error = _js_typeof(value)
-        reads.append(
-            {
-                "path": path,
-                "present": value is not None,
-                "python_type": type(value).__name__,
-                "js_typeof": js_typeof,
-                "js_error": js_error,
-                "js_constructor": _js_constructor(value),
-                "coercions": [
-                    {"method": method.split(":", 1)[-1], **fingerprint(text)} for method, text in row_options
-                ],
-                "error": None,
-            }
-        )
-    chosen_path, chosen_text = _best_text(name, options)
-    return {"name": name, "path": chosen_path, "text": chosen_text, "reads": reads}
-
-
-def describe_secret(env, name: str) -> dict:
-    chosen = choose_secret(env, name)
-    return {
-        "name": name,
-        "chosen_path": chosen["path"],
-        "chosen": fingerprint(chosen["text"]),
-        "reads": chosen["reads"],
-    }
-
-
-def describe_env(env) -> dict:
-    return {"secrets": [describe_secret(env, name) for name in SECRET_NAMES]}
-
-
 def env_get(env, name: str) -> str | None:
-    return choose_secret(env, name)["text"]
+    """A usable secret string. Placeholders and non-strings are skipped."""
+    for value in _iter_plain(env, name):
+        text = _as_text(value)
+        if not text or text.casefold() in _REJECTED_SECRETS:
+            continue
+        if text.startswith("<") and ("JsProxy" in text or "object at 0x" in text):
+            continue
+        if "\n" in text or "\r" in text:
+            continue
+        return text
+    return None
 
 
 class WorkerSessionMiddleware:
