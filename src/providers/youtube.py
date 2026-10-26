@@ -100,6 +100,11 @@ def choose_channel(channels: list[dict]) -> dict | None:
     return best
 
 
+def youtube_key_configured(api_key: str) -> bool:
+    """A real Data API key starts with AIza. The literal placeholder must not be sent to Google."""
+    return api_key.startswith("AIza") and api_key != "[REDACTED]"
+
+
 async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResult:
     api_key = env_get(env, "YOUTUBE_API_KEY")
     if not api_key:
@@ -108,6 +113,8 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
             "YouTube",
             "Set the Worker secret YOUTUBE_API_KEY. Public upload times use the Data API; no user OAuth.",
         )
+    if not youtube_key_configured(api_key):
+        return errored("youtube", "YouTube", "YouTube key is misconfigured")
     channel_ids = list((links or {}).get("youtube_channel_ids") or [])
     handles = list((links or {}).get("youtube_handles") or [])
 

@@ -113,7 +113,7 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
     async def produce() -> SourceResult:
         url = f"https://www.instagram.com/{handle}/embed/"
         try:
-            result = await http.get_text(url, timeout=15, allow_redirects=False)
+            result = await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=300_000)
         except TransportError as exc:
             return unavailable("instagram", "Instagram", str(exc))
         if login_wall(result):

@@ -32,8 +32,14 @@ async def _bounded(coro, platform: str, label: str):
             label,
             "This source took too long and was skipped so the rest of the page could load.",
         )
+    except MemoryError:
+        return errored(
+            platform,
+            label,
+            "This source used too much memory and was skipped so the rest of the page could load.",
+        )
     except Exception:
-        return None
+        return errored(platform, label, "This source failed and was skipped so the rest of the page could load.")
 
 
 async def _finish_catalog(rest, partial):

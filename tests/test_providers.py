@@ -6,12 +6,21 @@ from http_client import HttpResult
 from models import make_item
 from providers.common import cache_key
 from runtime import env_get
-from providers.apple import LOOKUP, SEARCH, fetch_apple, itunes_url, parse_collections
+from providers.apple import (
+    LOOKUP,
+    SEARCH,
+    WEB_EXACT_LIMIT,
+    fetch_apple,
+    itunes_url,
+    parse_apple_albums,
+    parse_collections,
+    parse_release_meta,
+)
 from providers.instagram import parse_embed
 from providers.musicbrainz import aggregate_catalog, extract_links
 from providers.spotify import fetch_spotify, parse_albums, parse_discography, parse_monthly_listeners, parse_popular, visible_lines
 from providers.tiktok import parse_embed_videos, parse_profile, parse_video
-from providers.youtube import parse_videos
+from providers.youtube import fetch_youtube, parse_videos
 from providers import collect_artist
 
 
@@ -797,6 +806,70 @@ def test_apple_public_page_is_used_when_itunes_is_forbidden():
     assert result.items[0].display == "2020-01-02 08:00 UTC"
     assert any("music.apple.com" in note for note in result.notices)
     assert any("HTTP 403" in note for note in result.notices)
+
+
+def test_apple_public_fallback_reads_a_script_slice_and_caps_album_pages():
+    assert WEB_EXACT_LIMIT == 3
+    rows = []
+    for number in range(6):
+        rows.append(
+            "{"
+            f'"titleLinks":[{{"title":"Album {number}"}}],'
+            f'"subtitleLinks":[{{"title":"201{number}"}}],'
+            '"contentDescriptor":{"kind":"album",'
+            f'"url":"https://music.apple.com/us/album/a/{number}",'
+            f'"identifiers":{{"storeAdamID":"{number}"}}}}'
+            "}"
+        )
+    shelf = (
+        '<script type="application/json" id="serialized-server-data">'
+        '{"data":[{"data":{"seoData":{"pageTitle":"Example - Apple Music"},"sections":['
+        '{"header":{"item":{"titleLink":{"title":"Albums"}}},"items":['
+        + ",".join(rows)
+        + "]}]}}]}</script>"
+        + ("<p>padding</p>" * 1000)
+    )
+    profile, albums = parse_apple_albums(shelf)
+    assert profile == "Example"
+    assert len(albums) == 6
+    assert parse_release_meta('<meta content="2020-01-02T08:00:00Z" property="music:release_date">') == (
+        "2020-01-02T08:00:00Z"
+    )
+    album_urls = []
+
+    def respond(method, url, params, data):
+        if "itunes.apple.com" in url:
+            return HttpResult(403, "", url, {})
+        if "/album/" in url:
+            album_urls.append(url)
+            return HttpResult(200, '<meta property="music:release_date" content="2020-01-02T08:00:00Z">', url, {})
+        if "music.apple.com" in url:
+            return HttpResult(200, shelf, url, {})
+        return HttpResult(404, "", url, {})
+
+    result = asyncio.run(fetch_apple("Example", {"apple_id": "5"}, FakeHttp(respond), MemoryCache({})))
+    assert result.status == "ok"
+    assert len(album_urls) == 3
+    assert sum(item.precision == "time" for item in result.items) == 3
+    assert sum(item.precision == "year" for item in result.items) == 3
+
+
+def test_youtube_misconfigured_key_is_not_sent():
+    calls = []
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        return HttpResult(200, "{}", url, {})
+
+    http = FakeHttp(respond)
+    placeholder = asyncio.run(
+        fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "[REDACTED]"}, http, MemoryCache({}))
+    )
+    short = asyncio.run(fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "not-a-google-key"}, http, MemoryCache({})))
+    assert placeholder.status == "error"
+    assert placeholder.reason == "YouTube key is misconfigured"
+    assert short.reason == "YouTube key is misconfigured"
+    assert calls == []
 
 
 def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):

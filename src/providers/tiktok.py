@@ -4,29 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 
 from analytics import compact_count
 from http_client import TransportError
 from models import Metric, SourceResult, make_unix_item, sort_items, unavailable
-from providers.common import cache_key, cached
+from providers.common import cache_key, cached, script_body
 
 MAX_VIDEOS = 6
-SCRIPT_RE = re.compile(
-    r'<script id="(?P<id>__UNIVERSAL_DATA_FOR_REHYDRATION__|__FRONTITY_CONNECT_STATE__)"[^>]*>(?P<body>.*?)</script>',
-    re.S,
-)
+PAGE_MAX_BYTES = 400_000
 
 
 def script_json(html: str, script_id: str):
-    for match in SCRIPT_RE.finditer(html or ""):
-        if match.group("id") != script_id:
-            continue
-        try:
-            return json.loads(match.group("body"))
-        except json.JSONDecodeError:
-            return None
-    return None
+    raw = script_body(html or "", f'id="{script_id}"')
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, MemoryError, RecursionError, ValueError):
+        return None
 
 
 def login_wall(result) -> bool:
@@ -99,7 +94,7 @@ def parse_video(html: str) -> dict | None:
 
 async def _get(http, url: str):
     try:
-        return await http.get_text(url, timeout=15, allow_redirects=False)
+        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=PAGE_MAX_BYTES)
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
 
