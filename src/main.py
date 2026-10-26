@@ -2,7 +2,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from providers import collect_artist
@@ -19,7 +19,16 @@ app.add_middleware(WorkerSessionMiddleware, fallback_secret=FALLBACK_SESSION_SEC
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
 # so a ../templates path exists locally and 500s on every HTML route after deploy.
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+_CSS_PATH = Path(__file__).resolve().parent / "static" / "app.css"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+# Browsers request /favicon.ico even when a page also links an icon.
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="6" fill="#0f172a"/>'
+    '<text x="16" y="23" text-anchor="middle" font-size="18" fill="#34d399">&#9834;</text>'
+    "</svg>"
+)
 
 # Demo login stays available even when accounts are only in memory.
 USERS = {
@@ -41,6 +50,22 @@ def get_current_user(request: Request):
         if user["id"] == user_id:
             return user
     return None
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml")
+
+
+@app.get("/static/app.css")
+async def app_css():
+    if not _CSS_PATH.is_file():
+        return Response(status_code=404)
+    return Response(
+        content=_CSS_PATH.read_text(encoding="utf-8"),
+        media_type="text/css",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/", response_class=HTMLResponse)

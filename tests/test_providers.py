@@ -4,7 +4,9 @@ import json
 from cache import MemoryCache
 from http_client import HttpResult
 from models import make_item
-from providers.apple import fetch_apple, parse_collections
+from providers.common import cache_key
+from runtime import env_get
+from providers.apple import LOOKUP, SEARCH, fetch_apple, itunes_url, parse_collections
 from providers.instagram import parse_embed
 from providers.musicbrainz import aggregate_catalog, extract_links
 from providers.spotify import fetch_spotify, parse_albums, parse_discography, parse_monthly_listeners, parse_popular, visible_lines
@@ -436,3 +438,263 @@ def test_collect_reports_missing_secrets_and_does_not_invent_metrics():
     blob = json.dumps(bundle)
     assert "1.2M" not in blob
     assert "[12, 28, 35, 18]" not in blob
+    assert "_mbid" not in blob
+
+
+def test_env_get_unwraps_a_jsproxy_secret_and_rejects_object_string():
+    class ProxyKey:
+        def to_py(self):
+            return "AIzaExactKey123"
+
+        def __str__(self):
+            return "[object Object]"
+
+    class Garbage:
+        def __str__(self):
+            return "[object Object]"
+
+    class Env:
+        def __init__(self, value):
+            self.YOUTUBE_API_KEY = value
+
+    assert env_get(Env(ProxyKey()), "YOUTUBE_API_KEY") == "AIzaExactKey123"
+    assert env_get(Env(Garbage()), "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "undefined"}, "YOUTUBE_API_KEY") is None
+
+
+def test_youtube_request_url_contains_the_exact_api_key():
+    class ProxyKey:
+        def to_py(self):
+            return "AIzaExactKey123"
+
+        def __str__(self):
+            return "[object Object]"
+
+    class Env:
+        YOUTUBE_API_KEY = ProxyKey()
+
+    urls = []
+
+    def respond(method, url, params, data):
+        urls.append(url)
+        if "/youtube/v3/search?" in url:
+            body = {
+                "items": [
+                    {"id": {"channelId": "UCexact"}, "snippet": {"title": "Callen Sounds"}},
+                ]
+            }
+        elif "/youtube/v3/channels?" in url:
+            body = {
+                "items": [
+                    {
+                        "id": "UCexact",
+                        "snippet": {"title": "Callen Sounds"},
+                        "statistics": {"subscriberCount": "12", "hiddenSubscriberCount": False},
+                        "contentDetails": {"relatedPlaylists": {"uploads": "UUexact"}},
+                    }
+                ]
+            }
+        elif "/youtube/v3/playlistItems?" in url:
+            body = {
+                "items": [
+                    {
+                        "snippet": {
+                            "title": "First",
+                            "publishedAt": "2024-05-01T15:04:05Z",
+                            "resourceId": {"videoId": "vid1"},
+                        },
+                        "contentDetails": {"videoId": "vid1", "videoPublishedAt": "2024-05-01T15:04:05Z"},
+                    }
+                ]
+            }
+        else:
+            return HttpResult(404, "", url, {})
+        return HttpResult(200, json.dumps(body), url, {})
+
+    from providers.youtube import fetch_youtube
+
+    result = asyncio.run(
+        fetch_youtube("Callen Sounds", {}, Env(), FakeHttp(respond), MemoryCache({}))
+    )
+    assert urls
+    assert result.status == "ok"
+    assert any("Matched by name" in note for note in result.notices)
+    for url in urls:
+        assert "key=AIzaExactKey123" in url
+        assert "[object Object]" not in url
+        assert "undefined" not in url
+    assert "AIzaExactKey123" not in (result.reason or "")
+    assert "AIzaExactKey123" not in " ".join(result.notices)
+
+
+def test_apple_lookup_by_id_does_not_search_and_429_uses_stale_cache(monkeypatch):
+    async def no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("providers.apple.asyncio.sleep", no_sleep)
+    lookup = itunes_url(LOOKUP, {"id": "5", "entity": "album", "limit": "100", "country": "us"})
+    stale = {
+        "results": [
+            {"wrapperType": "artist", "artistId": 5, "artistName": "Example", "artistLinkUrl": "https://music.apple.com/a/5"},
+            {
+                "wrapperType": "collection",
+                "artistId": 5,
+                "collectionId": 8,
+                "collectionName": "Debut",
+                "releaseDate": "2020-01-02T08:00:00Z",
+                "collectionType": "Album",
+            },
+        ]
+    }
+    cache = MemoryCache({})
+
+    async def seed():
+        await cache.set(
+            cache_key("itunes-stale", lookup),
+            json.dumps({"at": "2026-01-02 03:04 UTC", "body": stale}),
+            1000,
+        )
+
+    asyncio.run(seed())
+    calls = []
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        if "itunes.apple.com/search" in url:
+            return HttpResult(500, "search should not run", url, {})
+        return HttpResult(429, "", url, {})
+
+    result = asyncio.run(fetch_apple("Example", {"apple_id": "5"}, FakeHttp(respond), cache))
+    assert calls
+    assert all("itunes.apple.com/search" not in url for url in calls)
+    assert len(calls) == 2
+    assert result.status == "ok"
+    assert result.items[0].display == "2020-01-02 08:00 UTC"
+    assert result.reason == "Apple is rate-limiting; showing cached data from 2026-01-02 03:04 UTC."
+
+
+def test_apple_403_without_cache_says_try_again(monkeypatch):
+    async def no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("providers.apple.asyncio.sleep", no_sleep)
+    calls = []
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        return HttpResult(403, "", url, {})
+
+    result = asyncio.run(fetch_apple("Example", {"apple_id": "5"}, FakeHttp(respond), MemoryCache({})))
+    assert len(calls) == 1
+    assert result.status == "unavailable"
+    assert "HTTP 403" in result.reason
+    assert "Try again shortly" in result.reason
+
+
+def test_unmatched_artist_is_labeled_matched_by_name_and_does_not_invent_counts():
+    def respond(method, url, params, data):
+        if "musicbrainz.org/ws/2/artist/" in url and params and "query" in (params or {}):
+            body = {"artists": []}
+        elif "itunes.apple.com/search" in url:
+            assert "entity=musicArtist" in url
+            body = {"results": [{"wrapperType": "artist", "artistId": 42, "artistName": "Callen Sounds"}]}
+        elif "itunes.apple.com/lookup" in url:
+            assert "id=42" in url
+            assert "entity=album" in url
+            body = {
+                "results": [
+                    {"wrapperType": "artist", "artistId": 42, "artistName": "Callen Sounds"},
+                    {
+                        "wrapperType": "collection",
+                        "artistId": 42,
+                        "collectionId": 7,
+                        "collectionName": "Demo",
+                        "releaseDate": "2024-03-01T08:00:00Z",
+                        "collectionType": "Album",
+                    },
+                ]
+            }
+        elif "/youtube/v3/search?" in url:
+            body = {"items": [{"id": {"channelId": "UCname"}, "snippet": {"title": "Callen Sounds"}}]}
+        elif "/youtube/v3/channels?" in url:
+            body = {
+                "items": [
+                    {
+                        "id": "UCname",
+                        "snippet": {"title": "Callen Sounds"},
+                        "statistics": {"hiddenSubscriberCount": True},
+                        "contentDetails": {"relatedPlaylists": {"uploads": "UUname"}},
+                    }
+                ]
+            }
+        elif "/youtube/v3/playlistItems?" in url:
+            body = {"items": []}
+        else:
+            return HttpResult(404, "", url, {})
+        return HttpResult(200, json.dumps(body), url, {})
+
+    bundle = asyncio.run(
+        collect_artist(
+            "Callen Sounds",
+            env={"YOUTUBE_API_KEY": "AIzaExactKey123"},
+            http=FakeHttp(respond),
+            cache=MemoryCache({}),
+        )
+    )
+    by_platform = {source["platform"]: source for source in bundle["sources"]}
+    assert by_platform["musicbrainz"]["status"] == "unavailable"
+    assert any("Matched by name" in note for note in by_platform["apple"]["notices"])
+    assert any("Matched by name" in note for note in by_platform["youtube"]["notices"])
+    assert "not guessed" in by_platform["spotify"]["reason"]
+    assert "not guessed" in by_platform["instagram"]["reason"]
+    blob = json.dumps(bundle)
+    assert "1.2M" not in blob
+    assert "AIzaExactKey123" not in blob
+
+
+def test_catalog_overlaps_the_other_providers():
+    events = []
+
+    class DelayHttp(FakeHttp):
+        async def get_text(self, url, **kwargs):
+            if "release-group" in url:
+                events.append("rg-start")
+                await asyncio.sleep(0.15)
+                events.append("rg-end")
+            if "itunes.apple.com" in url:
+                events.append("apple-start")
+                await asyncio.sleep(0.05)
+                events.append("apple-end")
+            return await super().get_text(url, **kwargs)
+
+    def respond(method, url, params, data):
+        if "musicbrainz.org/ws/2/artist/" in url and params and "query" in (params or {}):
+            body = {"artists": [{"id": "mbid-1", "name": "Example Artist", "score": 100}]}
+        elif url.endswith("/artist/mbid-1"):
+            body = {
+                "name": "Example Artist",
+                "relations": [{"url": {"resource": "https://music.apple.com/us/artist/example/5"}}],
+            }
+        elif "release-group" in url:
+            body = {"release-groups": []}
+        elif "musicbrainz.org/ws/2/release" in url:
+            body = {"releases": []}
+        elif "itunes.apple.com/lookup" in url:
+            body = {
+                "results": [
+                    {"wrapperType": "artist", "artistId": 5, "artistName": "Example Artist"},
+                    {
+                        "wrapperType": "collection",
+                        "artistId": 5,
+                        "collectionId": 8,
+                        "collectionName": "Debut",
+                        "releaseDate": "2020-01-02T08:00:00Z",
+                    },
+                ]
+            }
+        else:
+            return HttpResult(404, "", url, {})
+        return HttpResult(200, json.dumps(body), url, {})
+
+    asyncio.run(collect_artist("Example Artist", env={}, http=DelayHttp(respond), cache=MemoryCache({})))
+    assert events.index("apple-start") < events.index("rg-start") < events.index("apple-end")

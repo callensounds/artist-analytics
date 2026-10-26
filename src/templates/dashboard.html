@@ -8,7 +8,7 @@
 {% block content %}
 <div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-6">
     <div>
-        <h1 class="text-3xl font-bold">{{ query }}</h1>
+        <h1 class="text-2xl sm:text-3xl font-bold break-words">{{ query }}</h1>
         <p class="text-slate-400 text-sm mt-1">Public release times and post times. Missing data stays blank.</p>
     </div>
     <form method="get" action="/dashboard" class="flex gap-2 w-full md:w-auto">
@@ -16,7 +16,7 @@
         <input id="artist" name="artist" value="{{ query }}" required maxlength="120"
                class="flex-1 md:w-72 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:border-emerald-500"
                placeholder="Artist name">
-        <button type="submit" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Analyze</button>
+        <button type="submit" class="shrink-0 bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Analyze</button>
     </form>
 </div>
 
@@ -106,7 +106,7 @@
         {% endif %}
 
         {% if source.metrics %}
-        <dl class="grid grid-cols-2 gap-3 mb-4">
+        <dl class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
             {% for metric in source.metrics %}
             <div class="bg-slate-900/50 rounded-xl p-3">
                 <dt class="text-xs text-slate-400">{{ metric.label }}</dt>
@@ -150,32 +150,47 @@
 
 <script id="pattern-data" type="application/json">{{ patterns | tojson }}</script>
 <script>
-const patterns = JSON.parse(document.getElementById("pattern-data").textContent);
+const patternNode = document.getElementById("pattern-data");
+let patterns = { hour_labels: [], weekday_labels: [], release_hours: [], social_hours: [], weekdays: [] };
+try {
+    patterns = JSON.parse(patternNode ? patternNode.textContent : "{}");
+} catch (err) {
+    patterns = { hour_labels: [], weekday_labels: [], release_hours: [], social_hours: [], weekdays: [] };
+}
 
 function drawChart(canvasId, labels, datasets) {
     const canvas = document.getElementById(canvasId);
-    if (!canvas || !datasets || !datasets.length) return;
-    new Chart(canvas, {
-        type: "bar",
-        data: {
-            labels: labels,
-            datasets: datasets.map((series) => ({
-                label: series.label,
-                data: series.data,
-                backgroundColor: series.color,
-                borderRadius: 3
-            }))
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: "#cbd5e1" } } },
-            scales: {
-                y: { beginAtZero: true, stacked: true, ticks: { precision: 0, color: "#94a3b8" }, grid: { color: "#334155" } },
-                x: { stacked: true, ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true }, grid: { display: false } }
-            }
-        }
+    const series = (Array.isArray(datasets) ? datasets : []).filter(function (row) {
+        return row && Array.isArray(row.data) && row.data.length;
     });
+    if (!canvas || !series.length || typeof Chart !== "function") return;
+    try {
+        new Chart(canvas, {
+            type: "bar",
+            data: {
+                labels: Array.isArray(labels) ? labels : [],
+                datasets: series.map(function (item) {
+                    return {
+                        label: item.label,
+                        data: item.data,
+                        backgroundColor: item.color,
+                        borderRadius: 3
+                    };
+                })
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { labels: { color: "#cbd5e1" } } },
+                scales: {
+                    y: { beginAtZero: true, stacked: true, ticks: { precision: 0, color: "#94a3b8" }, grid: { color: "#334155" } },
+                    x: { stacked: true, ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true }, grid: { display: false } }
+                }
+            }
+        });
+    } catch (err) {
+        return;
+    }
 }
 
 drawChart("releaseHourChart", patterns.hour_labels, patterns.release_hours);

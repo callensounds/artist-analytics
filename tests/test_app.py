@@ -61,6 +61,19 @@ def test_templates_are_bundled_beside_the_worker_and_login_renders():
     assert login.status_code == 200
     assert "Welcome back" in login.text
     assert "Average Analytics" in login.text
+    assert "cdn.tailwindcss.com" not in home.text
+    assert "/static/app.css" in home.text
+    assert "typeof Chart" in (module_dir / "templates" / "dashboard.html").read_text()
+    icon = client.get("/favicon.ico")
+    assert icon.status_code == 200
+    assert icon.headers["content-type"].startswith("image/svg+xml")
+    assert "<svg" in icon.text
+    css = client.get("/static/app.css")
+    assert css.status_code == 200
+    assert "text/css" in css.headers["content-type"]
+    assert ".bg-slate-900" in css.text
+    assert '"fallthrough": true' in wrangler
+    assert "**/*.css" in wrangler
 
 
 def test_demo_login_and_dashboard_do_not_fabricate_metrics(monkeypatch):
@@ -139,6 +152,7 @@ def test_artist_query_renders_exact_timestamps(monkeypatch):
     assert "Exact time" in page.text
     assert "releaseHourChart" in page.text
     assert "07:00 UTC" in page.text
+    assert "typeof Chart" in page.text
 
 
 def test_bad_login_and_short_password():

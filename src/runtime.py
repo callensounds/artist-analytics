@@ -17,34 +17,83 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 FALLBACK_SESSION_SECRET = "artist-analytics-demo-session-secret"
 
 
-def env_get(env, name: str) -> str | None:
-    value = None
-    if isinstance(env, dict):
-        value = env.get(name)
-    elif env is not None:
-        try:
-            value = getattr(env, name)
-        except Exception:
-            value = None
-        if value is None:
-            try:
-                value = env[name]
-            except Exception:
-                value = None
-    if _blank(value):
-        value = os.getenv(name)
-    if _blank(value):
+# str() of a Worker secret is often "[object Object]" or "undefined".
+# Those are not the secret. Google then answers "API key not valid".
+_UNUSABLE_SECRET = {
+    "",
+    "none",
+    "undefined",
+    "null",
+    "[object object]",
+    "[object string]",
+}
+
+
+def _secret_text(value) -> str | None:
+    """Plain str from a Worker env binding. JsProxy secrets are not Python strings."""
+    if value is None or isinstance(value, bool):
         return None
-    return str(value).strip()
+    if isinstance(value, bytes):
+        try:
+            value = value.decode()
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        converted = None
+        to_py = getattr(value, "to_py", None)
+        if callable(to_py):
+            try:
+                converted = to_py()
+            except Exception:
+                converted = None
+        if not isinstance(converted, (str, bytes)):
+            value_of = getattr(value, "valueOf", None)
+            if callable(value_of):
+                try:
+                    converted = value_of()
+                except Exception:
+                    converted = None
+        if isinstance(converted, bytes):
+            try:
+                converted = converted.decode()
+            except UnicodeDecodeError:
+                converted = None
+        if isinstance(converted, str):
+            value = converted
+        else:
+            value = str(value)
+    text = value.strip()
+    if text.casefold() in _UNUSABLE_SECRET:
+        return None
+    if text.startswith("<") and ("JsProxy" in text or "object at 0x" in text):
+        return None
+    return text
 
 
-def _blank(value) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, (str, int, float)):
-        return False
-    text = str(value).strip()
-    return text == "" or text in {"None", "undefined", "null"}
+def env_get(env, name: str) -> str | None:
+    candidates = []
+    if isinstance(env, dict):
+        candidates.append(env.get(name))
+    elif env is not None:
+        sources = [env]
+        raw = getattr(env, "_env", None)
+        if raw is not None and raw is not env:
+            sources.append(raw)
+        for source in sources:
+            try:
+                candidates.append(getattr(source, name))
+            except Exception:
+                pass
+            try:
+                candidates.append(source[name])
+            except Exception:
+                pass
+    candidates.append(os.getenv(name))
+    for candidate in candidates:
+        text = _secret_text(candidate)
+        if text:
+            return text
+    return None
 
 
 class WorkerSessionMiddleware:

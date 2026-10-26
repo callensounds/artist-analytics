@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote, urlencode
+
 from analytics import compact_count, names_match, scrub
 from http_client import TransportError
 from models import Metric, SourceResult, errored, make_item, missing_credentials, sort_items, unavailable
@@ -9,6 +11,12 @@ from providers.common import cache_key, cached
 from runtime import env_get
 
 API = "https://www.googleapis.com/youtube/v3"
+NAME_MATCH = "Matched by name via the YouTube Data API, not from a MusicBrainz URL."
+
+
+def youtube_url(path: str, params: dict) -> str:
+    """Query string uses the key as a plain Python str. quote, not quote_plus."""
+    return f"{API}/{path}?{urlencode(params, quote_via=quote)}"
 
 
 def _message(payload, status: int, secret: str) -> str:
@@ -21,8 +29,9 @@ def _message(payload, status: int, secret: str) -> str:
 
 
 async def _get(http, path: str, params: dict, secret: str):
+    url = youtube_url(path, params)
     try:
-        result, payload = await http.get_json(f"{API}/{path}", params=params, timeout=10)
+        result, payload = await http.get_json(url, timeout=8)
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
     if not result.ok or not isinstance(payload, dict):
@@ -79,6 +88,7 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
     handles = list((links or {}).get("youtube_handles") or [])
 
     async def produce() -> SourceResult:
+        matched_by_name = False
         try:
             channel = None
             if channel_ids:
@@ -131,6 +141,7 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
                         "YouTube",
                         "No YouTube channel title matched that artist closely enough to chart.",
                     )
+                matched_by_name = True
                 payload = await _get(
                     http,
                     "channels",
@@ -168,6 +179,12 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
         subscribers = None if hidden else compact_count(stats.get("subscriberCount"))
         title = (channel.get("snippet") or {}).get("title")
         channel_id = channel.get("id")
+        notices = [
+            "Times are videoPublishedAt when YouTube sends it, otherwise snippet.publishedAt. "
+            "Both are UTC to the second. The chart uses the 50 most recent public uploads."
+        ]
+        if matched_by_name:
+            notices.append(NAME_MATCH)
         return SourceResult(
             platform="youtube",
             label="YouTube",
@@ -184,10 +201,7 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
                 Metric(label="Recent uploads", available=True, value=str(len(items))),
             ],
             items=items,
-            notices=[
-                "Times are videoPublishedAt when YouTube sends it, otherwise snippet.publishedAt. "
-                "Both are UTC to the second. The chart uses the 50 most recent public uploads."
-            ],
+            notices=notices,
         )
 
     return await cached(cache, cache_key("youtube", name, ",".join(channel_ids), ",".join(handles)), produce)
