@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from analytics import (
     EXCLUDED_SECONDARY,
     PATTERN_RELEASE_TYPES,
@@ -10,10 +12,11 @@ from analytics import (
     sanitize_artist_query,
 )
 from http_client import TransportError
-from models import Metric, SourceResult, errored, make_item, sort_items, unavailable
+from models import Metric, SourceResult, errored, make_item, sort_items, source_from_dict, unavailable
+import json
+
 from providers.common import (
     apple_artist_id,
-    cached,
     cache_key,
     instagram_handle,
     spotify_artist_id,
@@ -137,8 +140,6 @@ def aggregate_catalog(release_groups: list[dict], releases: list[dict]) -> list[
 
 
 async def _get_json(http, url: str, params: dict):
-    import asyncio
-
     last_status = None
     for attempt in range(2):
         try:
@@ -157,91 +158,171 @@ async def _get_json(http, url: str, params: dict):
     raise TransportError(f"MusicBrainz returned HTTP {last_status}.")
 
 
-async def fetch_musicbrainz(name: str, http, cache) -> SourceResult:
+def _public_links(links: dict | None) -> dict:
+    return {key: value for key, value in (links or {}).items() if not str(key).startswith("_")}
+
+
+async def _remember(cache, query: str, result: SourceResult) -> None:
+    if cache is None or not query or not result.cacheable:
+        return
+    try:
+        await cache.set(cache_key("musicbrainz", query), json.dumps(result.to_dict()), result.ttl)
+    except Exception:
+        return
+
+
+async def _match(name: str, http) -> SourceResult:
     query = sanitize_artist_query(name)
     if not query:
         return unavailable("musicbrainz", "MusicBrainz", "Enter an artist name to search MusicBrainz.")
+    try:
+        search = await _get_json(
+            http,
+            f"{MB}/artist/",
+            {"query": f'artist:"{query}"', "fmt": "json", "limit": "5"},
+        )
+    except TransportError as exc:
+        return errored("musicbrainz", "MusicBrainz", str(exc))
+    artists = search.get("artists") or []
+    chosen = None
+    for artist in artists:
+        score = int(artist.get("score") or 0)
+        if score >= 80 or names_match(artist.get("name") or "", query):
+            chosen = artist
+            break
+    if chosen is None:
+        return unavailable(
+            "musicbrainz",
+            "MusicBrainz",
+            "No confident MusicBrainz artist match. Apple and YouTube can still be matched by name. "
+            "Instagram and TikTok handles are not guessed.",
+        )
+    mbid = chosen["id"]
+    try:
+        artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
+    except TransportError as exc:
+        return errored("musicbrainz", "MusicBrainz", str(exc))
+    links = extract_links(artist_doc.get("relations") or [])
+    links["_mbid"] = mbid
+    profile = artist_doc.get("name") or chosen.get("name")
+    disambiguation = artist_doc.get("disambiguation") or chosen.get("disambiguation") or ""
+    return SourceResult(
+        platform="musicbrainz",
+        label="MusicBrainz",
+        status="ok",
+        profile_name=profile,
+        profile_url=f"https://musicbrainz.org/artist/{mbid}",
+        metrics=[
+            Metric(label="Match", available=True, value=f"{profile}" + (f" ({disambiguation})" if disambiguation else "")),
+        ],
+        notices=[],
+        links=links,
+    )
 
-    async def produce() -> SourceResult:
-        try:
-            search = await _get_json(
-                http,
-                f"{MB}/artist/",
-                {"query": f'artist:"{query}"', "fmt": "json", "limit": "5"},
-            )
-        except TransportError as exc:
-            return errored("musicbrainz", "MusicBrainz", str(exc))
-        artists = search.get("artists") or []
-        chosen = None
-        for artist in artists:
-            score = int(artist.get("score") or 0)
-            if score >= 80 or names_match(artist.get("name") or "", query):
-                chosen = artist
-                break
-        if chosen is None:
-            return unavailable(
-                "musicbrainz",
-                "MusicBrainz",
-                "No confident MusicBrainz artist match. Social profiles are not guessed from the name.",
-            )
-        mbid = chosen["id"]
-        try:
-            artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
-            groups = await _get_json(
-                http,
-                f"{MB}/release-group",
-                {"artist": mbid, "fmt": "json", "limit": "100"},
-            )
-        except TransportError as exc:
-            return errored("musicbrainz", "MusicBrainz", str(exc))
-        release_notice = None
-        try:
-            releases = await _get_json(
-                http,
-                f"{MB}/release",
-                {
-                    "artist": mbid,
-                    "fmt": "json",
-                    "limit": "100",
-                    "status": "official",
-                    "inc": "release-groups",
-                },
-            )
-        except TransportError:
-            releases = {"releases": []}
-            release_notice = "Official release events could not be loaded, so dates fall back to release-group first-release-date values."
-        items = aggregate_catalog(groups.get("release-groups") or [], releases.get("releases") or [])
-        day_level = sum(1 for item in items if item.precision in {"day", "time"})
-        partial = sum(1 for item in items if item.precision in {"month", "year"})
-        disambiguation = artist_doc.get("disambiguation") or chosen.get("disambiguation") or ""
-        profile = artist_doc.get("name") or chosen.get("name")
-        notices = [
-            "Release dates use the earliest MusicBrainz date, refined to a full day when a release event has one. "
-            "Month- and year-only dates stay partial and are excluded from the weekday chart. "
-            "Showing up to 100 release groups and 100 official releases."
-        ]
-        if release_notice:
-            notices.append(release_notice)
-        return SourceResult(
-            platform="musicbrainz",
-            label="MusicBrainz",
-            status="ok",
-            profile_name=profile,
-            profile_url=f"https://musicbrainz.org/artist/{mbid}",
-            metrics=[
-                Metric(label="Match", available=True, value=f"{profile}" + (f" ({disambiguation})" if disambiguation else "")),
-                Metric(label="Catalog rows", available=True, value=str(len(items))),
-                Metric(label="Exact days", available=True, value=str(day_level)),
-                Metric(
-                    label="Partial dates",
-                    available=True,
-                    value=str(partial),
-                    reason=None,
-                ),
-            ],
-            items=items,
-            notices=notices,
-            links=extract_links(artist_doc.get("relations") or []),
+
+async def _finish(partial: SourceResult, http) -> SourceResult:
+    links = dict(partial.links or {})
+    mbid = links.get("_mbid") or ""
+    public = _public_links(links)
+    if partial.status != "ok" or not mbid:
+        partial.links = public
+        return partial
+    try:
+        groups, releases, release_notice = await _catalog(http, mbid)
+    except TransportError as exc:
+        partial.links = public
+        partial.notices = list(partial.notices or []) + [str(exc)]
+        return partial
+    items = aggregate_catalog(groups.get("release-groups") or [], releases.get("releases") or [])
+    day_level = sum(1 for item in items if item.precision in {"day", "time"})
+    month_or_year = sum(1 for item in items if item.precision in {"month", "year"})
+    notices = [
+        "Release dates use the earliest MusicBrainz date, refined to a full day when a release event has one. "
+        "Month- and year-only dates stay partial and are excluded from the weekday chart. "
+        "Showing up to 100 release groups and 100 official releases."
+    ]
+    if release_notice:
+        notices.append(release_notice)
+    match = (partial.metrics or [None])[0]
+    return SourceResult(
+        platform="musicbrainz",
+        label="MusicBrainz",
+        status="ok",
+        profile_name=partial.profile_name,
+        profile_url=partial.profile_url,
+        metrics=[
+            match or Metric(label="Match", available=True, value=partial.profile_name),
+            Metric(label="Catalog rows", available=True, value=str(len(items))),
+            Metric(label="Exact days", available=True, value=str(day_level)),
+            Metric(label="Partial dates", available=True, value=str(month_or_year)),
+        ],
+        items=items,
+        notices=notices,
+        links=public,
+    )
+
+
+async def open_musicbrainz(name: str, http, cache):
+    """URL relations first. The catalog coroutine can run beside the other providers."""
+    query = sanitize_artist_query(name)
+    if cache is not None and query:
+        raw = await cache.get(cache_key("musicbrainz", query))
+        if raw:
+            try:
+                return source_from_dict(json.loads(raw)), None
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
+    partial = await _match(name, http)
+    if partial.status != "ok":
+        partial.links = _public_links(partial.links)
+        await _remember(cache, query, partial)
+        return partial, None
+
+    async def finish():
+        done = await _finish(partial, http)
+        await _remember(cache, query, done)
+        return done
+
+    return partial, finish()
+
+
+async def fetch_musicbrainz(name: str, http, cache) -> SourceResult:
+    partial, rest = await open_musicbrainz(name, http, cache)
+    if rest is None:
+        return partial
+    return await rest
+
+
+async def _catalog(http, mbid: str):
+    async def groups():
+        return await _get_json(
+            http,
+            f"{MB}/release-group",
+            {"artist": mbid, "fmt": "json", "limit": "100"},
         )
 
-    return await cached(cache, cache_key("musicbrainz", query), produce)
+    async def releases():
+        return await _get_json(
+            http,
+            f"{MB}/release",
+            {
+                "artist": mbid,
+                "fmt": "json",
+                "limit": "100",
+                "status": "official",
+                "inc": "release-groups",
+            },
+        )
+
+    groups_result, releases_result = await asyncio.gather(groups(), releases(), return_exceptions=True)
+    if isinstance(groups_result, Exception):
+        if isinstance(groups_result, TransportError):
+            raise groups_result
+        raise TransportError("MusicBrainz release groups could not be loaded.") from groups_result
+    release_notice = None
+    if isinstance(releases_result, Exception):
+        releases_result = {"releases": []}
+        release_notice = (
+            "Official release events could not be loaded, so dates fall back to release-group first-release-date values."
+        )
+    return groups_result, releases_result, release_notice

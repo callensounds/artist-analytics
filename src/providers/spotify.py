@@ -380,23 +380,22 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
 
 
 async def fetch_spotify(name: str, links: dict, env, http, cache) -> SourceResult:
-    if (links or {}).get("_incomplete") and not (env_get(env, "SPOTIFY_CLIENT_ID") and env_get(env, "SPOTIFY_CLIENT_SECRET")):
-        return unavailable(
-            "spotify",
-            "Spotify",
-            "MusicBrainz did not return URL relationships, so the official Spotify artist was not looked up.",
-            ttl=120,
-        )
     artist_id = (links or {}).get("spotify_id") or ""
     client_id = env_get(env, "SPOTIFY_CLIENT_ID")
     client_secret = env_get(env, "SPOTIFY_CLIENT_SECRET")
+    # The public search HTML shell does not include artist ids, and oEmbed
+    # rejects search URLs. Guessing an id would show the wrong artist.
+    if not artist_id and not (client_id and client_secret):
+        reason = (
+            "MusicBrainz has no official Spotify URL for this artist. "
+            "The public search page does not include artist ids, so an id is not guessed."
+        )
+        if (links or {}).get("_incomplete"):
+            reason = (
+                "MusicBrainz did not return URL relationships. "
+                "The public Spotify search page does not include artist ids, so an id is not guessed."
+            )
+        return unavailable("spotify", "Spotify", reason, ttl=120)
     if client_id and client_secret:
         return await _fetch_api(name, artist_id, (client_id, client_secret), http, cache)
-    if not artist_id:
-        return unavailable(
-            "spotify",
-            "Spotify",
-            "MusicBrainz has no official Spotify URL for this artist. An id is not guessed.",
-            ttl=1800,
-        )
     return await _fetch_public(artist_id, http, cache)

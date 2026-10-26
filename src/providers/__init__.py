@@ -10,32 +10,81 @@ from http_client import RequestsClient
 from models import errored
 from providers.apple import fetch_apple
 from providers.instagram import fetch_instagram
-from providers.musicbrainz import fetch_musicbrainz
+from providers.musicbrainz import open_musicbrainz
 from providers.spotify import fetch_spotify
 from providers.tiktok import fetch_tiktok
 from providers.youtube import fetch_youtube
+
+# One slow source must not hold the rest of the dashboard.
+PROVIDER_TIMEOUT = 15
+
+
+def _public_links(links: dict | None) -> dict:
+    return {key: value for key, value in (links or {}).items() if not str(key).startswith("_")}
+
+
+async def _bounded(coro, platform: str, label: str):
+    try:
+        return await asyncio.wait_for(coro, PROVIDER_TIMEOUT)
+    except asyncio.TimeoutError:
+        return errored(
+            platform,
+            label,
+            "This source took too long and was skipped so the rest of the page could load.",
+        )
+    except Exception:
+        return None
+
+
+async def _finish_catalog(rest, partial):
+    """Catalog runs beside the other providers. A timeout keeps the artist match."""
+    if rest is None:
+        partial.links = _public_links(partial.links)
+        return partial
+    try:
+        return await asyncio.wait_for(rest, PROVIDER_TIMEOUT)
+    except asyncio.TimeoutError:
+        partial.links = _public_links(partial.links)
+        partial.notices = list(partial.notices or []) + [
+            "The MusicBrainz catalog took too long and was skipped so the rest of the page could load."
+        ]
+        return partial
+    except Exception:
+        partial.links = _public_links(partial.links)
+        return partial
 
 
 async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
     client = http or RequestsClient()
     store = cache or cache_from_env(env)
-    musicbrainz = await fetch_musicbrainz(name, client, store)
-    links = dict(musicbrainz.links or {})
-    if musicbrainz.status != "ok":
+    # Identity (search + URL relations) has to finish first. The catalog does not.
+    try:
+        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), PROVIDER_TIMEOUT)
+    except asyncio.TimeoutError:
+        opened = (
+            errored(
+                "musicbrainz",
+                "MusicBrainz",
+                "This source took too long and was skipped so the rest of the page could load.",
+            ),
+            None,
+        )
+    except Exception:
+        opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
+    if not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
+        opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
+    partial, rest = opened
+    links = dict(partial.links or {})
+    if partial.status != "ok":
         links["_incomplete"] = True
 
-    async def run(fetcher):
-        try:
-            return await fetcher()
-        except Exception:
-            return None
-
-    apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
-        run(lambda: fetch_apple(name, links, client, store)),
-        run(lambda: fetch_spotify(name, links, env, client, store)),
-        run(lambda: fetch_youtube(name, links, env, client, store)),
-        run(lambda: fetch_instagram(name, links, client, store)),
-        run(lambda: fetch_tiktok(name, links, client, store)),
+    musicbrainz, apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
+        _finish_catalog(rest, partial),
+        _bounded(fetch_apple(name, links, client, store), "apple", "Apple Music"),
+        _bounded(fetch_spotify(name, links, env, client, store), "spotify", "Spotify"),
+        _bounded(fetch_youtube(name, links, env, client, store), "youtube", "YouTube"),
+        _bounded(fetch_instagram(name, links, client, store), "instagram", "Instagram"),
+        _bounded(fetch_tiktok(name, links, client, store), "tiktok", "TikTok"),
     )
     sources = [musicbrainz]
     for platform, label, result in (

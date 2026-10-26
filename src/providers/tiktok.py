@@ -110,7 +110,8 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
         return unavailable(
             "tiktok",
             "TikTok",
-            "MusicBrainz did not return URL relationships, so the official TikTok profile was not looked up.",
+            "MusicBrainz did not return URL relationships, so the official TikTok profile was not looked up. "
+            "A handle is not guessed.",
             ttl=120,
         )
     if not handle:

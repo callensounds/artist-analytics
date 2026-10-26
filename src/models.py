@@ -53,7 +53,7 @@ class SourceResult:
     notices: list[str] = field(default_factory=list)
     links: dict = field(default_factory=dict)
     cacheable: bool = True
-    ttl: int = 1800
+    ttl: int = 2700
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,7 +73,7 @@ def source_from_dict(data: dict) -> SourceResult:
         notices=list(data.get("notices") or []),
         links=dict(data.get("links") or {}),
         cacheable=bool(data.get("cacheable", True)),
-        ttl=int(data.get("ttl") or 1800),
+        ttl=int(data.get("ttl") or 2700),
     )
 
 

@@ -97,7 +97,8 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
         return unavailable(
             "instagram",
             "Instagram",
-            "MusicBrainz did not return URL relationships, so the official Instagram profile was not looked up.",
+            "MusicBrainz did not return URL relationships, so the official Instagram profile was not looked up. "
+            "A handle is not guessed.",
             ttl=120,
         )
     if not handle:

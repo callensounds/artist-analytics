@@ -1,4 +1,4 @@
-"""Process memory cache, with an optional Cloudflare KV binding in front of it."""
+"""Process memory, the Workers Cache API, and optional KV. Any layer can be missing."""
 
 from __future__ import annotations
 
@@ -61,6 +61,88 @@ class KVCache:
                 return
 
 
+class EdgeCache:
+    """Workers Cache API (caches.default). Absent outside the Worker runtime."""
+
+    def __init__(self, api=None):
+        self.api = api
+
+    def _api(self):
+        if self.api is not None:
+            return self.api
+        from js import caches
+
+        return caches
+
+    @staticmethod
+    def _request(key: str):
+        from urllib.parse import quote
+
+        from js import Request
+
+        url = "https://cache.artist-analytics.internal/v1/" + quote(key, safe="")
+        return Request.new(url)
+
+    async def get(self, key: str) -> str | None:
+        try:
+            api = self._api()
+            response = await api.default.match(self._request(key))
+        except Exception:
+            return None
+        if not response:
+            return None
+        try:
+            text = await response.text()
+        except Exception:
+            return None
+        if text is None:
+            return None
+        text = str(text)
+        return text or None
+
+    async def set(self, key: str, value: str, ttl: int) -> None:
+        try:
+            from js import Headers, Response
+
+            api = self._api()
+            headers = Headers.new()
+            headers.set("Cache-Control", f"public, max-age={max(int(ttl), 60)}")
+            response = Response.new(value, headers=headers)
+            await api.default.put(self._request(key), response)
+        except Exception:
+            return
+
+
+class TieredCache:
+    """Read the first layer that has the key. Writes go to every layer."""
+
+    def __init__(self, layers):
+        self.layers = [layer for layer in layers if layer is not None]
+
+    async def get(self, key: str) -> str | None:
+        for index, layer in enumerate(self.layers):
+            try:
+                value = await layer.get(key)
+            except Exception:
+                value = None
+            if not value:
+                continue
+            for earlier in self.layers[:index]:
+                try:
+                    await earlier.set(key, value, 120)
+                except Exception:
+                    pass
+            return value
+        return None
+
+    async def set(self, key: str, value: str, ttl: int) -> None:
+        for layer in self.layers:
+            try:
+                await layer.set(key, value, ttl)
+            except Exception:
+                continue
+
+
 def binding(env, name: str):
     if env is None:
         return None
@@ -75,9 +157,10 @@ def binding(env, name: str):
     return value
 
 
-def cache_from_env(env) -> MemoryCache | KVCache:
-    kv = binding(env, "CACHE")
+def cache_from_env(env) -> TieredCache:
     memory = MemoryCache()
-    if kv is None:
-        return memory
-    return KVCache(kv, memory)
+    layers: list = [memory, EdgeCache()]
+    kv = binding(env, "CACHE")
+    if kv is not None:
+        layers.append(KVCache(kv))
+    return TieredCache(layers)
