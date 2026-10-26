@@ -32,9 +32,8 @@ FRESH_TTL = 6 * 60 * 60
 STALE_TTL = 7 * 24 * 60 * 60
 WEB_EXACT_LIMIT = 3
 SHELF_MAX_BYTES = 350_000
-ARTIST_MAX_BYTES = 600_000
 ALBUM_MAX_BYTES = 120_000
-SHELF_TITLES = {"Albums", "Singles & EPs", "Live Albums"}
+SHELF_TITLES = {"albums", "singles & eps", "live albums", "compilations"}
 _SERVER_MARKER = 'id="serialized-server-data"'
 
 
@@ -183,13 +182,26 @@ def _profile_name(block: dict) -> str | None:
     seo = block.get("seoData")
     if not isinstance(seo, dict) or not isinstance(seo.get("pageTitle"), str):
         return None
-    title = seo["pageTitle"]
-    for sep in (" – ", " - ", " — "):
+    title = seo["pageTitle"].replace("\xa0", " ").strip()
+    for sep in (" – ", " - ", " — ", " | "):
         if sep in title:
-            title = title.split(sep)[0]
+            title = title.split(sep)[0].strip()
             break
-    title = title.removeprefix("Albums by ").removeprefix("Singles by ").strip(" ‎")
+    for prefix in ("Albums by ", "Singles & EPs by ", "Singles by ", "Live Albums by "):
+        if title.startswith(prefix):
+            title = title[len(prefix) :].strip()
+            break
     return title or None
+
+
+def _keep_section(title: str) -> bool:
+    """The full-albums page titles the shelf 'Albums by <name>', not 'Albums'."""
+    if not title:
+        return True
+    folded = title.casefold()
+    if folded in SHELF_TITLES:
+        return True
+    return folded.startswith(tuple(SHELF_TITLES))
 
 
 def _candidate_blocks(payload) -> list[dict]:
@@ -248,7 +260,7 @@ def parse_apple_albums(html: str) -> tuple[str | None, list[dict]]:
             if not isinstance(section, dict):
                 continue
             title = _shelf_title(section)
-            if title and title not in SHELF_TITLES:
+            if not _keep_section(title):
                 continue
             for item in section.get("items") or []:
                 if isinstance(item, dict):
@@ -312,32 +324,37 @@ async def fetch_public_apple(http, artist_id: str, name: str, status: int) -> So
         return None
 
 
-async def _fetch_public_apple(http, artist_id: str, name: str, status: int) -> SourceResult | None:
-    shelf_html = await _get_html(
-        http,
-        f"https://music.apple.com/us/artist/{artist_id}/see-all?section=full-albums",
-        SHELF_MAX_BYTES,
-    )
-    profile, albums = parse_apple_albums(shelf_html) if shelf_html else (None, [])
-    if not albums:
-        artist_html = await _get_html(
-            http,
-            f"https://music.apple.com/us/artist/{artist_id}",
-            ARTIST_MAX_BYTES,
+async def _canonical_artist_url(http, artist_id: str) -> str:
+    """The id-only shelf URL 404s. A 301 Location carries the slug, and that body is tiny."""
+    direct = f"https://music.apple.com/us/artist/{artist_id}"
+    try:
+        result = await http.get_text(
+            direct,
+            timeout=8,
+            headers={"Accept": "text/html"},
+            allow_redirects=False,
+            max_bytes=4096,
         )
-        if artist_html:
-            profile, albums = parse_apple_albums(artist_html)
+    except (TransportError, MemoryError, Exception):
+        return direct
+    location = result.header("location") if result.status in {301, 302, 303, 307, 308} else ""
+    if location.startswith("https://music.apple.com/"):
+        return location.split("?", 1)[0].rstrip("/")
+    return direct
+
+
+async def _fetch_public_apple(http, artist_id: str, name: str, status: int) -> SourceResult | None:
+    # One shelf page (~230KB). The artist detail page is ~800KB and its JSON sits at the end.
+    canonical = await _canonical_artist_url(http, artist_id)
+    shelf_html = await _get_html(http, f"{canonical}/see-all?section=full-albums", SHELF_MAX_BYTES)
+    profile, albums = parse_apple_albums(shelf_html) if shelf_html else (None, [])
     if not albums:
         return None
     exact = [row for row in albums[:WEB_EXACT_LIMIT] if row.get("url")]
-
-    async def one(row: dict) -> str | None:
+    dates = []
+    for row in exact:
         html = await _get_html(http, row["url"], ALBUM_MAX_BYTES)
-        if not html:
-            return None
-        return parse_release_meta(html)
-
-    dates = await asyncio.gather(*(one(row) for row in exact))
+        dates.append(parse_release_meta(html) if html else None)
     items = []
     for row, raw in zip(albums, list(dates) + [None] * (len(albums) - len(dates))):
         item = make_item(

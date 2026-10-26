@@ -824,7 +824,7 @@ def test_apple_public_fallback_reads_a_script_slice_and_caps_album_pages():
     shelf = (
         '<script type="application/json" id="serialized-server-data">'
         '{"data":[{"data":{"seoData":{"pageTitle":"Example - Apple Music"},"sections":['
-        '{"header":{"item":{"titleLink":{"title":"Albums"}}},"items":['
+        '{"header":{"item":{"titleLink":{"title":"Albums by Example"}}},"items":['
         + ",".join(rows)
         + "]}]}}]}</script>"
         + ("<p>padding</p>" * 1000)
