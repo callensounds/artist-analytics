@@ -443,6 +443,80 @@ def test_collect_reports_missing_secrets_and_does_not_invent_metrics():
     assert "_mbid" not in blob
 
 
+def test_session_secret_stays_in_python_and_boxed_keys_still_unwrap(monkeypatch):
+    """Favicon and login read SECRET_KEY on every request. That read must not enter JS."""
+    import runtime
+
+    json_calls = {"n": 0}
+    imported = []
+    real_import = __import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name == "workers":
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    def counting_stringify(value):
+        json_calls["n"] += 1
+        return None
+
+    monkeypatch.setattr("builtins.__import__", tracking_import)
+    monkeypatch.setattr(runtime, "_json_stringify", counting_stringify)
+
+    assert env_get({"SECRET_KEY": "plain-session-secret"}, "SECRET_KEY") == "plain-session-secret"
+    assert env_get({}, "SECRET_KEY") is None
+    assert json_calls["n"] == 0
+    assert imported == []
+
+    real = "AIza" + ("K" * 35)
+
+    class Ctor:
+        name = "String"
+
+    class Boxed:
+        def __init__(self, text):
+            self.length = len(text)
+            self.constructor = Ctor()
+            self._text = text
+
+        def __getitem__(self, index):
+            return self._text[index]
+
+        def __str__(self):
+            return "[object String]"
+
+    class Env:
+        YOUTUBE_API_KEY = Boxed(real)
+
+    assert env_get(Env(), "YOUTUBE_API_KEY") == real
+
+
+def test_worker_source_does_not_nest_a_promising_task_at_import():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "toString.call" in code or "Object.prototype.toString" in code:
+                offenders.append(f"{path.relative_to(root)}:{lineno}")
+            if line.startswith("_mb_lock = asyncio.Lock()"):
+                offenders.append(f"{path.relative_to(root)}:{lineno}")
+    assert offenders == []
+
+
+def test_musicbrainz_lock_is_created_on_first_request_not_at_import():
+    import providers.musicbrainz as mb
+
+    mb._mb_lock = None
+    mb._mb_next = 0.0
+    assert mb._mb_lock is None
+
+    asyncio.run(mb._mb_slot())
+    assert isinstance(mb._mb_lock, asyncio.Lock)
+
+
 def test_env_get_unwraps_a_jsproxy_secret_and_rejects_object_string():
     class ProxyKey:
         def to_py(self):

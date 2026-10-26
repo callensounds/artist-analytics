@@ -30,7 +30,9 @@ MB_USER_AGENT = "AverageAnalytics/1.0 ( callen@callensounds.com )"
 MB_INTERVAL = 1.1
 MB_TTL = 24 * 60 * 60
 HEADERS = {"Accept": "application/json", "User-Agent": MB_USER_AGENT}
-_mb_lock = asyncio.Lock()
+# Created on first use, inside a running request. A module-level Lock() is
+# constructed while Pyodide is still inside the import's promising task.
+_mb_lock: asyncio.Lock | None = None
 _mb_next = 0.0
 
 
@@ -146,7 +148,9 @@ def aggregate_catalog(release_groups: list[dict], releases: list[dict]) -> list[
 
 async def _mb_slot() -> None:
     """One MusicBrainz request at a time, at most about one per second, per isolate."""
-    global _mb_next
+    global _mb_lock, _mb_next
+    if _mb_lock is None:
+        _mb_lock = asyncio.Lock()
     async with _mb_lock:
         loop = asyncio.get_running_loop()
         delay = _mb_next - loop.time()

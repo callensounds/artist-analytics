@@ -5,8 +5,6 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from diag import diagnose
-from http_client import RequestsClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
 
@@ -180,13 +178,22 @@ async def dashboard(request: Request, artist: str | None = None):
     )
 
 
+async def _diagnose_report(env):
+    # Imported on use. Favicon, CSS, and login do not need this module graph
+    # while the isolate is still inside its one promising task.
+    from diag import diagnose
+    from http_client import RequestsClient
+
+    return await diagnose(env, RequestsClient())
+
+
 @app.get("/admin/diag", response_class=HTMLResponse)
 async def admin_diag(request: Request):
     user = get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     try:
-        report = await diagnose(request.scope.get("env"), RequestsClient())
+        report = await _diagnose_report(request.scope.get("env"))
     except Exception:
         report = {
             "secrets": [],

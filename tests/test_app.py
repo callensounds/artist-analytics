@@ -1,6 +1,8 @@
+import asyncio
 import json
 import re
 
+import httpx
 from fastapi.testclient import TestClient
 
 import main
@@ -156,7 +158,7 @@ def test_artist_query_renders_exact_timestamps(monkeypatch):
 
 
 def test_diag_is_logged_in_only_and_does_not_print_a_secret(monkeypatch):
-    async def fake_diagnose(env, http):
+    async def fake_diagnose(env, http=None):
         return {
             "secrets": [
                 {
@@ -224,7 +226,7 @@ def test_diag_is_logged_in_only_and_does_not_print_a_secret(monkeypatch):
             },
         }
 
-    monkeypatch.setattr(main, "diagnose", fake_diagnose)
+    monkeypatch.setattr(main, "_diagnose_report", fake_diagnose)
     client = TestClient(main.app)
     anon = client.get("/admin/diag", follow_redirects=False)
     assert anon.status_code == 303
@@ -236,6 +238,44 @@ def test_diag_is_logged_in_only_and_does_not_print_a_secret(monkeypatch):
     assert "AIza…(39)" in page.text
     assert "AIzaExactKey123" not in page.text
     assert "HTTP 403" in page.text or "403" in page.text
+
+
+def test_concurrent_requests_after_startup_do_not_500():
+    """Same mix that 1101'd in production: login, dashboard, diag, favicon, CSS."""
+
+    async def hammer():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            paths = ["/login", "/dashboard", "/admin/diag", "/favicon.ico", "/static/app.css"]
+
+            async def hit(index):
+                if index % 7 == 0:
+                    response = await client.post(
+                        "/login",
+                        data={"email": "artist@demo.com", "password": "demo123"},
+                    )
+                else:
+                    response = await client.get(paths[index % len(paths)])
+                return response.status_code
+
+            return await asyncio.gather(*[hit(index) for index in range(35)])
+
+    codes = asyncio.run(hammer())
+    assert codes
+    assert 500 not in codes
+    assert all(code in {200, 303, 400} for code in codes)
+    assert codes.count(200) >= 1
+
+
+def test_diag_import_is_not_on_the_module_import_path():
+    header = []
+    for line in open(main.__file__, encoding="utf-8"):
+        if line.startswith("def ") or line.startswith("async def ") or line.startswith("@app"):
+            break
+        header.append(line)
+    blob = "".join(header)
+    assert "from diag import" not in blob
+    assert "from http_client import" not in blob
 
 
 def test_bad_login_and_short_password():

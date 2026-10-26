@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from base64 import b64decode, b64encode
@@ -64,7 +65,7 @@ def fingerprint(text: str | None) -> dict:
 
 
 def _js_typeof(value) -> tuple[str | None, str | None]:
-    """Object.prototype.toString. new Function is banned in Workers."""
+    """Constructor name only. Object toString via a JS call re-enters a promising task."""
     if isinstance(value, str):
         return "string", None
     if value is None:
@@ -73,26 +74,14 @@ def _js_typeof(value) -> tuple[str | None, str | None]:
         return "boolean", None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return "number", None
-    try:
-        import js
-    except Exception as exc:
-        return None, f"import js: {type(exc).__name__}"
-    try:
-        tag = js.Object.prototype.toString.call(value)
-        tag = tag if isinstance(tag, str) else str(tag)
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"[:160]
-    if tag.startswith("[object ") and tag.endswith("]"):
-        kind = tag[8:-1]
-        return {
-            "String": "string",
-            "Number": "number",
-            "Boolean": "boolean",
-            "Undefined": "undefined",
-            "Null": "object",
-            "Array": "object",
-        }.get(kind, "object"), None
-    return None, tag[:80]
+    ctor = _js_constructor(value)
+    return {
+        "String": "string",
+        "Number": "number",
+        "Boolean": "boolean",
+        "Array": "object",
+        "Undefined": "undefined",
+    }.get(ctor or "", "object" if ctor else None), None
 
 
 def _json_stringify(value):
@@ -161,8 +150,28 @@ def _indexed_string(value) -> str | None:
     return "".join(chars)
 
 
+def _is_boxed_string(value) -> bool:
+    """A JS String object, not a Python str and not a general object."""
+    if value is None or isinstance(value, (str, bytes, bytearray, bool, int, float)):
+        return False
+    ctor = _js_constructor(value)
+    if ctor not in {None, "String"}:
+        return False
+    try:
+        length = int(getattr(value, "length"))
+    except Exception:
+        return False
+    return 0 < length <= 256
+
+
 def coercions(value) -> list[tuple[str, str | None]]:
-    """Every way to read one binding, in the order we trust them."""
+    """Every way to read one binding, in the order we trust them.
+
+    JSON.stringify and per-character reads run only for a boxed string.
+    Both walk into JS. Doing that for every binding on every request kept
+    the isolate inside its one promising task long enough for the next
+    request's initPyInstance to fail.
+    """
     found: list[tuple[str, str | None]] = []
     if isinstance(value, bytes):
         try:
@@ -171,7 +180,9 @@ def coercions(value) -> list[tuple[str, str | None]]:
             found.append(("bytes", None))
     if isinstance(value, str):
         found.append(("python-str", value))
-    found.append(("json-stringify", _json_string(value)))
+    boxed = _is_boxed_string(value)
+    if boxed:
+        found.append(("json-stringify", _json_string(value)))
     to_py = getattr(value, "to_py", None)
     if callable(to_py):
         try:
@@ -191,9 +202,10 @@ def coercions(value) -> list[tuple[str, str | None]]:
         except Exception:
             converted = None
         if not isinstance(converted, str):
-            converted = _json_string(converted) if converted is not None else None
+            converted = _json_string(converted) if _is_boxed_string(converted) else None
         found.append(("valueOf", converted if isinstance(converted, str) else None))
-    found.append(("indexed-chars", _indexed_string(value)))
+    if boxed:
+        found.append(("indexed-chars", _indexed_string(value)))
     if not isinstance(value, str):
         try:
             found.append(("str", str(value)))
@@ -235,7 +247,7 @@ def _read_item(source, name: str):
         return False, exc
 
 
-def iter_bindings(env, name: str):
+def iter_bindings(env, name: str, *, include_global: bool = True):
     """Yield (path, ok, value_or_error) for each place a secret might live."""
     if isinstance(env, dict):
         yield "dict", True, env.get(name)
@@ -256,6 +268,8 @@ def iter_bindings(env, name: str):
         yield "os.environ", True, os.environ.get(name)
     else:
         yield "os.environ", False, None
+    if not include_global:
+        return
     try:
         from workers import env as workers_env
     except Exception as exc:
@@ -324,8 +338,39 @@ def describe_env(env) -> dict:
     return {"secrets": [describe_secret(env, name) for name in SECRET_NAMES]}
 
 
+def _good_enough(name: str, options: list[tuple[str, str]]) -> bool:
+    _path, text = _best_text(name, options)
+    if not text:
+        return False
+    if name == "YOUTUBE_API_KEY":
+        return _looks_like_api_key(text)
+    return True
+
+
+def _scan_secret(env, name: str, *, include_global: bool) -> str | None:
+    options: list[tuple[str, str]] = []
+    for path, ok, value in iter_bindings(env, name, include_global=include_global):
+        if not ok:
+            continue
+        for method, text in coercions(value):
+            if text:
+                options.append((f"{path}:{method}", text))
+        if _good_enough(name, options):
+            break
+    return _best_text(name, options)[1]
+
+
 def env_get(env, name: str) -> str | None:
-    return choose_secret(env, name)["text"]
+    """Read one secret. The session cookie calls this on every request.
+
+    The global workers.env binding is a JS import. Skip it when the request
+    env already has the value, and skip it entirely for SECRET_KEY so a
+    missing session secret falls back without entering JavaScript.
+    """
+    text = _scan_secret(env, name, include_global=False)
+    if text or name == "SECRET_KEY":
+        return text
+    return _scan_secret(env, name, include_global=True)
 
 
 class WorkerSessionMiddleware:
@@ -353,6 +398,11 @@ class WorkerSessionMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Pyodide runs one promising task at a time. initPyInstance of the next
+        # request raises SystemError if this task is still inside synchronous
+        # Python. Yield before the secret read so a concurrent favicon, CSS, or
+        # login request can enter.
+        await asyncio.sleep(0)
         signer = self._signer(scope)
         connection = HTTPConnection(scope)
         initial_session_was_empty = True
