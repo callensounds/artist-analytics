@@ -10,7 +10,7 @@ from http_client import RequestsClient
 from models import errored
 from providers.apple import fetch_apple
 from providers.instagram import fetch_instagram
-from providers.musicbrainz import open_musicbrainz
+from providers.musicbrainz import MB_OPEN_TIMEOUT, open_musicbrainz
 from providers.spotify import fetch_spotify
 from providers.tiktok import fetch_tiktok
 from providers.youtube import fetch_youtube
@@ -21,6 +21,14 @@ PROVIDER_TIMEOUT = 15
 
 def _public_links(links: dict | None) -> dict:
     return {key: value for key, value in (links or {}).items() if not str(key).startswith("_")}
+
+
+def _has_saved_links(links: dict) -> bool:
+    if links.get("spotify_id") or links.get("apple_id") or links.get("instagram") or links.get("tiktok"):
+        return True
+    if links.get("youtube_channel_ids") or links.get("youtube_handles"):
+        return True
+    return False
 
 
 async def _bounded(coro, platform: str, label: str):
@@ -65,7 +73,7 @@ async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
     store = cache or cache_from_env(env)
     # Identity (search + URL relations) has to finish first. The catalog does not.
     try:
-        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), PROVIDER_TIMEOUT)
+        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), MB_OPEN_TIMEOUT)
     except asyncio.TimeoutError:
         opened = (
             errored(
@@ -81,7 +89,9 @@ async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
         opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
     partial, rest = opened
     links = dict(partial.links or {})
-    if partial.status != "ok":
+    # A MusicBrainz error with no saved URLs blocks Spotify, Instagram, and TikTok.
+    # Cached relations, or a Spotify id already on the links, still let those cards run.
+    if partial.status != "ok" and not _has_saved_links(links):
         links["_incomplete"] = True
 
     musicbrainz, apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
