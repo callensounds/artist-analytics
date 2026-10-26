@@ -19,6 +19,7 @@
                 <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
                     {% if user is defined and user %}
                         <a href="/dashboard" class="hover:text-emerald-400">Dashboard</a>
+                        <a href="/admin/diag" class="hover:text-emerald-400">Diagnostics</a>
                         <span class="text-slate-400 truncate max-w-[10rem] sm:max-w-xs">{{ user.artist_name }}</span>
                         <a href="/logout" class="text-slate-400 hover:text-white">Logout</a>
                     {% else %}

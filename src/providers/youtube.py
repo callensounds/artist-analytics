@@ -28,14 +28,38 @@ def _message(payload, status: int, secret: str) -> str:
     return scrub(text, [secret])
 
 
+def redact_key(url: str, secret: str | None) -> str:
+    """Replace the key query value with its prefix and length."""
+    if not secret:
+        return url
+    marker = f"{secret[:4]}…({len(secret)})"
+    redacted = url.replace(secret, marker)
+    from urllib.parse import quote
+
+    encoded = quote(secret, safe="")
+    if encoded and encoded != secret:
+        redacted = redacted.replace(encoded, marker)
+    return redacted
+
+
 async def _get(http, path: str, params: dict, secret: str):
-    url = youtube_url(path, params)
+    # The key goes in a header. A query-string key was still rejected in
+    # production after the value was read, so the header is what we send.
+    query = {key: value for key, value in params.items() if key != "key"}
+    url = youtube_url(path, query)
     try:
-        result, payload = await http.get_json(url, timeout=8)
+        result, payload = await http.get_json(
+            url,
+            timeout=8,
+            headers={"X-Goog-Api-Key": secret},
+        )
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
     if not result.ok or not isinstance(payload, dict):
-        raise TransportError(_message(payload, result.status, secret))
+        message = _message(payload, result.status, secret)
+        if "API key not valid" in message:
+            message += " A logged-in check of the key string is at /admin/diag."
+        raise TransportError(message)
     return payload
 
 

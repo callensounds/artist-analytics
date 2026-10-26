@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics — Average Analytics{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl sm:text-3xl font-bold mb-2">Diagnostics</h1>
+<p class="text-slate-400 text-sm mb-6">Logged-in only. Secret values are reduced to a 4-character prefix and a length.</p>
+
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-3">Secrets</h2>
+    {% for secret in report.secrets %}
+    <div class="mb-4">
+        <h3 class="text-sm font-medium">{{ secret.name }}</h3>
+        <p class="text-sm text-slate-300">
+            chosen path: {{ secret.chosen_path or "none" }}
+            · length {{ secret.chosen.length if secret.chosen.length is not none else "—" }}
+            · prefix {{ secret.chosen.prefix4 or "—" }}
+            · usable {{ secret.chosen.usable }}
+        </p>
+        <ul class="mt-2 space-y-2 text-xs text-slate-400">
+            {% for read in secret.reads %}
+            <li>
+                {{ read.path }}
+                · present {{ read.present }}
+                · python {{ read.python_type or "—" }}
+                · js typeof {{ read.js_typeof or "—" }}
+                {% if read.js_error %}· js error {{ read.js_error }}{% endif %}
+                · constructor {{ read.js_constructor or "—" }}
+                {% if read.error %}· {{ read.error }}{% endif %}
+                {% for item in read.coercions %}
+                <div class="pl-3">
+                    {{ item.method }}
+                    · len {{ item.length if item.length is not none else "—" }}
+                    · prefix {{ item.prefix4 or "—" }}
+                    · object {{ item.is_object_object }}
+                    · undefined {{ item.is_undefined }}
+                    · usable {{ item.usable }}
+                </div>
+                {% endfor %}
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endfor %}
+</section>
+
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-2">YouTube</h2>
+    <p class="text-sm text-slate-300 mb-2">{{ report.youtube.dashboard_sends }}</p>
+    <p class="text-xs text-slate-400 break-words mb-3">built query URL: {{ report.youtube.built_query_url or "no key" }}</p>
+    {% for label, probe in (("header", report.youtube.header_request), ("query", report.youtube.query_request)) %}
+    <div class="text-sm text-slate-300 mb-2">
+        {% if probe %}
+        {{ label }} request · HTTP {{ probe.status if probe.status is not none else "—" }}
+        {% if probe.message %}· {{ probe.message }}{% endif %}
+        {% if probe.error %}· {{ probe.error }}{% endif %}
+        <div class="text-xs text-slate-400 break-words">{{ probe.url }}</div>
+        {% else %}
+        {{ label }} request · no key was read
+        {% endif %}
+    </div>
+    {% endfor %}
+</section>
+
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+    <h2 class="font-semibold mb-3">Apple from this network</h2>
+    {% for label, probe in report.apple.items() %}
+    <div class="text-sm text-slate-300 mb-3">
+        <div class="font-medium">{{ label }}</div>
+        HTTP {{ probe.status if probe.status is not none else "—" }}
+        {% if probe.message %}· {{ probe.message }}{% endif %}
+        {% if probe.error %}· {{ probe.error }}{% endif %}
+        {% if probe.has_server_data %}· serialized-server-data{% endif %}
+        {% if probe.has_release_meta %}· music:release_date{% endif %}
+        <div class="text-xs text-slate-400 break-words">{{ probe.url }}</div>
+    </div>
+    {% endfor %}
+</section>
+{% endblock %}
