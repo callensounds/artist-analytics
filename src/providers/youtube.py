@@ -8,7 +8,7 @@ from analytics import compact_count, names_match, scrub
 from http_client import TransportError
 from models import Metric, SourceResult, errored, make_item, missing_credentials, sort_items, unavailable
 from providers.common import cache_key, cached
-from runtime import env_get
+from runtime import env_get, env_string
 
 API = "https://www.googleapis.com/youtube/v3"
 NAME_MATCH = "Matched by name via the YouTube Data API, not from a MusicBrainz URL."
@@ -106,15 +106,16 @@ def youtube_key_configured(api_key: str) -> bool:
 
 
 async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResult:
+    raw = env_string(env, "YOUTUBE_API_KEY")
     api_key = env_get(env, "YOUTUBE_API_KEY")
-    if not api_key:
+    if not api_key or not youtube_key_configured(api_key):
+        if raw:
+            return errored("youtube", "YouTube", "YouTube key is misconfigured")
         return missing_credentials(
             "youtube",
             "YouTube",
             "Set the Worker secret YOUTUBE_API_KEY. Public upload times use the Data API; no user OAuth.",
         )
-    if not youtube_key_configured(api_key):
-        return errored("youtube", "YouTube", "YouTube key is misconfigured")
     channel_ids = list((links or {}).get("youtube_channel_ids") or [])
     handles = list((links or {}).get("youtube_handles") or [])
 

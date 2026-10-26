@@ -452,9 +452,12 @@ def test_collect_reports_missing_secrets_and_does_not_invent_metrics():
     assert "_mbid" not in blob
 
 
-def test_env_get_unwraps_a_jsproxy_secret_and_rejects_object_string():
+def test_env_get_reads_a_plain_string_and_rejects_placeholders():
+    calls = {"to_py": 0}
+
     class ProxyKey:
         def to_py(self):
+            calls["to_py"] += 1
             return "AIzaExactKey123"
 
         def __str__(self):
@@ -468,21 +471,19 @@ def test_env_get_unwraps_a_jsproxy_secret_and_rejects_object_string():
         def __init__(self, value):
             self.YOUTUBE_API_KEY = value
 
-    assert env_get(Env(ProxyKey()), "YOUTUBE_API_KEY") == "AIzaExactKey123"
+    assert env_get(Env(ProxyKey()), "YOUTUBE_API_KEY") is None
+    assert calls["to_py"] == 0
+    assert env_get(Env("AIzaExactKey123"), "YOUTUBE_API_KEY") == "AIzaExactKey123"
     assert env_get(Env(Garbage()), "YOUTUBE_API_KEY") is None
     assert env_get({"YOUTUBE_API_KEY": "undefined"}, "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "null"}, "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "[object Object]"}, "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "[REDACTED]"}, "YOUTUBE_API_KEY") is None
 
 
 def test_youtube_request_url_contains_the_exact_api_key():
-    class ProxyKey:
-        def to_py(self):
-            return "AIzaExactKey123"
-
-        def __str__(self):
-            return "[object Object]"
-
     class Env:
-        YOUTUBE_API_KEY = ProxyKey()
+        YOUTUBE_API_KEY = "AIzaExactKey123"
 
     urls = []
 
@@ -740,8 +741,8 @@ def test_youtube_key_prefers_an_aiza_string_over_to_py_garbage():
     class Env:
         YOUTUBE_API_KEY = Both()
 
-    assert env_get(Env(), "YOUTUBE_API_KEY") == real
-    from runtime import describe_secret
+    assert env_get(Env(), "YOUTUBE_API_KEY") is None
+    from diag_secrets import describe_secret
 
     report = describe_secret(Env(), "YOUTUBE_API_KEY")
     blob = json.dumps(report)

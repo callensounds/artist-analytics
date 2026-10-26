@@ -1,9 +1,16 @@
+import asyncio
+import builtins
 import json
 import re
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 import main
+from cache import MemoryCache
+from http_client import HttpResult
+from providers.youtube import fetch_youtube
+from runtime import WorkerSessionMiddleware, env_get, env_string
 
 EMPTY = {
     "sources": [
@@ -256,3 +263,108 @@ def test_bad_login_and_short_password():
     )
     assert created.status_code == 303
     assert "new@example.com" in main.USERS
+
+
+def test_middleware_and_env_get_never_import_js(monkeypatch):
+    import sys
+
+    assert "diag_secrets" not in sys.modules
+    assert "js" not in sys.modules
+    source = Path("src/runtime.py").read_text(encoding="utf-8")
+    assert re.search(r"(?m)^\s*(import|from)\s+js\b", source) is None
+    assert re.search(r"(?m)^\s*(import|from)\s+workers\b", source) is None
+
+    imported = []
+    real_import = builtins.__import__
+
+    def tracking(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.split(".", 1)[0]
+        if root in {"js", "workers", "diag_secrets"}:
+            imported.append(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", tracking)
+
+    class Trap:
+        def to_py(self):
+            import js
+
+            return "AIza" + ("x" * 35)
+
+        def valueOf(self):
+            import js
+
+            return "AIza" + ("y" * 35)
+
+        def __str__(self):
+            return "[object Object]"
+
+    class Env:
+        YOUTUBE_API_KEY = Trap()
+        SECRET_KEY = Trap()
+
+    assert env_get(Env(), "YOUTUBE_API_KEY") is None
+    assert env_get(Env(), "SECRET_KEY") is None
+    assert env_string(Env(), "YOUTUBE_API_KEY") is None
+    assert env_get({"SECRET_KEY": "[REDACTED]"}, "SECRET_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "[object Object]"}, "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "undefined"}, "YOUTUBE_API_KEY") is None
+    assert env_get({"YOUTUBE_API_KEY": "null"}, "YOUTUBE_API_KEY") is None
+
+    calls = []
+
+    async def call(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def drive():
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await WorkerSessionMiddleware(call)(
+            {"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b"", "env": Env()},
+            receive,
+            send,
+        )
+
+    asyncio.run(drive())
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        return HttpResult(200, "{}", url, {})
+
+    class Recording:
+        async def get_text(self, url, **kwargs):
+            return respond("GET", url, kwargs.get("params"), kwargs.get("data"))
+
+        async def get_json(self, url, **kwargs):
+            result = await self.get_text(url, **kwargs)
+            return result, {}
+
+        async def post_form(self, url, data, **kwargs):
+            return respond("POST", url, None, data), {}
+
+    missed = asyncio.run(fetch_youtube("Example", {}, Env(), Recording(), MemoryCache({})))
+    assert missed.status == "missing_credentials"
+    redacted = asyncio.run(
+        fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "[REDACTED]"}, Recording(), MemoryCache({}))
+    )
+    assert redacted.reason == "YouTube key is misconfigured"
+    assert calls == []
+
+    async def fake_collect(name, env=None, http=None, cache=None):
+        assert env_get(env, "YOUTUBE_API_KEY") is None
+        return EMPTY
+
+    monkeypatch.setattr(main, "collect_artist", fake_collect)
+    client = TestClient(main.app)
+    for path in ("/", "/login", "/favicon.ico", "/static/app.css"):
+        assert client.get(path).status_code == 200
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
+    assert client.get("/dashboard", params={"artist": "Billie Eilish"}).status_code == 200
+    assert imported == []
