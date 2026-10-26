@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -21,8 +22,24 @@ NOTICE = (
     "Follower counts are not part of this API."
 )
 NAME_MATCH = "Matched by name on the public iTunes Search API, not from a MusicBrainz URL."
+WEB_NOTICE = (
+    "iTunes Search was refused from this network. "
+    "These dates were read from public music.apple.com pages: music:release_date on the album page when it was present, "
+    "otherwise the year printed on the album shelf. No Apple login or token is used."
+)
 FRESH_TTL = 6 * 60 * 60
 STALE_TTL = 7 * 24 * 60 * 60
+WEB_EXACT_LIMIT = 8
+SHELF_TITLES = {"Albums", "Singles & EPs", "Live Albums"}
+_SERVER_DATA = re.compile(
+    r'<script type="application/json" id="serialized-server-data">(.*?)</script>',
+    re.DOTALL,
+)
+_RELEASE_META = re.compile(
+    r'<meta[^>]+property="music:release_date"[^>]+content="([^"]+)"'
+    r'|<meta[^>]+content="([^"]+)"[^>]+property="music:release_date"',
+    re.IGNORECASE,
+)
 
 
 class ItunesLimited(Exception):
@@ -138,6 +155,178 @@ async def itunes_json(http, cache, base: str, params: dict) -> tuple[dict, str |
     raise ItunesLimited(last_status)
 
 
+def _shelf_title(section: dict) -> str:
+    header = section.get("header") or {}
+    item = header.get("item") or {}
+    link = item.get("titleLink") or {}
+    title = link.get("title")
+    return title if isinstance(title, str) else ""
+
+
+def _album_row(node: dict) -> dict | None:
+    descriptor = node.get("contentDescriptor") or {}
+    if descriptor.get("kind") != "album":
+        return None
+    titles = node.get("titleLinks") or []
+    title = titles[0].get("title") if titles and isinstance(titles[0], dict) else None
+    if not title:
+        return None
+    subtitles = node.get("subtitleLinks") or []
+    year = subtitles[0].get("title") if subtitles and isinstance(subtitles[0], dict) else None
+    url = descriptor.get("url")
+    album_id = (descriptor.get("identifiers") or {}).get("storeAdamID")
+    return {
+        "title": title,
+        "year": year if isinstance(year, str) and re.fullmatch(r"\d{4}", year) else None,
+        "url": url if isinstance(url, str) else None,
+        "id": str(album_id) if album_id else None,
+    }
+
+
+def parse_apple_albums(html: str) -> tuple[str | None, list[dict]]:
+    """Albums embedded in a public music.apple.com page. Years only; album pages add the clock time."""
+    match = _SERVER_DATA.search(html or "")
+    if not match:
+        return None, []
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None, []
+    profile = None
+    albums: list[dict] = []
+    seen = set()
+
+    def add(row: dict | None) -> None:
+        if not row:
+            return
+        key = row.get("id") or row.get("url") or row["title"]
+        if key in seen:
+            return
+        seen.add(key)
+        albums.append(row)
+
+    def walk_sections(node) -> None:
+        nonlocal profile
+        if isinstance(node, dict):
+            seo = node.get("seoData")
+            if isinstance(seo, dict) and isinstance(seo.get("pageTitle"), str) and profile is None:
+                title = seo["pageTitle"]
+                for sep in (" – ", " - ", " — "):
+                    if sep in title:
+                        title = title.split(sep)[0]
+                        break
+                title = title.removeprefix("Albums by ").removeprefix("Singles by ").strip(" ‎")
+                profile = title or None
+            sections = node.get("sections")
+            if isinstance(sections, list):
+                for section in sections:
+                    if not isinstance(section, dict):
+                        continue
+                    title = _shelf_title(section)
+                    if title and title not in SHELF_TITLES:
+                        continue
+                    for item in section.get("items") or []:
+                        if isinstance(item, dict):
+                            add(_album_row(item))
+            for value in node.values():
+                walk_sections(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk_sections(value)
+
+    walk_sections(payload)
+    if not albums:
+        def walk_all(node) -> None:
+            if isinstance(node, dict):
+                add(_album_row(node))
+                for value in node.values():
+                    walk_all(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk_all(value)
+
+        walk_all(payload)
+    return profile, albums
+
+
+def parse_release_meta(html: str) -> str | None:
+    match = _RELEASE_META.search(html or "")
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+async def _get_html(http, url: str) -> str | None:
+    try:
+        result = await http.get_text(url, timeout=8, headers={"Accept": "text/html"})
+    except TransportError:
+        return None
+    if not result.ok or not result.text:
+        return None
+    return result.text
+
+
+async def fetch_public_apple(http, artist_id: str, name: str, status: int) -> SourceResult | None:
+    """Public artist and album pages. Used when iTunes answers 403 or 429 with nothing cached."""
+    artist_html, shelf_html = await asyncio.gather(
+        _get_html(http, f"https://music.apple.com/us/artist/{artist_id}"),
+        _get_html(http, f"https://music.apple.com/us/artist/{artist_id}/see-all?section=full-albums"),
+    )
+    profile, albums = (None, [])
+    if shelf_html:
+        profile, albums = parse_apple_albums(shelf_html)
+    if not albums and artist_html:
+        profile, albums = parse_apple_albums(artist_html)
+    if not albums:
+        return None
+    exact = albums[:WEB_EXACT_LIMIT]
+
+    async def one(row: dict) -> str | None:
+        if not row.get("url"):
+            return None
+        html = await _get_html(http, row["url"])
+        if not html:
+            return None
+        return parse_release_meta(html)
+
+    dates = await asyncio.gather(*(one(row) for row in exact))
+    items = []
+    for row, raw in zip(albums, list(dates) + [None] * (len(albums) - len(dates))):
+        item = make_item(
+            title=row["title"],
+            kind="release",
+            raw=raw or row.get("year") or "",
+            url=row.get("url"),
+        )
+        if item is not None:
+            items.append(item)
+    items = sort_items(items)
+    if not items:
+        return None
+    timed = sum(1 for item in items if item.precision == "time")
+    return SourceResult(
+        platform="apple",
+        label="Apple Music",
+        status="ok",
+        profile_name=profile or name,
+        profile_url=f"https://music.apple.com/us/artist/{artist_id}",
+        metrics=[
+            Metric(label="Albums returned", available=True, value=str(len(items))),
+            Metric(label="Exact timestamps", available=True, value=str(timed)),
+            Metric(
+                label="Followers",
+                available=False,
+                reason="Public Apple Music pages do not publish follower counts.",
+            ),
+        ],
+        items=items[:100],
+        notices=[
+            WEB_NOTICE,
+            f"iTunes returned HTTP {status}. Showing the public Apple Music page instead.",
+        ],
+    )
+
+
 async def fetch_apple(name: str, links: dict, http, cache) -> SourceResult:
     artist_id = (links or {}).get("apple_id") or ""
 
@@ -173,6 +362,13 @@ async def fetch_apple(name: str, links: dict, http, cache) -> SourceResult:
             if lookup_stale:
                 limited_at = fetched_at
         except ItunesLimited as exc:
+            web_id = resolved or artist_id
+            if web_id:
+                web = await fetch_public_apple(http, web_id, name, exc.status)
+                if web is not None:
+                    if matched_by_name:
+                        web.notices.append(NAME_MATCH)
+                    return web
             return unavailable("apple", "Apple Music", _limited_message(exc.status, None), ttl=120)
         except TransportError as exc:
             return errored("apple", "Apple Music", str(exc))

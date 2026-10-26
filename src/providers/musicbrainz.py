@@ -26,7 +26,12 @@ from providers.common import (
 )
 
 MB = "https://musicbrainz.org/ws/2"
-HEADERS = {"Accept": "application/json"}
+MB_USER_AGENT = "AverageAnalytics/1.0 ( callen@callensounds.com )"
+MB_INTERVAL = 1.1
+MB_TTL = 24 * 60 * 60
+HEADERS = {"Accept": "application/json", "User-Agent": MB_USER_AGENT}
+_mb_lock = asyncio.Lock()
+_mb_next = 0.0
 
 
 def extract_links(relations: list[dict]) -> dict:
@@ -139,16 +144,28 @@ def aggregate_catalog(release_groups: list[dict], releases: list[dict]) -> list[
     return sort_items(items)
 
 
+async def _mb_slot() -> None:
+    """One MusicBrainz request at a time, at most about one per second, per isolate."""
+    global _mb_next
+    async with _mb_lock:
+        loop = asyncio.get_running_loop()
+        delay = _mb_next - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _mb_next = loop.time() + MB_INTERVAL
+
+
 async def _get_json(http, url: str, params: dict):
     last_status = None
     for attempt in range(2):
+        await _mb_slot()
         try:
             result, payload = await http.get_json(url, params=params, headers=HEADERS, timeout=10)
         except TransportError as exc:
             raise TransportError(str(exc)) from exc
         last_status = result.status
-        if result.status in {429, 503} and attempt == 0:
-            await asyncio.sleep(2)
+        if result.status == 503 and attempt == 0:
+            await asyncio.sleep(MB_INTERVAL)
             continue
         if result.status in {429, 503}:
             raise TransportError("MusicBrainz is rate-limiting requests. Try again shortly.")
@@ -217,6 +234,7 @@ async def _match(name: str, http) -> SourceResult:
         ],
         notices=[],
         links=links,
+        ttl=MB_TTL,
     )
 
 
@@ -259,6 +277,7 @@ async def _finish(partial: SourceResult, http) -> SourceResult:
         items=items,
         notices=notices,
         links=public,
+        ttl=MB_TTL,
     )
 
 

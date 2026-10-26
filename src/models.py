@@ -77,12 +77,13 @@ def source_from_dict(data: dict) -> SourceResult:
     )
 
 
-def unavailable(platform: str, label: str, reason: str, *, ttl: int = 600) -> SourceResult:
+def unavailable(platform: str, label: str, reason: str, *, ttl: int = 120) -> SourceResult:
     return SourceResult(
         platform=platform,
         label=label,
         status="unavailable",
         reason=reason,
+        cacheable=False,
         ttl=ttl,
     )
 

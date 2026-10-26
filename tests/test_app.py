@@ -155,6 +155,89 @@ def test_artist_query_renders_exact_timestamps(monkeypatch):
     assert "typeof Chart" in page.text
 
 
+def test_diag_is_logged_in_only_and_does_not_print_a_secret(monkeypatch):
+    async def fake_diagnose(env, http):
+        return {
+            "secrets": [
+                {
+                    "name": "YOUTUBE_API_KEY",
+                    "chosen_path": "env-attr:json-stringify",
+                    "chosen": {
+                        "length": 39,
+                        "prefix4": "AIza",
+                        "usable": True,
+                        "is_object_object": False,
+                        "is_undefined": False,
+                    },
+                    "reads": [
+                        {
+                            "path": "env-attr",
+                            "present": True,
+                            "python_type": "JsProxy",
+                            "js_typeof": "object",
+                            "js_constructor": "String",
+                            "error": None,
+                            "coercions": [
+                                {
+                                    "method": "str",
+                                    "length": 15,
+                                    "prefix4": "[obj",
+                                    "usable": False,
+                                    "is_object_object": True,
+                                    "is_undefined": False,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "youtube": {
+                "key_present": True,
+                "built_query_url": "https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=%40TaylorSwift&key=AIza…(39)",
+                "header_request": {
+                    "status": 200,
+                    "url": "https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=%40TaylorSwift",
+                    "message": None,
+                    "error": None,
+                    "has_server_data": False,
+                    "has_release_meta": False,
+                },
+                "query_request": {
+                    "status": 400,
+                    "url": "https://www.googleapis.com/youtube/v3/channels?part=id&key=AIza…(39)",
+                    "message": "API key not valid. Please pass a valid API key.",
+                    "error": None,
+                    "has_server_data": False,
+                    "has_release_meta": False,
+                },
+                "dashboard_sends": "X-Goog-Api-Key header, no key query parameter",
+            },
+            "apple": {
+                "itunes_lookup": {
+                    "status": 403,
+                    "url": "https://itunes.apple.com/lookup?id=159260351",
+                    "message": None,
+                    "error": None,
+                    "has_server_data": False,
+                    "has_release_meta": False,
+                }
+            },
+        }
+
+    monkeypatch.setattr(main, "diagnose", fake_diagnose)
+    client = TestClient(main.app)
+    anon = client.get("/admin/diag", follow_redirects=False)
+    assert anon.status_code == 303
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
+    page = client.get("/admin/diag")
+    assert page.status_code == 200
+    assert "env-attr:json-stringify" in page.text
+    assert "JsProxy" in page.text
+    assert "AIza…(39)" in page.text
+    assert "AIzaExactKey123" not in page.text
+    assert "HTTP 403" in page.text or "403" in page.text
+
+
 def test_bad_login_and_short_password():
     client = TestClient(main.app)
     denied = client.post("/login", data={"email": "artist@demo.com", "password": "nope"})

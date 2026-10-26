@@ -8,16 +8,23 @@ import re
 from models import SourceResult, source_from_dict
 
 
+# Bump when a cached error must not outlive a code fix.
+CACHE_VERSION = "v3"
+
+
 async def cached(cache, key: str, producer) -> SourceResult:
     if cache is not None:
         raw = await cache.get(key)
         if raw:
             try:
-                return source_from_dict(json.loads(raw))
+                stored = source_from_dict(json.loads(raw))
             except (json.JSONDecodeError, KeyError, TypeError):
-                pass
+                stored = None
+            # Errors and unavailable cards used to sit in this cache for 45 minutes.
+            if stored is not None and stored.status == "ok":
+                return stored
     result = await producer()
-    if cache is not None and result.cacheable:
+    if cache is not None and result.cacheable and result.status == "ok":
         try:
             await cache.set(key, json.dumps(result.to_dict()), result.ttl)
         except Exception:
@@ -64,4 +71,4 @@ def tiktok_handle(url: str) -> str | None:
 
 def cache_key(platform: str, *parts: str) -> str:
     slug = ":".join(part.strip().casefold() for part in parts if part)
-    return f"aa:v1:{platform}:{slug or 'none'}"
+    return f"aa:{CACHE_VERSION}:{platform}:{slug or 'none'}"

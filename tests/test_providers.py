@@ -18,8 +18,10 @@ from providers import collect_artist
 class FakeHttp:
     def __init__(self, responder):
         self.responder = responder
+        self.headers = []
 
     async def get_text(self, url, **kwargs):
+        self.headers.append(kwargs.get("headers") or {})
         return self.responder("GET", url, kwargs.get("params"), kwargs.get("data"))
 
     async def get_json(self, url, **kwargs):
@@ -511,18 +513,28 @@ def test_youtube_request_url_contains_the_exact_api_key():
             return HttpResult(404, "", url, {})
         return HttpResult(200, json.dumps(body), url, {})
 
-    from providers.youtube import fetch_youtube
+    from providers.youtube import fetch_youtube, redact_key, youtube_url
 
-    result = asyncio.run(
-        fetch_youtube("Callen Sounds", {}, Env(), FakeHttp(respond), MemoryCache({}))
-    )
+    http = FakeHttp(respond)
+    result = asyncio.run(fetch_youtube("Callen Sounds", {}, Env(), http, MemoryCache({})))
     assert urls
     assert result.status == "ok"
     assert any("Matched by name" in note for note in result.notices)
+    assert http.headers
+    for header in http.headers:
+        assert header.get("X-Goog-Api-Key") == "AIzaExactKey123"
     for url in urls:
-        assert "key=AIzaExactKey123" in url
+        assert "AIzaExactKey123" not in url
         assert "[object Object]" not in url
         assert "undefined" not in url
+    built = youtube_url(
+        "channels",
+        {"part": "id", "forHandle": "@TaylorSwift", "key": "AIzaExactKey123"},
+    )
+    assert "key=AIzaExactKey123" in built
+    redacted = redact_key(built, "AIzaExactKey123")
+    assert "AIzaExactKey123" not in redacted
+    assert "AIza…(15)" in redacted
     assert "AIzaExactKey123" not in (result.reason or "")
     assert "AIzaExactKey123" not in " ".join(result.notices)
 
@@ -585,7 +597,8 @@ def test_apple_403_without_cache_says_try_again(monkeypatch):
         return HttpResult(403, "", url, {})
 
     result = asyncio.run(fetch_apple("Example", {"apple_id": "5"}, FakeHttp(respond), MemoryCache({})))
-    assert len(calls) == 1
+    assert calls[0].startswith("https://itunes.apple.com/lookup")
+    assert any("music.apple.com" in url for url in calls)
     assert result.status == "unavailable"
     assert "HTTP 403" in result.reason
     assert "Try again shortly" in result.reason
@@ -652,7 +665,9 @@ def test_unmatched_artist_is_labeled_matched_by_name_and_does_not_invent_counts(
     assert "AIzaExactKey123" not in blob
 
 
-def test_catalog_overlaps_the_other_providers():
+def test_catalog_overlaps_the_other_providers(monkeypatch):
+    monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0.02)
+    monkeypatch.setattr("providers.musicbrainz._mb_next", 0.0)
     events = []
 
     class DelayHttp(FakeHttp):
@@ -698,3 +713,118 @@ def test_catalog_overlaps_the_other_providers():
 
     asyncio.run(collect_artist("Example Artist", env={}, http=DelayHttp(respond), cache=MemoryCache({})))
     assert events.index("apple-start") < events.index("rg-start") < events.index("apple-end")
+
+
+def test_youtube_key_prefers_an_aiza_string_over_to_py_garbage():
+    real = "AIza" + ("Y" * 35)
+
+    class Both:
+        def to_py(self):
+            return "not-the-real-key"
+
+        def valueOf(self):
+            return real
+
+        def __str__(self):
+            return "[object Object]"
+
+    class Env:
+        YOUTUBE_API_KEY = Both()
+
+    assert env_get(Env(), "YOUTUBE_API_KEY") == real
+    from runtime import describe_secret
+
+    report = describe_secret(Env(), "YOUTUBE_API_KEY")
+    blob = json.dumps(report)
+    assert real not in blob
+    assert "not-the-real-key" not in blob
+    assert report["chosen"]["prefix4"] == "AIza"
+    assert report["chosen"]["length"] == 39
+    assert report["chosen_path"].endswith("valueOf")
+
+
+def test_cached_ok_results_ignore_stored_errors():
+    from models import errored
+    from providers.common import CACHE_VERSION, cached
+
+    assert CACHE_VERSION == "v3"
+
+    async def scenario():
+        cache = MemoryCache({})
+        key = cache_key("youtube", "Example")
+        await cache.set(key, json.dumps(errored("youtube", "YouTube", "API key not valid").to_dict()), 2700)
+        calls = {"n": 0}
+
+        async def produce():
+            calls["n"] += 1
+            return errored("youtube", "YouTube", "API key not valid")
+
+        result = await cached(cache, key, produce)
+        return calls["n"], result.status, await cache.get(key)
+
+    calls, status, stored = asyncio.run(scenario())
+    assert calls == 1
+    assert status == "error"
+    stored_status = json.loads(stored)["status"]
+    assert stored_status == "error"
+
+
+def test_apple_public_page_is_used_when_itunes_is_forbidden():
+    shelf = """
+    <script type="application/json" id="serialized-server-data">
+    {"data":[{"data":{"seoData":{"pageTitle":"Example - Apple Music"},"sections":[
+      {"header":{"item":{"titleLink":{"title":"Albums"}}},"items":[
+        {"titleLinks":[{"title":"Debut"}],"subtitleLinks":[{"title":"2020"}],
+         "contentDescriptor":{"kind":"album","url":"https://music.apple.com/us/album/debut/8",
+           "identifiers":{"storeAdamID":"8"}}}
+      ]}
+    ]}}]}
+    </script>
+    """
+    album = '<meta property="music:release_date" content="2020-01-02T08:00:00Z">'
+
+    def respond(method, url, params, data):
+        if "itunes.apple.com" in url:
+            return HttpResult(403, "", url, {})
+        if "/album/" in url:
+            return HttpResult(200, album, url, {})
+        if "music.apple.com" in url:
+            return HttpResult(200, shelf, url, {})
+        return HttpResult(404, "", url, {})
+
+    result = asyncio.run(fetch_apple("Example", {"apple_id": "5"}, FakeHttp(respond), MemoryCache({})))
+    assert result.status == "ok"
+    assert result.items[0].display == "2020-01-02 08:00 UTC"
+    assert any("music.apple.com" in note for note in result.notices)
+    assert any("HTTP 403" in note for note in result.notices)
+
+
+def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):
+    monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0.05)
+    monkeypatch.setattr("providers.musicbrainz._mb_next", 0.0)
+    starts = []
+    seen_headers = []
+
+    class TimedHttp(FakeHttp):
+        async def get_text(self, url, **kwargs):
+            if "musicbrainz.org" in url:
+                starts.append(asyncio.get_running_loop().time())
+                seen_headers.append(kwargs.get("headers") or {})
+            return await super().get_text(url, **kwargs)
+
+    def respond(method, url, params, data):
+        return HttpResult(200, json.dumps({"artists": []}), url, {})
+
+    from providers.musicbrainz import MB_USER_AGENT, _get_json
+
+    async def run():
+        http = TimedHttp(respond)
+        await asyncio.gather(
+            _get_json(http, "https://musicbrainz.org/ws/2/artist/", {"fmt": "json"}),
+            _get_json(http, "https://musicbrainz.org/ws/2/artist/mbid-1", {"fmt": "json"}),
+        )
+
+    asyncio.run(run())
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= 0.05
+    assert seen_headers[0]["User-Agent"] == MB_USER_AGENT
