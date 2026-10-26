@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import random
 
 from analytics import (
     EXCLUDED_SECONDARY,
@@ -13,8 +15,6 @@ from analytics import (
 )
 from http_client import TransportError
 from models import Metric, SourceResult, errored, make_item, sort_items, source_from_dict, unavailable
-import json
-
 from providers.common import (
     apple_artist_id,
     cache_key,
@@ -29,6 +29,10 @@ MB = "https://musicbrainz.org/ws/2"
 MB_USER_AGENT = "AverageAnalytics/1.0 ( callen@callensounds.com )"
 MB_INTERVAL = 1.1
 MB_TTL = 24 * 60 * 60
+MB_RELATIONS_TTL = 7 * 24 * 60 * 60
+MB_TIMEOUT = 12
+# Search, one lookup, and one retry have to fit. The other providers stay on a shorter budget.
+MB_OPEN_TIMEOUT = 22
 HEADERS = {"Accept": "application/json", "User-Agent": MB_USER_AGENT}
 _mb_lock = asyncio.Lock()
 _mb_next = 0.0
@@ -155,24 +159,78 @@ async def _mb_slot() -> None:
         _mb_next = loop.time() + MB_INTERVAL
 
 
+def _body_snippet(text: str) -> str:
+    collapsed = " ".join((text or "").split())
+    return collapsed[:240]
+
+
+def _mb_message(status: int | None, body: str) -> str:
+    snippet = _body_snippet(body)
+    if status is None:
+        return f"MusicBrainz request failed: {snippet or 'no response body'}"
+    if snippet:
+        return f"MusicBrainz HTTP {status}: {snippet}"
+    return f"MusicBrainz HTTP {status}."
+
+
 async def _get_json(http, url: str, params: dict):
-    last_status = None
+    """Two attempts. A 429, 503, or transport failure waits a short jitter, then tries once more."""
+    last_error = TransportError("MusicBrainz request failed: no response body")
     for attempt in range(2):
         await _mb_slot()
         try:
-            result, payload = await http.get_json(url, params=params, headers=HEADERS, timeout=10)
+            result, payload = await http.get_json(url, params=params, headers=HEADERS, timeout=MB_TIMEOUT)
         except TransportError as exc:
-            raise TransportError(str(exc)) from exc
-        last_status = result.status
-        if result.status == 503 and attempt == 0:
-            await asyncio.sleep(MB_INTERVAL)
+            last_error = TransportError(_mb_message(None, str(exc)))
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.25, 0.9))
+                continue
+            raise last_error from exc
+        if result.ok and isinstance(payload, dict):
+            return payload
+        last_error = TransportError(_mb_message(result.status, result.text or ""))
+        if result.status in {429, 503} and attempt == 0:
+            await asyncio.sleep(random.uniform(0.25, 0.9))
             continue
-        if result.status in {429, 503}:
-            raise TransportError("MusicBrainz is rate-limiting requests. Try again shortly.")
-        if not result.ok or not isinstance(payload, dict):
-            raise TransportError(f"MusicBrainz returned HTTP {result.status}.")
-        return payload
-    raise TransportError(f"MusicBrainz returned HTTP {last_status}.")
+        raise last_error
+    raise last_error
+
+
+def _relations_payload(result: SourceResult) -> dict:
+    links = _public_links(result.links)
+    return {
+        "links": links,
+        "name": result.profile_name or "",
+    }
+
+
+async def _load_relations(cache, query: str) -> dict | None:
+    if cache is None or not query:
+        return None
+    raw = await cache.get(cache_key("mb-rels", query))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    links = payload.get("links") if isinstance(payload, dict) else None
+    if not isinstance(links, dict):
+        return None
+    return links
+
+
+async def _store_relations(cache, query: str, result: SourceResult) -> None:
+    if cache is None or not query or result.status != "ok":
+        return
+    try:
+        await cache.set(
+            cache_key("mb-rels", query),
+            json.dumps(_relations_payload(result)),
+            MB_RELATIONS_TTL,
+        )
+    except Exception:
+        return
 
 
 def _public_links(links: dict | None) -> dict:
@@ -196,7 +254,7 @@ async def _match(name: str, http) -> SourceResult:
         search = await _get_json(
             http,
             f"{MB}/artist/",
-            {"query": f'artist:"{query}"', "fmt": "json", "limit": "5"},
+            {"query": f'artist:"{query}"', "fmt": "json", "limit": "5", "inc": "url-rels"},
         )
     except TransportError as exc:
         return errored("musicbrainz", "MusicBrainz", str(exc))
@@ -215,10 +273,14 @@ async def _match(name: str, http) -> SourceResult:
             "Instagram and TikTok handles are not guessed.",
         )
     mbid = chosen["id"]
-    try:
-        artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
-    except TransportError as exc:
-        return errored("musicbrainz", "MusicBrainz", str(exc))
+    # The search server usually ignores inc=url-rels. A lookup is the second call only then.
+    if isinstance(chosen.get("relations"), list):
+        artist_doc = chosen
+    else:
+        try:
+            artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
+        except TransportError as exc:
+            return errored("musicbrainz", "MusicBrainz", str(exc))
     links = extract_links(artist_doc.get("relations") or [])
     links["_mbid"] = mbid
     profile = artist_doc.get("name") or chosen.get("name")
@@ -292,8 +354,17 @@ async def open_musicbrainz(name: str, http, cache):
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
     partial = await _match(name, http)
-    if partial.status != "ok":
-        partial.links = _public_links(partial.links)
+    if partial.status == "ok":
+        await _store_relations(cache, query, partial)
+    else:
+        cached_links = await _load_relations(cache, query)
+        if cached_links:
+            partial.links = dict(cached_links)
+            partial.notices = list(partial.notices or []) + [
+                "MusicBrainz did not answer. Spotify, Instagram, and TikTok are using URL relations cached for 7 days."
+            ]
+        else:
+            partial.links = _public_links(partial.links)
         await _remember(cache, query, partial)
         return partial, None
 

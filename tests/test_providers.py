@@ -873,6 +873,123 @@ def test_youtube_misconfigured_key_is_not_sent():
     assert calls == []
 
 
+def test_musicbrainz_reports_status_and_body_and_reuses_cached_relations(monkeypatch):
+    async def no_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("providers.musicbrainz.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0)
+    monkeypatch.setattr("providers.musicbrainz._mb_next", 0.0)
+    calls = []
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        if "musicbrainz.org" in url:
+            return HttpResult(503, "rate limit exceeded for this shared egress IP", url, {})
+        if "oembed" in url:
+            return HttpResult(200, json.dumps({"title": "Billie Eilish"}), url, {})
+        if "open.spotify.com/" in url:
+            return HttpResult(200, "<html><body><p>1,234,567 monthly listeners</p></body></html>", url, {})
+        if "instagram.com/billieeilish/embed" in url:
+            return HttpResult(200, "no timestamps", url, {})
+        if "tiktok.com/@billieeilish" in url:
+            return HttpResult(200, "<html></html>", url, {})
+        if "api.spotify.com/v1/search" in url:
+            return HttpResult(
+                200,
+                json.dumps({"artists": {"items": [{"id": "abc", "name": "Billie Eilish"}]}}),
+                url,
+                {},
+            )
+        if "accounts.spotify.com" in url:
+            return HttpResult(200, json.dumps({"access_token": "token", "expires_in": 3600}), url, {})
+        if "api.spotify.com" in url:
+            return HttpResult(200, json.dumps({"name": "Billie Eilish", "followers": {"total": 1}, "external_urls": {}}), url, {})
+        return HttpResult(404, "", url, {})
+
+    cache = MemoryCache({})
+    bundle = asyncio.run(collect_artist("Billie Eilish", env={}, http=FakeHttp(respond), cache=cache))
+    musicbrainz = next(source for source in bundle["sources"] if source["platform"] == "musicbrainz")
+    assert musicbrainz["status"] == "error"
+    assert "HTTP 503" in musicbrainz["reason"]
+    assert "shared egress IP" in musicbrainz["reason"]
+    assert sum("musicbrainz.org" in url for url in calls) == 2
+    spotify = next(source for source in bundle["sources"] if source["platform"] == "spotify")
+    assert "did not return URL relationships" in spotify["reason"]
+
+    calls.clear()
+    named = asyncio.run(
+        collect_artist(
+            "Billie Eilish",
+            env={"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "sec"},
+            http=FakeHttp(respond),
+            cache=MemoryCache({}),
+        )
+    )
+    assert any("api.spotify.com/v1/search" in url for url in calls)
+    named_spotify = next(source for source in named["sources"] if source["platform"] == "spotify")
+    assert named_spotify["status"] == "ok"
+
+    calls.clear()
+    asyncio.run(
+        cache.set(
+            cache_key("mb-rels", "Billie Eilish"),
+            json.dumps(
+                {
+                    "links": {
+                        "spotify_id": "abc",
+                        "apple_id": "",
+                        "youtube_channel_ids": [],
+                        "youtube_handles": [],
+                        "instagram": "billieeilish",
+                        "tiktok": "billieeilish",
+                    },
+                    "name": "Billie Eilish",
+                }
+            ),
+            100,
+        )
+    )
+    cached = asyncio.run(collect_artist("Billie Eilish", env={}, http=FakeHttp(respond), cache=cache))
+    joined = " ".join(calls)
+    assert "open.spotify.com/artist/abc" in joined
+    assert "instagram.com/billieeilish/embed" in joined
+    assert "tiktok.com/@billieeilish" in joined
+    musicbrainz = next(source for source in cached["sources"] if source["platform"] == "musicbrainz")
+    assert "HTTP 503" in musicbrainz["reason"]
+    assert any("cached for 7 days" in note for note in musicbrainz["notices"])
+
+
+def test_musicbrainz_search_relations_skip_the_lookup():
+    calls = []
+
+    def respond(method, url, params, data):
+        calls.append(url)
+        if params and "query" in (params or {}):
+            assert params.get("inc") == "url-rels"
+            body = {
+                "artists": [
+                    {
+                        "id": "mbid-1",
+                        "name": "Example Artist",
+                        "score": 100,
+                        "relations": [{"url": {"resource": "https://open.spotify.com/artist/abc"}}],
+                    }
+                ]
+            }
+            return HttpResult(200, json.dumps(body), url, {})
+        if "release-group" in url or url.endswith("/release") or "/release?" in url:
+            return HttpResult(200, json.dumps({"release-groups": [], "releases": []}), url, {})
+        return HttpResult(500, "should not look up the artist again", url, {})
+
+    from providers.musicbrainz import fetch_musicbrainz
+
+    result = asyncio.run(fetch_musicbrainz("Example Artist", FakeHttp(respond), MemoryCache({})))
+    assert result.status == "ok"
+    assert result.links["spotify_id"] == "abc"
+    assert not any(url.rstrip("/").endswith("/artist/mbid-1") for url in calls)
+
+
 def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):
     monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0.05)
     monkeypatch.setattr("providers.musicbrainz._mb_next", 0.0)
