@@ -1,8 +1,25 @@
-"""Process memory, the Workers Cache API, and optional KV. Any layer can be missing."""
+"""Process memory, the Workers Cache API, and optional KV. Any layer can be missing.
+
+Every Cache API and KV call is an awaited JS promise. Nothing here blocks or uses run_sync.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import time
+
+# A slow cache layer must not eat the dashboard budget.
+LAYER_TIMEOUT = 1.5
+
+
+def _js_options(options: dict):
+    """A JS object for KV/Cache options. Plain dicts are fine for fakes outside the Worker."""
+    try:
+        from js import Object
+        from pyodide.ffi import to_js
+    except ImportError:
+        return options
+    return to_js(options, dict_converter=Object.fromEntries)
 
 _MEMORY: dict[str, tuple[float, str]] = {}
 
@@ -53,7 +70,7 @@ class KVCache:
     async def set(self, key: str, value: str, ttl: int) -> None:
         await self.memory.set(key, value, ttl)
         try:
-            await self.kv.put(key, value, {"expirationTtl": int(ttl)})
+            await self.kv.put(key, value, _js_options({"expirationTtl": max(int(ttl), 60)}))
         except Exception:
             try:
                 await self.kv.put(key, value)
@@ -107,7 +124,7 @@ class EdgeCache:
             api = self._api()
             headers = Headers.new()
             headers.set("Cache-Control", f"public, max-age={max(int(ttl), 60)}")
-            response = Response.new(value, headers=headers)
+            response = Response.new(value, _js_options({"headers": headers}))
             await api.default.put(self._request(key), response)
         except Exception:
             return
@@ -122,14 +139,14 @@ class TieredCache:
     async def get(self, key: str) -> str | None:
         for index, layer in enumerate(self.layers):
             try:
-                value = await layer.get(key)
+                value = await asyncio.wait_for(layer.get(key), LAYER_TIMEOUT)
             except Exception:
                 value = None
             if not value:
                 continue
             for earlier in self.layers[:index]:
                 try:
-                    await earlier.set(key, value, 120)
+                    await asyncio.wait_for(earlier.set(key, value, 120), LAYER_TIMEOUT)
                 except Exception:
                     pass
             return value
@@ -138,7 +155,7 @@ class TieredCache:
     async def set(self, key: str, value: str, ttl: int) -> None:
         for layer in self.layers:
             try:
-                await layer.set(key, value, ttl)
+                await asyncio.wait_for(layer.set(key, value, ttl), LAYER_TIMEOUT)
             except Exception:
                 continue
 

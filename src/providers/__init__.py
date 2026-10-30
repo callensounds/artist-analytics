@@ -6,17 +6,20 @@ import asyncio
 
 from analytics import build_insights, build_patterns
 from cache import cache_from_env
-from http_client import RequestsClient
+from http_client import HttpClient
 from models import errored
 from providers.apple import fetch_apple
 from providers.instagram import fetch_instagram
-from providers.musicbrainz import MB_OPEN_TIMEOUT, open_musicbrainz
+from providers.musicbrainz import MB_OPEN_TIMEOUT, open_musicbrainz, timed_out
 from providers.spotify import fetch_spotify
 from providers.tiktok import fetch_tiktok
 from providers.youtube import fetch_youtube
 
-# One slow source must not hold the rest of the dashboard.
-PROVIDER_TIMEOUT = 15
+# The whole dashboard answers within about 10s. Rendering gets the last half second.
+DASHBOARD_DEADLINE = 9.5
+# No single source gets more than this, even when the deadline would allow it.
+PROVIDER_TIMEOUT = 8.0
+RENDER_MARGIN = 0.4
 
 
 def _public_links(links: dict | None) -> dict:
@@ -31,9 +34,16 @@ def _has_saved_links(links: dict) -> bool:
     return False
 
 
-async def _bounded(coro, platform: str, label: str):
+def _budget(deadline: float | None, cap: float = PROVIDER_TIMEOUT) -> float:
+    if deadline is None:
+        return cap
+    left = deadline - asyncio.get_running_loop().time() - RENDER_MARGIN
+    return max(0.05, min(cap, left))
+
+
+async def _bounded(coro, platform: str, label: str, deadline: float | None = None):
     try:
-        return await asyncio.wait_for(coro, PROVIDER_TIMEOUT)
+        return await asyncio.wait_for(coro, _budget(deadline))
     except asyncio.TimeoutError:
         return errored(
             platform,
@@ -50,13 +60,13 @@ async def _bounded(coro, platform: str, label: str):
         return errored(platform, label, "This source failed and was skipped so the rest of the page could load.")
 
 
-async def _finish_catalog(rest, partial):
+async def _finish_catalog(rest, partial, deadline: float | None = None):
     """Catalog runs beside the other providers. A timeout keeps the artist match."""
     if rest is None:
         partial.links = _public_links(partial.links)
         return partial
     try:
-        return await asyncio.wait_for(rest, PROVIDER_TIMEOUT)
+        return await asyncio.wait_for(rest, _budget(deadline))
     except asyncio.TimeoutError:
         partial.links = _public_links(partial.links)
         partial.notices = list(partial.notices or []) + [
@@ -68,21 +78,15 @@ async def _finish_catalog(rest, partial):
         return partial
 
 
-async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
-    client = http or RequestsClient()
+async def collect_artist(name: str, env=None, http=None, cache=None, deadline_s: float = DASHBOARD_DEADLINE) -> dict:
+    deadline = asyncio.get_running_loop().time() + deadline_s
+    client = http or HttpClient(deadline=deadline - RENDER_MARGIN)
     store = cache or cache_from_env(env)
     # Identity (search + URL relations) has to finish first. The catalog does not.
     try:
-        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), MB_OPEN_TIMEOUT)
+        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), _budget(deadline, MB_OPEN_TIMEOUT))
     except asyncio.TimeoutError:
-        opened = (
-            errored(
-                "musicbrainz",
-                "MusicBrainz",
-                "This source took too long and was skipped so the rest of the page could load.",
-            ),
-            None,
-        )
+        opened = (await timed_out(name, store), None)
     except Exception:
         opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
     if not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
@@ -95,13 +99,17 @@ async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
         links["_incomplete"] = True
 
     musicbrainz, apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
-        _finish_catalog(rest, partial),
-        _bounded(fetch_apple(name, links, client, store), "apple", "Apple Music"),
-        _bounded(fetch_spotify(name, links, env, client, store), "spotify", "Spotify"),
-        _bounded(fetch_youtube(name, links, env, client, store), "youtube", "YouTube"),
-        _bounded(fetch_instagram(name, links, client, store), "instagram", "Instagram"),
-        _bounded(fetch_tiktok(name, links, client, store), "tiktok", "TikTok"),
+        _finish_catalog(rest, partial, deadline),
+        _bounded(fetch_apple(name, links, client, store), "apple", "Apple Music", deadline),
+        _bounded(fetch_spotify(name, links, env, client, store), "spotify", "Spotify", deadline),
+        _bounded(fetch_youtube(name, links, env, client, store), "youtube", "YouTube", deadline),
+        _bounded(fetch_instagram(name, links, client, store), "instagram", "Instagram", deadline),
+        _bounded(fetch_tiktok(name, links, client, store), "tiktok", "TikTok", deadline),
+        return_exceptions=True,
     )
+    if isinstance(musicbrainz, BaseException) or musicbrainz is None:
+        partial.links = _public_links(partial.links)
+        musicbrainz = partial
     sources = [musicbrainz]
     for platform, label, result in (
         ("apple", "Apple Music", apple),
@@ -110,7 +118,9 @@ async def collect_artist(name: str, env=None, http=None, cache=None) -> dict:
         ("instagram", "Instagram", instagram),
         ("tiktok", "TikTok", tiktok),
     ):
-        sources.append(result or errored(platform, label, "The source failed before returning a result."))
+        if isinstance(result, BaseException) or result is None:
+            result = errored(platform, label, "The source failed before returning a result.")
+        sources.append(result)
     payload = [source.to_dict() for source in sources]
     return {
         "sources": payload,
