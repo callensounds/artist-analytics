@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -634,4 +635,79 @@ def test_dashboard_route_performs_no_d1_writes(monkeypatch):
     assert hung_elapsed < 1
     stored = asyncio.run(db.D1Database(binding).query("SELECT COUNT(*) AS n FROM artists"))
     assert stored[0]["n"] == 0
+    reset_pool()
+
+
+def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, capsys):
+    """Workers calls scheduled(controller, env, ctx) and queue(batch, env, ctx)."""
+    import crawl
+    import db
+
+    scheduled = inspect.signature(main.Default.scheduled)
+    queue_sig = inspect.signature(main.Default.queue)
+    assert [name for name in scheduled.parameters if name != "self"][:3] == ["controller", "env", "ctx"]
+    assert [name for name in queue_sig.parameters if name != "self"][:3] == ["batch", "env", "ctx"]
+
+    binding = _D1()
+    queue = _Queue()
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+            self.CRAWL_QUEUE = queue
+
+    env = Env()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    reset_pool()
+    now = datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
+
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+        assert include_related is True
+        return _bundle(listeners=42, related=[])
+
+    monkeypatch.setattr(crawl, "collect_artist", fake_collect)
+
+    class Controller:
+        cron = "*/15 * * * *"
+        scheduledTime = 0
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Stale Act', 'staleact', 'search', 1, ?)
+            """,
+            (utc_now(now),),
+        )
+        worker = main.Default(object(), env)
+        # Exact runtime call: scheduled(controller, env, ctx).
+        await main.Default.scheduled(worker, Controller(), env, object())
+        runs = await database.query("SELECT status, artists_attempted FROM crawl_runs")
+        # A positional env with no bindings must still use the entrypoint env.
+        await main.Default.scheduled(worker, Controller(), object(), None)
+        message = _Message({"artist_id": 1})
+        # The call that raised "takes 2 positional arguments but 4 were given".
+        await main.Default.queue(worker, Batch([message]), env, object())
+        stored = await database.query("SELECT value FROM metric_snapshots")
+        runs_after = await database.query("SELECT status FROM crawl_runs")
+        return runs, runs_after, message, stored
+
+    runs, runs_after, message, stored = asyncio.run(run())
+    assert runs and runs[0]["status"] == "queued"
+    assert int(runs[0]["artists_attempted"]) == 1
+    assert len(runs_after) >= 2
+    assert queue.sent == [{"artist_id": 1}, {"artist_id": 1}]
+    assert message.acked and not message.retried
+    assert stored[0]["value"] == 42
+    logs = capsys.readouterr().out
+    assert "scheduled start" in logs
+    assert "scheduled end" in logs
+    assert "queue start" in logs
+    assert "queue end" in logs
     reset_pool()

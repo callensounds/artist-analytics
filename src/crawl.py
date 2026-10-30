@@ -107,7 +107,28 @@ def env_binding(env, name: str):
 
 
 def _log(message: str, **fields) -> None:
-    print(json.dumps({"message": message, **fields}))
+    print(json.dumps({"message": message, **fields}, default=str), flush=True)
+
+
+def handler_env(owner, passed):
+    """Entrypoint env when it has bindings, otherwise the env argument.
+
+    WorkerEntrypoint stores a wrapped env on ``self.env``. Fetch uses that object.
+    The scheduled and queue calls also pass a raw env, which can expose ``DB``
+    without the ``prepare`` method this process can call. Prefer ``self.env``.
+    """
+    own = getattr(owner, "env", None)
+
+    def usable(candidate) -> bool:
+        if candidate is None:
+            return False
+        return env_binding(candidate, "DB") is not None or env_binding(candidate, "CRAWL_QUEUE") is not None
+
+    if usable(own):
+        return own
+    if usable(passed):
+        return passed
+    return own if own is not None else passed
 
 
 async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datetime, related_cap: int) -> dict:
@@ -325,22 +346,33 @@ async def _finish_message(message, method: str) -> None:
         await result
 
 
-async def run_queue_batch(batch, env, *, collect=collect_artist, http=None, cache=None) -> None:
+async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) -> dict:
     # max_batch_size is 1. If a batch is larger anyway, only the first artist runs
     # in this invocation. The rest go back on the queue instead of stacking subrequests.
-    messages = list(getattr(batch, "messages", None) or [])
-    for extra in messages[1:]:
+    incoming = list(getattr(batch, "messages", None) or [])
+    for extra in incoming[1:]:
         await _finish_message(extra, "retry")
-    messages = messages[:1]
+    messages = incoming[:1]
+    extra_retries = max(0, len(incoming) - 1)
+    if collect is None:
+        collect = collect_artist
     db = await open_database(env)
     if db is None:
         for message in messages:
             await _finish_message(message, "retry")
-        return
+        return {
+            "messages": len(incoming),
+            "acked": 0,
+            "retried": len(messages) + extra_retries,
+            "snapshots": 0,
+        }
     await migrate(db)
     config = settings(env)
     store = cache if cache is not None else cache_from_env(env)
     moment = datetime.now(timezone.utc)
+    acked = 0
+    retried = 0
+    snapshots = 0
     for message in messages:
         artist_id, name, origin = _message_fields(message)
         row = None
@@ -350,13 +382,15 @@ async def run_queue_batch(batch, env, *, collect=collect_artist, http=None, cach
             row = await _ensure_named_artist(db, name, origin, moment)
         if row is None:
             await _finish_message(message, "ack")
+            acked += 1
             continue
         # A dashboard burst can enqueue the same name many times. Crawl the stale one.
         if not _stale(row, moment, config["stale_seconds"]):
             await _finish_message(message, "ack")
+            acked += 1
             continue
         try:
-            await refresh_artist(
+            saved = await refresh_artist(
                 db,
                 env,
                 row,
@@ -368,8 +402,17 @@ async def run_queue_batch(batch, env, *, collect=collect_artist, http=None, cach
             )
         except Exception:
             await _finish_message(message, "retry")
+            retried += 1
             continue
+        snapshots += int(saved.get("snapshots") or 0)
         await _finish_message(message, "ack")
+        acked += 1
+    return {
+        "messages": len(incoming),
+        "acked": acked,
+        "retried": retried + extra_retries,
+        "snapshots": snapshots,
+    }
 
 
 _POOL: dict[str, SqliteDatabase] = {}
