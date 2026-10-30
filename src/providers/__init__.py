@@ -10,13 +10,16 @@ from http_client import HttpClient
 from models import SourceResult, errored
 from providers.apple import fetch_apple
 from providers.instagram import fetch_instagram
-from providers.musicbrainz import MB_OPEN_TIMEOUT, open_musicbrainz, timed_out
+from providers.musicbrainz import MB_CRAWL_MAX_QUEUE, MB_CRAWL_OPEN_TIMEOUT, MB_OPEN_TIMEOUT, open_musicbrainz, timed_out
 from providers.spotify import fetch_spotify
 from providers.tiktok import fetch_tiktok
 from providers.youtube import fetch_youtube
 
 # The whole dashboard answers within about 10s. Rendering gets the last half second.
 DASHBOARD_DEADLINE = 9.5
+# The queue consumer is the only request on its invocation, so MusicBrainz can wait
+# out a dashboard burst instead of giving up at the page budget.
+CRAWL_DEADLINE = 28.0
 # No single source gets more than this, even when the deadline would allow it.
 PROVIDER_TIMEOUT = 8.0
 RENDER_MARGIN = 0.4
@@ -92,6 +95,38 @@ async def _passthrough(value):
     return value
 
 
+async def _links_from_database(env, name: str) -> dict:
+    """One indexed artists read. Used when MusicBrainz did not return URL relations."""
+    if env is None or not name:
+        return {}
+    # Imported lazily: crawl imports collect_artist while this module is loading.
+    from crawl import known_links, open_database
+
+    database = None
+    try:
+        database = await open_database(env, migrate_schema=False)
+    except Exception:
+        database = None
+    if database is None:
+        return {}
+    row = None
+    try:
+        from analytics import normalize_name
+
+        row = await database.query_one(
+            """
+            SELECT spotify_id, apple_id, youtube_channel_id, instagram_handle, tiktok_handle
+            FROM artists WHERE normalized_name = ?
+            """,
+            (normalize_name(name),),
+        )
+    except Exception:
+        row = None
+    if not row:
+        return {}
+    return known_links(row)
+
+
 async def collect_artist(
     name: str,
     env=None,
@@ -102,22 +137,47 @@ async def collect_artist(
     include_related: bool = False,
     skip_platforms=None,
 ) -> dict:
+    client = http or HttpClient()
+    light = bool(getattr(client, "crawl_light", False))
+    if light and deadline_s == DASHBOARD_DEADLINE:
+        deadline_s = CRAWL_DEADLINE
     deadline = asyncio.get_running_loop().time() + deadline_s
-    client = http or HttpClient(deadline=deadline - RENDER_MARGIN)
+    if http is None:
+        client.deadline = deadline - RENDER_MARGIN
+    elif light and getattr(client, "deadline", None) is None:
+        try:
+            client.deadline = deadline - RENDER_MARGIN
+        except Exception:
+            pass
+    if light:
+        try:
+            if getattr(client, "mb_open_timeout", None) is None:
+                client.mb_open_timeout = MB_CRAWL_OPEN_TIMEOUT
+            if getattr(client, "mb_max_queue", None) is None:
+                client.mb_max_queue = MB_CRAWL_MAX_QUEUE
+        except Exception:
+            pass
     store = cache or cache_from_env(env)
     skipped = {platform for platform in (skip_platforms or set()) if platform}
-    light = bool(getattr(client, "crawl_light", False))
+    open_cap = MB_CRAWL_OPEN_TIMEOUT if light else MB_OPEN_TIMEOUT
     # Identity (search + URL relations) has to finish first. The catalog does not.
     if "musicbrainz" in skipped:
         partial, rest = _skipped("musicbrainz", "MusicBrainz"), None
     else:
+        # Await the timeout fallback only after TimeoutError has finished propagating.
+        # timed_out() reads the cache, and that read is a JS promise on Workers.
+        opened = None
+        timed_out_open = False
+        failed_open = False
         try:
-            opened = await asyncio.wait_for(open_musicbrainz(name, client, store), _budget(deadline, MB_OPEN_TIMEOUT))
+            opened = await asyncio.wait_for(open_musicbrainz(name, client, store), _budget(deadline, open_cap))
         except asyncio.TimeoutError:
-            opened = (await timed_out(name, store), None)
+            timed_out_open = True
         except Exception:
-            opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
-        if not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
+            failed_open = True
+        if timed_out_open:
+            opened = (await timed_out(name, store), None)
+        elif failed_open or not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
             opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
         partial, rest = opened
         # The release catalog is a large JSON parse. Audience snapshots do not need it.
@@ -129,8 +189,20 @@ async def collect_artist(
     for key, value in (known_links or {}).items():
         if value and not links.get(key):
             links[key] = value
+    # A MusicBrainz timeout used to mark Spotify, Instagram, and TikTok incomplete
+    # whenever the cache had no URL relations. The artists row is the same ids,
+    # stored from an earlier crawl, and one indexed read recovers them.
+    if partial.status != "ok" and not _has_saved_links(links):
+        stored = await _links_from_database(env, name)
+        for key, value in stored.items():
+            if value and not links.get(key):
+                links[key] = value
+        if _has_saved_links(links):
+            partial.notices = list(partial.notices or []) + [
+                "MusicBrainz did not return URL relations. Spotify, Instagram, and TikTok are using ids stored for this artist."
+            ]
     # A MusicBrainz error with no saved URLs blocks Spotify, Instagram, and TikTok.
-    # Cached relations, or a Spotify id already on the links, still let those cards run.
+    # Cached relations, a previous artists row, or a Spotify id already on the links still let those cards run.
     if partial.status != "ok" and not _has_saved_links(links):
         links["_incomplete"] = True
 

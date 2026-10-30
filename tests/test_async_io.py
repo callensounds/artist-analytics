@@ -63,6 +63,38 @@ def test_no_asyncio_primitives_at_import_time(path):
                     assert name.split(".")[-1] not in PRIMITIVES, f"{path.name}:{node.lineno} builds {name} at import"
 
 
+def _awaits_while_unwinding(nodes) -> list[int]:
+    """Await / async-with nested in an except or finally, ignoring nested function bodies."""
+    lines = []
+    for node in nodes:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, (ast.Await, ast.AsyncWith)):
+            lines.append(node.lineno)
+            continue
+        lines.extend(_awaits_while_unwinding(list(ast.iter_child_nodes(node))))
+    return lines
+
+
+def test_no_await_while_an_exception_is_propagating():
+    """Awaiting a JS promise from except, finally, or __aexit__ raises the promising-task SystemError."""
+    offenders = []
+    for path in SOURCES:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncWith):
+                offenders.append(f"{path.relative_to(SRC)}:{node.lineno} async with")
+            blocks = []
+            if isinstance(node, ast.ExceptHandler):
+                blocks.append(node.body)
+            elif isinstance(node, ast.Try) and node.finalbody:
+                blocks.append(node.finalbody)
+            for block in blocks:
+                for line in _awaits_while_unwinding(block):
+                    offenders.append(f"{path.relative_to(SRC)}:{line}")
+    assert offenders == []
+
+
 def test_requests_is_not_a_runtime_dependency():
     pyproject = (SRC.parent / "pyproject.toml").read_text(encoding="utf-8")
     runtime = pyproject.split("[dependency-groups]", 1)[0]

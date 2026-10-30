@@ -37,8 +37,11 @@ MB_OPEN_TIMEOUT = 5.5
 MB_MAX_QUEUE = 3.0
 HEADERS = {"Accept": "application/json", "User-Agent": MB_USER_AGENT}
 # Next free slot, in event-loop time, for this isolate. A plain float, not an asyncio
-# primitive: no Lock or Semaphore is built at import time or shared across requests.
+# primitive: no Lock or Semaphore is built at import time.
 _mb_next = 0.0
+# Identity lookups on the queue can wait out a dashboard burst. The dashboard stays short.
+MB_CRAWL_OPEN_TIMEOUT = 18.0
+MB_CRAWL_MAX_QUEUE = 12.0
 
 
 def extract_links(relations: list[dict]) -> dict:
@@ -170,7 +173,59 @@ def _owners(now: float) -> int:
     return sum(1 for expiry in _mb_inflight.values() if expiry > now)
 
 
+class _IsolateGate:
+    """One serializer for the running event loop. The lock is created on first use.
+
+    Nothing here is an asyncio primitive at import time. Concurrent dashboard
+    requests on one isolate share the loop, so they share this gate. A new
+    ``asyncio.run`` (each test) gets a new loop and therefore a new lock.
+    """
+
+    def __init__(self):
+        self._lock = None
+
+    def lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+
+def _gate_for(http) -> _IsolateGate:
+    """The isolate's gate, hung off the running loop (or the request client)."""
+    loop = asyncio.get_running_loop()
+    gate = getattr(loop, "_aa_mb_gate", None)
+    if gate is None:
+        gate = _IsolateGate()
+        try:
+            loop._aa_mb_gate = gate
+        except Exception:
+            gate = _remember_gate(loop, gate)
+    if http is not None and getattr(http, "_aa_mb_gate", None) is None:
+        try:
+            http._aa_mb_gate = gate
+        except Exception:
+            pass
+    return gate
+
+
+def _remember_gate(loop, gate: _IsolateGate) -> _IsolateGate:
+    """Used only when the loop object refuses arbitrary attributes."""
+    gates = getattr(_remember_gate, "gates", None)
+    if gates is None:
+        gates = {}
+        _remember_gate.gates = gates
+    found = gates.get(id(loop))
+    if found is None:
+        gates[id(loop)] = gate
+        return gate
+    return found
+
+
 def _max_queue(http, limit: float = MB_MAX_QUEUE) -> float:
+    if http is not None:
+        override = getattr(http, "mb_max_queue", None)
+        if override is not None:
+            limit = float(override)
     remaining = getattr(http, "remaining", None)
     left = remaining() if callable(remaining) else None
     if left is not None:
@@ -181,22 +236,33 @@ def _max_queue(http, limit: float = MB_MAX_QUEUE) -> float:
 async def _mb_slot(http=None, max_queue: float = MB_MAX_QUEUE) -> None:
     """At most about one MusicBrainz request per MB_INTERVAL, per isolate.
 
-    The slot is reserved synchronously (read and write with no await in between),
-    then the caller sleeps until it. A request that would wait past its budget
-    does not reserve a slot and fails fast, so a burst cannot build an
-    unbounded queue behind one shared lock.
+    The slot is reserved while the per-loop lock is held, with no await in that
+    section, then the caller sleeps until it. ``Lock.release`` is synchronous, so
+    a full queue raises only after the lock is released. A request that would
+    wait past its budget does not reserve a slot.
     """
     global _mb_next
-    now = asyncio.get_running_loop().time()
-    slot = max(now, _mb_next)
-    if slot - now > _max_queue(http, max_queue):
+    gate = _gate_for(http)
+    await gate.lock().acquire()
+    busy = False
+    delay = 0.0
+    try:
+        now = asyncio.get_running_loop().time()
+        slot = max(now, _mb_next)
+        if slot - now > _max_queue(http, max_queue):
+            busy = True
+        else:
+            _mb_next = slot + MB_INTERVAL
+            delay = slot - now
+    finally:
+        gate.lock().release()
+    if busy:
         raise MusicBrainzBusy(
             "MusicBrainz is busy: this server keeps to about one request per second and the queue is full. "
             "Refresh in a few seconds."
         )
-    _mb_next = slot + MB_INTERVAL
-    if slot > now:
-        await asyncio.sleep(slot - now)
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 def _body_snippet(text: str) -> str:
@@ -220,6 +286,7 @@ async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEU
         if attempt and _max_queue(http, max_queue) < 1.0:
             break
         await _mb_slot(http, max_queue)
+        transport_error: TransportError | None = None
         try:
             result, payload = await http.get_json(
                 url,
@@ -229,11 +296,16 @@ async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEU
                 max_bytes=max_bytes,
             )
         except TransportError as exc:
-            last_error = TransportError(_mb_message(None, str(exc)))
+            transport_error = exc
+        # Sleep only after the exception has finished propagating. asyncio.sleep
+        # is a JS timer on Pyodide, and awaiting it inside except raises
+        # "Cannot enter a promising task from inside another running promising task".
+        if transport_error is not None:
+            last_error = TransportError(_mb_message(None, str(transport_error)))
             if attempt == 0:
                 await asyncio.sleep(random.uniform(0.25, 0.9))
                 continue
-            raise last_error from exc
+            raise last_error
         if result.ok and isinstance(payload, dict):
             return payload
         last_error = TransportError(_mb_message(result.status, result.text or ""))
@@ -443,7 +515,9 @@ async def _match_or_wait(name: str, http, cache, query: str) -> tuple[SourceResu
     loop = asyncio.get_running_loop()
     remaining = getattr(http, "remaining", None)
     left = remaining() if callable(remaining) else None
-    budget = MB_OPEN_TIMEOUT if left is None else min(MB_OPEN_TIMEOUT, left)
+    configured = getattr(http, "mb_open_timeout", None) if http is not None else None
+    cap = float(configured) if configured else MB_OPEN_TIMEOUT
+    budget = cap if left is None else min(cap, left)
     give_up = loop.time() + budget - 0.3
     last_busy: MusicBrainzBusy | None = None
     waited = False

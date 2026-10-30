@@ -398,8 +398,14 @@ async def fetch_apple(name: str, links: dict, http, cache) -> SourceResult:
     async def produce() -> SourceResult:
         matched_by_name = False
         limited_at = None
+        # Captured and handled only after the except block ends. Awaiting js.fetch
+        # (or any other JS promise) while ItunesLimited is still propagating raises
+        # SystemError: Cannot enter a promising task from inside another running promising task.
+        limited: ItunesLimited | None = None
+        transport: TransportError | None = None
+        resolved = artist_id
+        payload = None
         try:
-            resolved = artist_id
             if not resolved:
                 search, _, _search_stale = await itunes_json(
                     http,
@@ -427,16 +433,23 @@ async def fetch_apple(name: str, links: dict, http, cache) -> SourceResult:
             if lookup_stale:
                 limited_at = fetched_at
         except ItunesLimited as exc:
-            web_id = resolved or artist_id
-            if web_id:
-                web = await fetch_public_apple(http, web_id, name, exc.status)
+            limited = exc
+        except TransportError as exc:
+            transport = exc
+        if transport is not None:
+            return errored("apple", "Apple Music", str(transport))
+        if limited is not None:
+            # The album shelf is a few hundred KB plus up to three album pages.
+            # That is not a cheap recovery on a crawl, which still has to write the
+            # other sources. The dashboard may read the public page once this
+            # exception has finished propagating.
+            if resolved and not getattr(http, "crawl_light", False):
+                web = await fetch_public_apple(http, resolved, name, limited.status)
                 if web is not None:
                     if matched_by_name:
                         web.notices.append(NAME_MATCH)
                     return web
-            return unavailable("apple", "Apple Music", _limited_message(exc.status, None), ttl=120)
-        except TransportError as exc:
-            return errored("apple", "Apple Music", str(exc))
+            return unavailable("apple", "Apple Music", _limited_message(limited.status, None), ttl=120)
         artist, items = parse_collections(payload, resolved)
         if artist is None and not items:
             return unavailable("apple", "Apple Music", "iTunes lookup returned no albums for that artist id.")

@@ -122,6 +122,8 @@ class WorkersFetchTransport:
         except Exception as exc:
             raise TransportError("The service could not be reached.") from exc
         finally:
+            # abort() is synchronous. Awaiting it here would run while the
+            # exception above is still propagating.
             if not done:
                 try:
                     controller.abort()

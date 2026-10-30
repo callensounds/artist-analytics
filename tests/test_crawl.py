@@ -993,3 +993,197 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
     assert cap_for("instagram.com") >= 250_000
     assert cap_for("tiktok.com/@") >= 350_000
     assert cap_for("open.spotify.com/artist/") >= 200_000
+
+
+def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatch):
+    """iTunes 403 must not raise, and must not swallow Spotify, Instagram, or TikTok."""
+    import crawl
+    import db
+    from cache import _MEMORY
+    from http_client import HttpResult
+    from providers.musicbrainz import MB_CRAWL_OPEN_TIMEOUT, MB_OPEN_TIMEOUT
+
+    _MEMORY.clear()
+    assert MB_CRAWL_OPEN_TIMEOUT > MB_OPEN_TIMEOUT
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+    monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0)
+    reset_pool()
+    pad = "<!--pad-->" * 9000
+    spotify = (
+        pad
+        + '<div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>'
+        + "<h2>Fans also like</h2><div>Appears On</div>"
+    )
+    instagram = pad + (
+        'shortcode\\":\\"abc123\\" taken_at_timestamp\\":1792416619 '
+        'username\\":\\"jbrekkie\\" edge_followed_by\\":{\\"count\\":574486}'
+    )
+    tiktok = pad + '"followerCount":88000,"heartCount":1'
+    search = {
+        "artists": [
+            {
+                "id": "mb-jb",
+                "name": "Japanese Breakfast",
+                "score": 100,
+                "relations": [
+                    {"url": {"resource": "https://open.spotify.com/artist/7MoIc5s9KXolCBH1fy9kkw"}},
+                    {"url": {"resource": "https://www.instagram.com/jbrekkie/"}},
+                    {"url": {"resource": "https://www.tiktok.com/@jbrekkie"}},
+                ],
+            }
+        ]
+    }
+
+    class Pages:
+        def __init__(self):
+            self.urls = []
+
+        async def get_text(self, url, **kwargs):
+            self.urls.append(url)
+            if "instagram.com" in url:
+                return HttpResult(200, instagram, url, {})
+            if "tiktok.com" in url:
+                return HttpResult(200, tiktok, url, {})
+            if "open.spotify.com/artist/" in url:
+                return HttpResult(200, spotify, url, {})
+            return HttpResult(404, "", url, {})
+
+        async def get_json(self, url, **kwargs):
+            self.urls.append(url)
+            if "musicbrainz.org" in url:
+                return HttpResult(200, "{}", url, {}), search
+            if "oembed" in url:
+                return HttpResult(200, "{}", url, {}), {"title": "Japanese Breakfast"}
+            if "itunes.apple.com" in url:
+                return HttpResult(403, "", url, {}), None
+            return HttpResult(404, "", url, {}), None
+
+    pages = Pages()
+    monkeypatch.setattr(crawl, "HttpClient", lambda *args, **kwargs: pages)
+    binding = _D1()
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    message = _Message({"artist_id": 1})
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?)
+            """,
+            (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
+        )
+        env = Env()
+        worker = main.Default(object(), env)
+        await main.Default.queue(worker, Batch([message]), env, object())
+        snaps = await database.query("SELECT source, metric, value FROM metric_snapshots")
+        runs = await database.query("SELECT status, snapshots_written, detail FROM crawl_runs")
+        state = await database.query_one("SELECT apple_blocked_until FROM crawl_state WHERE id = 1")
+        first_urls = list(pages.urls)
+        pages.urls.clear()
+        await database.execute(
+            "UPDATE artists SET last_crawled_at = ? WHERE id = 1",
+            (utc_now(datetime(2020, 1, 1, tzinfo=timezone.utc)),),
+        )
+        again = _Message({"artist_id": 1})
+        await main.Default.queue(worker, Batch([again]), env, object())
+        return snaps, runs, state, again, first_urls
+
+    snaps, runs, state, again, first_urls = asyncio.run(run())
+    assert message.acked and not message.retried, runs
+    by_source = {row["source"]: row["value"] for row in snaps}
+    assert by_source.get("spotify") == 1473027
+    assert by_source.get("instagram") == 574486
+    assert by_source.get("tiktok") == 88000
+    assert runs[-1]["status"] == "ok"
+    assert runs[-1]["snapshots_written"] >= 3
+    assert "apple=unavailable" in runs[-1]["detail"]
+    assert "HTTP 403" in runs[-1]["detail"]
+    assert "SystemError" not in (runs[-1]["detail"] or "")
+    assert "Traceback" not in (runs[-1]["detail"] or "")
+    assert pages.mb_open_timeout == MB_CRAWL_OPEN_TIMEOUT
+    until = db.parse_utc(state["apple_blocked_until"])
+    assert until is not None
+    remaining = until - datetime.now(timezone.utc)
+    assert timedelta(minutes=25) < remaining < timedelta(minutes=35)
+    assert any("itunes.apple.com" in url for url in first_urls)
+    assert not any("music.apple.com" in url for url in first_urls)
+    assert again.acked and not again.retried
+    assert not any("itunes.apple.com" in url or "music.apple.com" in url for url in pages.urls)
+
+
+def test_dashboard_musicbrainz_timeout_uses_stored_artist_ids(monkeypatch):
+    import db
+    import providers
+    from models import unavailable
+
+    binding = _D1()
+
+    async def hang(name, http, cache):
+        await asyncio.sleep(30)
+
+    seen = {}
+
+    async def grab_spotify(name, links, env, http, cache, include_related=False):
+        seen["spotify"] = dict(links)
+        return unavailable("spotify", "Spotify", "stopped")
+
+    async def grab_instagram(name, links, http, cache):
+        seen["instagram"] = dict(links)
+        return unavailable("instagram", "Instagram", "stopped")
+
+    async def grab_tiktok(name, links, http, cache):
+        seen["tiktok"] = dict(links)
+        return unavailable("tiktok", "TikTok", "stopped")
+
+    async def stopped(*args, **kwargs):
+        return unavailable("x", "X", "stopped")
+
+    monkeypatch.setattr(providers, "open_musicbrainz", hang)
+    monkeypatch.setattr(providers, "fetch_spotify", grab_spotify)
+    monkeypatch.setattr(providers, "fetch_instagram", grab_instagram)
+    monkeypatch.setattr(providers, "fetch_tiktok", grab_tiktok)
+    monkeypatch.setattr(providers, "fetch_apple", stopped)
+    monkeypatch.setattr(providers, "fetch_youtube", stopped)
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (
+                name, normalized_name, spotify_id, instagram_handle, tiktok_handle,
+                origin, tracked, created_at
+            ) VALUES ('Example', 'example', 'sp-stored', 'ex_ig', 'ex_tt', 'search', 1, ?)
+            """,
+            (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
+        )
+        return await providers.collect_artist(
+            "Example",
+            env={"DB": binding},
+            cache=MemoryCache({}),
+            http=object(),
+            deadline_s=0.4,
+        )
+
+    bundle = asyncio.run(run())
+    assert seen["spotify"]["spotify_id"] == "sp-stored"
+    assert seen["instagram"]["instagram"] == "ex_ig"
+    assert seen["tiktok"]["tiktok"] == "ex_tt"
+    assert "_incomplete" not in seen["spotify"]
+    assert "_incomplete" not in seen["instagram"]
+    assert "_incomplete" not in seen["tiktok"]
+    musicbrainz = bundle["sources"][0]
+    assert musicbrainz["status"] == "error"
+    assert "took too long" in musicbrainz["reason"]
+    assert any("stored for this artist" in note for note in musicbrainz["notices"])

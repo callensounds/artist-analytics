@@ -69,13 +69,19 @@ class KVCache:
 
     async def set(self, key: str, value: str, ttl: int) -> None:
         await self.memory.set(key, value, ttl)
+        # A rejected KV put must not be followed by another awaited put inside except.
+        # That second promise is what raises the promising-task SystemError.
+        fallback = False
         try:
             await self.kv.put(key, value, _js_options({"expirationTtl": max(int(ttl), 60)}))
         except Exception:
-            try:
-                await self.kv.put(key, value)
-            except Exception:
-                return
+            fallback = True
+        if not fallback:
+            return
+        try:
+            await self.kv.put(key, value)
+        except Exception:
+            return
 
 
 class EdgeCache:

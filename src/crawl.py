@@ -25,6 +25,8 @@ RETRY_DELAY_SECONDS = 180
 # Skip a provider whose audience snapshot is newer than this. A retry after a
 # CPU kill then does not parse that source again.
 PROVIDER_FRESH_SECONDS = 3 * 60 * 60
+# Cloudflare egress often gets HTTP 403 from iTunes. Skip it until this passes.
+APPLE_BACKOFF_SECONDS = 30 * 60
 
 
 def settings(env) -> dict:
@@ -69,6 +71,37 @@ def known_links(row: dict) -> dict:
 async def _cursor(db) -> int:
     row = await db.query_one("SELECT next_artist_id FROM crawl_state WHERE id = 1")
     return int(row["next_artist_id"]) if row else 0
+
+
+async def apple_blocked_until(db) -> datetime | None:
+    row = await db.query_one("SELECT apple_blocked_until FROM crawl_state WHERE id = 1")
+    if not row:
+        return None
+    return parse_utc(row.get("apple_blocked_until"))
+
+
+async def block_apple(db, now: datetime) -> None:
+    """Skip iTunes until ``now + APPLE_BACKOFF_SECONDS``. Does not move the artist cursor."""
+    until = utc_now(now + timedelta(seconds=APPLE_BACKOFF_SECONDS))
+    await db.execute(
+        """
+        INSERT INTO crawl_state (id, next_artist_id, updated_at, apple_blocked_until)
+        VALUES (1, 0, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            apple_blocked_until = excluded.apple_blocked_until,
+            updated_at = excluded.updated_at
+        """,
+        (utc_now(now), until),
+    )
+
+
+def _apple_forbidden(bundle: dict) -> bool:
+    for source in bundle.get("sources") or []:
+        if source.get("platform") != "apple":
+            continue
+        if "HTTP 403" in str(source.get("reason") or ""):
+            return True
+    return False
 
 
 async def _save_cursor(db, artist_id: int, now: datetime) -> None:
@@ -192,6 +225,14 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
             skip = await fresh_sources(db, int(row["id"]), now)
         except Exception:
             skip = set()
+    apple_blocked = False
+    try:
+        until = await apple_blocked_until(db)
+        apple_blocked = until is not None and until > now
+    except Exception:
+        apple_blocked = False
+    if apple_blocked:
+        skip.add("apple")
     bundle = await collect(
         row["name"],
         env=env,
@@ -201,6 +242,11 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
         include_related=True,
         skip_platforms=skip,
     )
+    if not apple_blocked and _apple_forbidden(bundle):
+        try:
+            await block_apple(db, now)
+        except Exception:
+            pass
     saved = await remember(db, row["name"], bundle, origin=row.get("origin") or "search", now=now, related_cap=related_cap)
     sources = bundle.get("sources") or []
     statuses = [source.get("status") for source in sources]
@@ -499,6 +545,7 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
             await _finish_message(message, "ack")
             acked += 1
             continue
+        failure = None
         try:
             saved = await refresh_artist(
                 db,
@@ -511,8 +558,15 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                 related_cap=config["related_cap"],
             )
         except Exception as exc:
-            detail = _bundle_detail(str(row.get("name") or ""), None, exc)
-            _log("queue message failed", name=row.get("name"), detail=detail, **_exc_fields(exc))
+            # format_exc only works while the exception is active. The D1 write and
+            # message.retry below are JS promises and must run after this block.
+            failure = {
+                "detail": _bundle_detail(str(row.get("name") or ""), None, exc),
+                "fields": _exc_fields(exc),
+            }
+        if failure is not None:
+            _log("queue message failed", name=row.get("name"), detail=failure["detail"], **failure["fields"])
+            write_error = None
             try:
                 await record_consumer_run(
                     db,
@@ -523,10 +577,12 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                     snapshots=0,
                     edges=0,
                     discovered=0,
-                    detail=detail,
+                    detail=failure["detail"],
                 )
             except Exception as write_exc:
-                _log("crawl run write failed", **_exc_fields(write_exc))
+                write_error = _exc_fields(write_exc)
+            if write_error is not None:
+                _log("crawl run write failed", **write_error)
             await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
             retried += 1
             continue
