@@ -123,6 +123,8 @@ def parse_embed_state(page: str) -> dict:
     raw = script_body(page or "", 'id="__NEXT_DATA__"')
     if not raw:
         return {}
+    if len(raw) > CRAWL_EMBED_BYTES:
+        return {}
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, MemoryError, RecursionError, ValueError):
@@ -398,9 +400,9 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
             )
         except TransportError:
             oembed_result, oembed_payload = None, None
-        light = bool(getattr(http, "crawl_light", False))
-        page_cap = CRAWL_PAGE_BYTES if light else PAGE_MAX_BYTES
-        embed_cap = CRAWL_EMBED_BYTES if light else PAGE_MAX_BYTES
+        # Dashboard and crawl share this cap. A 400KB artist document was a ~2s CPU kill.
+        page_cap = CRAWL_PAGE_BYTES
+        embed_cap = CRAWL_EMBED_BYTES
         try:
             artist_page = await http.get_text(
                 artist_url,
@@ -433,7 +435,7 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
 
         oembed = parse_oembed(oembed_payload if oembed_result and oembed_result.ok else None)
         page_text = artist_page.text if artist_page.ok else ""
-        lines = visible_lines(page_text, limit=CRAWL_PAGE_BYTES if light else None)
+        lines = visible_lines(page_text, limit=page_cap)
         listeners, listeners_exact = parse_monthly_listeners(page_text[:page_cap], lines)
         follower_count = parse_spotify_followers(lines)
         discography = parse_discography(lines)

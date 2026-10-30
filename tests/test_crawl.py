@@ -832,3 +832,60 @@ def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monk
     assert runs[0]["artists_ok"] == 1
     assert runs[0]["snapshots_written"] >= 1
     reset_pool()
+
+
+def test_promising_task_error_retries_then_discards_the_isolate(monkeypatch):
+    import crawl
+    import db
+    from crawl import raise_discard
+
+    try:
+        raise_discard(SystemError("Cannot enter a promising task from inside another running promising task"))
+    except SystemExit:
+        discarded = True
+    else:
+        discarded = False
+    assert discarded
+
+    binding = _D1()
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    reset_pool()
+
+    async def explode(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+        raise SystemError("Cannot enter a promising task from inside another running promising task")
+
+    monkeypatch.setattr(crawl, "collect_artist", explode)
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    message = _Message({"artist_id": 1})
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Broken Isolate', 'brokenisolate', 'search', 1, ?)
+            """,
+            (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
+        )
+        worker = main.Default(object(), Env())
+        await main.Default.queue(worker, Batch([message]), Env(), object())
+
+    try:
+        asyncio.run(run())
+    except SystemExit:
+        discarded = True
+    else:
+        discarded = False
+    assert discarded
+    assert message.retried and not message.acked
+    assert message.delay == 60

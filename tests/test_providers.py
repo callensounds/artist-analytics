@@ -554,7 +554,7 @@ def test_apple_lookup_by_id_does_not_search_and_429_uses_stale_cache(monkeypatch
         return None
 
     monkeypatch.setattr("providers.apple.asyncio.sleep", no_sleep)
-    lookup = itunes_url(LOOKUP, {"id": "5", "entity": "album", "limit": "100", "country": "us"})
+    lookup = itunes_url(LOOKUP, {"id": "5", "entity": "album", "limit": "25", "country": "us"})
     stale = {
         "results": [
             {"wrapperType": "artist", "artistId": 5, "artistName": "Example", "artistLinkUrl": "https://music.apple.com/a/5"},
@@ -1019,3 +1019,58 @@ def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):
     assert len(starts) == 2
     assert starts[1] - starts[0] >= 0.05
     assert seen_headers[0]["User-Agent"] == MB_USER_AGENT
+
+
+def test_fetch_path_parse_stays_inside_the_byte_cap(monkeypatch):
+    """Cold dashboards use the same caps as a crawl. Nothing past the cap is parsed."""
+    from providers.instagram import fetch_instagram
+    from providers.musicbrainz import CATALOG_LIMIT, CATALOG_MAX_BYTES, _catalog
+    from providers.spotify import CRAWL_EMBED_BYTES, CRAWL_PAGE_BYTES, fetch_spotify, visible_lines
+    from providers.tiktok import fetch_tiktok
+
+    caps = []
+
+    class Http:
+        async def get_text(self, url, **kwargs):
+            caps.append(kwargs.get("max_bytes"))
+            return HttpResult(404, "", url, {})
+
+        async def get_json(self, url, **kwargs):
+            caps.append(kwargs.get("max_bytes"))
+            return HttpResult(404, "", url, {}), None
+
+    http = Http()
+    cache = MemoryCache({})
+    asyncio.run(fetch_spotify("Example", {"spotify_id": "abc"}, None, http, cache))
+    asyncio.run(fetch_instagram("Example", {"instagram": "example"}, http, cache))
+    asyncio.run(fetch_tiktok("Example", {"tiktok": "example"}, http, cache))
+    text_caps = [cap for cap in caps if cap is not None]
+    assert text_caps
+    assert max(text_caps) <= CRAWL_PAGE_BYTES
+
+    page = ("<span>keep</span>\n" * 5000) + "TAIL_MARKER"
+    assert len(page) > CRAWL_PAGE_BYTES
+    parsed = "\n".join(visible_lines(page, limit=CRAWL_PAGE_BYTES))
+    assert "TAIL_MARKER" not in parsed
+    assert len(parsed) <= CRAWL_PAGE_BYTES + 64
+    assert CRAWL_EMBED_BYTES <= CRAWL_PAGE_BYTES
+
+    catalog_calls = []
+
+    class CatalogHttp:
+        async def get_json(self, url, **kwargs):
+            catalog_calls.append((kwargs.get("params") or {}, kwargs.get("max_bytes")))
+            groups = [{"first-release-date": f"2020-01-{day:02d}"} for day in range(1, 6)]
+            return HttpResult(200, "{}", url, {}), {"release-groups": groups, "releases": []}
+
+    async def no_slot(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("providers.musicbrainz._mb_slot", no_slot)
+    groups, releases, notice = asyncio.run(_catalog(CatalogHttp(), "mb-1"))
+    assert len(catalog_calls) == 1
+    assert catalog_calls[0][0]["limit"] == CATALOG_LIMIT == "25"
+    assert catalog_calls[0][1] == CATALOG_MAX_BYTES
+    assert releases == {"releases": []}
+    assert notice is None
+    assert len(groups["release-groups"]) == 5

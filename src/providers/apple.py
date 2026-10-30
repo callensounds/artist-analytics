@@ -129,7 +129,7 @@ async def itunes_json(http, cache, base: str, params: dict) -> tuple[dict, str |
     last_status = 429
     for attempt in range(2):
         try:
-            result, payload = await http.get_json(url, timeout=8)
+            result, payload = await http.get_json(url, timeout=8, max_bytes=80_000)
         except TransportError as exc:
             raise TransportError(str(exc)) from exc
         if result.status == 429 and attempt == 0:
@@ -422,7 +422,7 @@ async def fetch_apple(name: str, links: dict, http, cache) -> SourceResult:
                 http,
                 cache,
                 LOOKUP,
-                {"id": resolved, "entity": "album", "limit": "100", "country": "us"},
+                {"id": resolved, "entity": "album", "limit": "25", "country": "us"},
             )
             if lookup_stale:
                 limited_at = fetched_at

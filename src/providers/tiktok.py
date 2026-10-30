@@ -111,9 +111,8 @@ def parse_video(html: str) -> dict | None:
 
 
 async def _get(http, url: str):
-    cap = 64_000 if getattr(http, "crawl_light", False) else PAGE_MAX_BYTES
     try:
-        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=cap)
+        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=64_000)
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
 
@@ -228,8 +227,9 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
             )
 
         items = []
-        # Video pages are another full JSON document each. Audience counts do not need them on a crawl.
+        # A crawl skips video pages. The dashboard reads at most two, each already byte-capped.
         if videos and not light:
+            videos = videos[:2]
             results = await asyncio.gather(*(load_video(video) for video in videos), return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception) or result is None:
