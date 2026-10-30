@@ -1,24 +1,21 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "artist-analytics-crawler",
-  "main": "src/crawler_entry.py",
+  "main": "crawler/src/index.ts",
   "compatibility_date": "2026-10-25",
-  "compatibility_flags": ["python_workers"],
+  "workers_dev": false,
   "preview_urls": false,
-  // Workers Free rejects limits.cpu_ms (build error 100328). Do not add it here.
-  // Same compatibility date and python_workers flag as wrangler.jsonc so pywrangler
-  // vendors python_modules the same way. pywrangler sync always reads the repo-root
-  // wrangler.jsonc for the Python version; this file must stay compatible with it.
-  // Workers Builds overrides the script name from the trigger. Give this config
-  // its own trigger or the upload is renamed to artist-analytics.
+  // JavaScript Worker. Do not set python_workers here: that flag makes Wrangler
+  // load the Pyodide runtime, which is what a CPU kill leaves permanently broken.
+  // Workers Free rejects limits.cpu_ms (build error 100328). Do not add it.
+  // Workers Builds overrides the script name from the trigger. This file is the
+  // config for trigger 72c7852f (artist-analytics-crawler), not the dashboard.
   "observability": {
     "enabled": true
   },
   "triggers": {
     "crons": ["*/15 * * * *"]
   },
-  // Same D1 database as the dashboard. The Worker applies new files in src/migrations
-  // itself. Do not edit 0001_crawl.sql.
   "d1_databases": [
     {
       "binding": "DB",
@@ -27,9 +24,6 @@
       "migrations_dir": "src/migrations"
     }
   ],
-  // This Worker is the only consumer of artist-analytics-crawl. The dashboard
-  // Worker is a producer only. A queue accepts one consumer. Deploy the dashboard
-  // (wrangler.jsonc, which no longer lists a consumer) before the first crawler deploy.
   "queues": {
     "producers": [
       {
@@ -48,10 +42,4 @@
       }
     ]
   }
-  // Migrations are picked up with the rest of src/, same as the dashboard bundle.
-  // Do not add a Text rule for **/*.sql: that uploads each file twice.
-  // Secrets are per Worker. YOUTUBE_API_KEY must be set on this Worker too:
-  //   npx wrangler secret put YOUTUBE_API_KEY -c wrangler.crawler.jsonc
-  // Also set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET here if the dashboard has them.
-  // SECRET_KEY is only the dashboard session cookie.
 }
