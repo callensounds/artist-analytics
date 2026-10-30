@@ -54,13 +54,17 @@ def visible_lines(page: str) -> list[str]:
     return lines
 
 
-def parse_monthly_listeners(page: str) -> tuple[str | None, bool]:
-    """Return (display, exact). Rounded marketing text is kept as printed."""
+def parse_monthly_listeners(page: str, lines: list[str] | None = None) -> tuple[str | None, bool]:
+    """Return (display, exact). Rounded marketing text is kept as printed.
+
+    Pass ``lines`` when the caller already ran ``visible_lines`` so the page is not scanned twice.
+    """
     exact = [int(match.group(1).replace(",", "")) for match in LISTENERS_EXACT.finditer(page or "")]
     if exact:
         return f"{max(exact):,}", True
-    lines = "\n".join(visible_lines(page))
-    rounded = LISTENERS_ROUNDED.search(lines) or LISTENERS_ROUNDED.search(page or "")
+    if lines is None:
+        lines = visible_lines(page)
+    rounded = LISTENERS_ROUNDED.search("\n".join(lines)) or LISTENERS_ROUNDED.search(page or "")
     if rounded:
         return rounded.group(1), False
     return None, False
@@ -141,25 +145,59 @@ def parse_spotify_followers(lines: list[str]) -> int | None:
     return None
 
 
+def _spotify_id_at(chunk: str, start: int) -> tuple[str, int] | None:
+    end = start
+    limit = min(len(chunk), start + 32)
+    while end < limit:
+        char = chunk[end]
+        if not (("A" <= char <= "Z") or ("a" <= char <= "z") or ("0" <= char <= "9")):
+            break
+        end += 1
+    if end == start or end >= len(chunk) or chunk[end] != '"':
+        return None
+    return chunk[start:end], end + 1
+
+
 def parse_related_artists(page: str) -> list[dict]:
-    """Names and ids from the public 'Fans also like' cards. Order is Spotify's rank."""
-    start = (page or "").find("Fans also like")
+    """Names and ids from the public 'Fans also like' cards. Order is Spotify's rank.
+
+    Linear scan of a short slice. The dashboard does not call this; the crawl does.
+    """
+    if not page:
+        return []
+    start = page.find("Fans also like")
     if start < 0:
         return []
     end = page.find("Appears On", start)
-    chunk = page[start:end if end > start else start + 20000]
+    chunk = page[start:end if end > start else min(len(page), start + 8000)]
     found = []
     seen = set()
-    pattern = re.compile(r'href="/artist/([A-Za-z0-9]+)"[\s\S]{0,900}?>([^<]{1,80})</span>')
-    for match in pattern.finditer(chunk):
-        artist_id = match.group(1)
-        name = html.unescape(match.group(2)).strip()
-        if not name or artist_id in seen:
+    cursor = 0
+    marker = 'href="/artist/'
+    while len(found) < 12:
+        at = chunk.find(marker, cursor)
+        if at < 0:
+            break
+        parsed = _spotify_id_at(chunk, at + len(marker))
+        if parsed is None:
+            cursor = at + len(marker)
+            continue
+        artist_id, after = parsed
+        window = chunk[after:after + 900]
+        close = window.find("</span>")
+        if close < 0:
+            cursor = after
+            continue
+        open_gt = window.rfind(">", 0, close)
+        if open_gt < 0:
+            cursor = after
+            continue
+        name = " ".join(html.unescape(window[open_gt + 1 : close]).split())
+        cursor = after + close + len("</span>")
+        if not name or "<" in name or len(name) > 80 or artist_id in seen:
             continue
         seen.add(artist_id)
         found.append({"name": name, "spotify_id": artist_id, "rank": len(found) + 1})
-        if len(found) >= 12:
-            break
     return found
 
 
@@ -340,7 +378,7 @@ def _top_track_metric(embed_tracks: list[str], popular: list[tuple[str, int | No
     return Metric(label="Top tracks", available=True, value=", ".join(labels))
 
 
-async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
+async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = False) -> SourceResult:
     async def produce() -> SourceResult:
         artist_url = f"https://open.spotify.com/artist/{artist_id}"
         embed_url = f"https://open.spotify.com/embed/artist/{artist_id}"
@@ -383,23 +421,18 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
             return unavailable("spotify", "Spotify", f"The public Spotify page returned HTTP {artist_page.status}.")
 
         oembed = parse_oembed(oembed_payload if oembed_result and oembed_result.ok else None)
-        lines = visible_lines(artist_page.text if artist_page.ok else "")
-        listeners, listeners_exact = parse_monthly_listeners(artist_page.text if artist_page.ok else "")
+        page_text = artist_page.text if artist_page.ok else ""
+        lines = visible_lines(page_text)
+        listeners, listeners_exact = parse_monthly_listeners(page_text, lines)
         follower_count = parse_spotify_followers(lines)
         discography = parse_discography(lines)
         popular = parse_popular(lines)
-        related = parse_related_artists(artist_page.text if artist_page.ok else "")
+        # Related-artist HTML is crawl-only. The dashboard keeps the 9f16bbd card path.
+        related = parse_related_artists(page_text) if include_related else []
         embed = parse_embed_state(embed_page.text) if embed_page is not None and embed_page.ok else {}
         items = _release_items(discography)
         listener_exact = int(listeners.replace(",", "")) if listeners_exact and listeners else None
-        if (
-            not items
-            and listeners is None
-            and follower_count is None
-            and not related
-            and not (embed.get("tracks") or popular)
-            and not oembed.get("title")
-        ):
+        if not items and listeners is None and not (embed.get("tracks") or popular) and not oembed.get("title"):
             return unavailable(
                 "spotify",
                 "Spotify",
@@ -444,10 +477,12 @@ async def _fetch_public(artist_id: str, http, cache) -> SourceResult:
             notices=notices,
         )
 
-    return await cached(cache, cache_key("spotify-public", artist_id), produce)
+    # A separate key so a dashboard cache entry (no related list) is not reused by a crawl.
+    cache_parts = (artist_id, "related") if include_related else (artist_id,)
+    return await cached(cache, cache_key("spotify-public", *cache_parts), produce)
 
 
-async def fetch_spotify(name: str, links: dict, env, http, cache) -> SourceResult:
+async def fetch_spotify(name: str, links: dict, env, http, cache, include_related: bool = False) -> SourceResult:
     artist_id = (links or {}).get("spotify_id") or ""
     client_id = env_get(env, "SPOTIFY_CLIENT_ID")
     client_secret = env_get(env, "SPOTIFY_CLIENT_SECRET")
@@ -466,4 +501,4 @@ async def fetch_spotify(name: str, links: dict, env, http, cache) -> SourceResul
         return unavailable("spotify", "Spotify", reason, ttl=120)
     if client_id and client_secret:
         return await _fetch_api(name, artist_id, (client_id, client_secret), http, cache)
-    return await _fetch_public(artist_id, http, cache)
+    return await _fetch_public(artist_id, http, cache, include_related=include_related)

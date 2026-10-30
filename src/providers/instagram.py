@@ -93,7 +93,7 @@ def parse_embed(html: str, handle: str) -> dict:
 
 async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
     handle = (links or {}).get("instagram") or ""
-    if (links or {}).get("_incomplete") and not handle:
+    if (links or {}).get("_incomplete"):
         return unavailable(
             "instagram",
             "Instagram",

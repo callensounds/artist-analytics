@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -140,7 +141,7 @@ def test_batch_skips_a_fresh_artist_and_queue_acks(monkeypatch, tmp_path):
     )
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
         seen.append((name, known_links))
         return _bundle(listeners=50, related=[])
 
@@ -309,7 +310,7 @@ def test_queue_send_failure_crawls_one_artist_in_process(monkeypatch, tmp_path):
     _insert_stale(database, "Second Act", "secondact", now)
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
         seen.append(name)
         return _bundle(listeners=7, related=[])
 
@@ -346,7 +347,7 @@ def test_queue_consumer_refreshes_one_message_and_retries_the_rest(monkeypatch, 
     _insert_stale(database, "Later Act", "lateract", now)
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
         seen.append(name)
         return _bundle(listeners=50, related=[])
 
@@ -380,8 +381,9 @@ def test_d1_binding_stores_exact_integers_asynchronously(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", fail_thread)
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
         assert known_links == {"spotify_id": "sp-stale"}
+        assert include_related is True
         return _bundle(listeners=50, related=[])
 
     async def run():
@@ -431,8 +433,9 @@ def test_known_links_survive_a_musicbrainz_error(monkeypatch):
     async def fail_open(*args, **kwargs):
         return errored("musicbrainz", "MusicBrainz", "down"), None
 
-    async def grab_spotify(name, links, env, http, cache):
+    async def grab_spotify(name, links, env, http, cache, include_related=False):
         seen["spotify"] = dict(links)
+        seen["include_related"] = include_related
         return unavailable("spotify", "Spotify", "stopped")
 
     async def stopped(*args, **kwargs):
@@ -453,15 +456,21 @@ def test_known_links_survive_a_musicbrainz_error(monkeypatch):
         )
     )
     assert seen["spotify"]["spotify_id"] == "abc123"
+    assert seen["include_related"] is False
     assert "_incomplete" not in seen["spotify"]
     assert bundle["sources"][0]["status"] == "error"
 
 
 def test_admin_requires_login_and_dashboard_shows_stored_growth(monkeypatch, tmp_path):
-    os.environ["ARTIST_ANALYTICS_SQLITE"] = str(tmp_path / "app.sqlite")
+    path = tmp_path / "app.sqlite"
+    os.environ["ARTIST_ANALYTICS_SQLITE"] = str(path)
     reset_pool()
+    database = SqliteDatabase(str(path))
+    asyncio.run(migrate(database))
+    # The crawler stored this. The dashboard request only reads it.
+    asyncio.run(remember(database, "Example", _bundle(), related_cap=10))
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
         return _bundle()
 
     monkeypatch.setattr(main, "collect_artist", fake_collect)
@@ -486,4 +495,143 @@ def test_admin_requires_login_and_dashboard_shows_stored_growth(monkeypatch, tmp
     assert "Tracked artists" in admin.text
     assert "*/15 * * * *" in admin.text
     os.environ.pop("ARTIST_ANALYTICS_SQLITE", None)
+    reset_pool()
+
+
+def test_related_parse_stays_linear_without_a_closing_span():
+    page = "Fans also like\n" + ('<a href="/artist/abc123">no closing span ' * 400)
+    started = time.perf_counter()
+    assert parse_related_artists(page) == []
+    assert time.perf_counter() - started < 0.25
+
+
+def test_queue_name_message_crawls_once_then_skips_a_fresh_repeat(monkeypatch, tmp_path):
+    path = tmp_path / "named.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    seen = []
+
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+        assert include_related is True
+        seen.append(name)
+        return _bundle(listeners=9, related=[])
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    first = _Message({"name": "New Act", "origin": "search"})
+    asyncio.run(run_queue_batch(Batch([first]), env={}, collect=fake_collect, cache=MemoryCache({})))
+    assert first.acked and not first.retried
+    assert seen == ["New Act"]
+    second = _Message({"name": "New Act", "origin": "search"})
+    asyncio.run(run_queue_batch(Batch([second]), env={}, collect=fake_collect, cache=MemoryCache({})))
+    assert second.acked and not second.retried
+    assert seen == ["New Act"]
+    reset_pool()
+
+
+def test_remember_uses_d1_batch_for_writes():
+    import db
+
+    binding = _D1()
+    binding.batch_sizes = []
+
+    def batch(statements):
+        binding.batch_sizes.append(len(list(statements)))
+
+        async def run():
+            for statement in statements:
+                await statement.run()
+            return []
+
+        return run()
+
+    binding.batch = batch
+
+    async def run():
+        wrapped = db.D1Database(binding)
+        await migrate(wrapped)
+        saved = await remember(wrapped, "Example", _bundle(), related_cap=10)
+        rows = await wrapped.query("SELECT value FROM metric_snapshots")
+        return saved, rows
+
+    saved, rows = asyncio.run(run())
+    assert saved["snapshots"] == 1
+    assert saved["discovered"] == 1
+    assert rows[0]["value"] == 1000
+    assert binding.batch_sizes
+    assert sum(binding.batch_sizes) >= 1
+
+
+def test_dashboard_route_performs_no_d1_writes(monkeypatch):
+    import httpx
+
+    import db
+
+    binding = _D1()
+    binding.writes = []
+    original_prepare = binding.prepare
+
+    def prepare(sql):
+        head = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        if head in {"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER"}:
+            binding.writes.append(sql)
+        return original_prepare(sql)
+
+    binding.prepare = prepare
+    asyncio.run(migrate(db.D1Database(binding)))
+    binding.writes.clear()
+    queue = _Queue()
+
+    class Env:
+        DB = binding
+        CRAWL_QUEUE = queue
+
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    reset_pool()
+
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+        assert include_related is False
+        return _bundle()
+
+    monkeypatch.setattr(main, "collect_artist", fake_collect)
+
+    async def application(scope, receive, send):
+        if scope.get("type") == "http":
+            scope = dict(scope)
+            scope["env"] = Env()
+        await main.app(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            login = await client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
+            assert login.status_code == 303
+            started = time.perf_counter()
+            page = await client.get("/dashboard", params={"artist": "Example"})
+            elapsed = time.perf_counter() - started
+            slow = _Queue()
+
+            async def hang(body):
+                slow.sent.append(body)
+                await asyncio.sleep(5)
+
+            slow.send = hang
+            Env.CRAWL_QUEUE = slow
+            started = time.perf_counter()
+            hung = await client.get("/dashboard", params={"artist": "Example"})
+            hung_elapsed = time.perf_counter() - started
+            return page, elapsed, hung, hung_elapsed, slow
+
+    page, elapsed, hung, hung_elapsed, slow = asyncio.run(run())
+    assert page.status_code == 200
+    assert hung.status_code == 200
+    assert binding.writes == []
+    assert queue.sent == [{"name": "Example", "origin": "search"}]
+    assert slow.sent == [{"name": "Example", "origin": "search"}]
+    assert elapsed < 2
+    assert hung_elapsed < 1
+    stored = asyncio.run(db.D1Database(binding).query("SELECT COUNT(*) AS n FROM artists"))
+    assert stored[0]["n"] == 0
     reset_pool()

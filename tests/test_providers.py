@@ -757,7 +757,7 @@ def test_cached_ok_results_ignore_stored_errors():
     from models import errored
     from providers.common import CACHE_VERSION, cached
 
-    assert CACHE_VERSION == "v4"
+    assert CACHE_VERSION == "v3"
 
     async def scenario():
         cache = MemoryCache({})

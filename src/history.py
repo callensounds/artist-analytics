@@ -18,6 +18,13 @@ AUDIENCE = {
 }
 SNAPSHOT_REPEAT_SECONDS = 3600
 RELATED_RANK_LIMIT = 5
+# Sightings are a crawl write, not a dashboard parse. Cap rows so one artist cannot
+# turn into a prepare-per-item loop.
+SIGHTINGS_PER_SOURCE = 8
+SIGHTING_CAP = 24
+GROWTH_ROW_LIMIT = 120
+# D1 rejects a statement with more than 100 bound parameters.
+_PARAM_BUDGET = 90
 
 
 def _whole_number(value) -> int | None:
@@ -99,16 +106,41 @@ def _blank(value) -> str | None:
     return text or None
 
 
-async def _latest_snapshot(db, artist_id: int, source: str, metric: str) -> dict | None:
-    return await db.query_one(
+def _value_statements(prefix: str, rows: list[tuple], suffix: str = "") -> list[tuple[str, tuple]]:
+    """Multi-row INSERT statements, each under D1's bound-parameter cap."""
+    if not rows:
+        return []
+    width = len(rows[0])
+    per = max(1, _PARAM_BUDGET // width)
+    marker = "(" + ",".join("?" for _ in range(width)) + ")"
+    tail = f" {suffix}" if suffix else ""
+    statements = []
+    for offset in range(0, len(rows), per):
+        chunk = rows[offset : offset + per]
+        sql = prefix + " VALUES " + ",".join(marker for _ in chunk) + tail
+        params = tuple(value for row in chunk for value in row)
+        statements.append((sql, params))
+    return statements
+
+
+async def _latest_by_metric(db, artist_id: int) -> dict[tuple[str, str], dict]:
+    rows = await db.query(
         """
-        SELECT value, captured_at FROM metric_snapshots
-        WHERE artist_id = ? AND source = ? AND metric = ?
-        ORDER BY captured_at DESC, id DESC
-        LIMIT 1
+        SELECT source, metric, value, captured_at
+        FROM (
+            SELECT source, metric, value, captured_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY source, metric
+                       ORDER BY captured_at DESC, id DESC
+                   ) AS rn
+            FROM metric_snapshots
+            WHERE artist_id = ?
+        ) AS ranked
+        WHERE rn = 1
         """,
-        (artist_id, source, metric),
+        (artist_id,),
     )
+    return {(row["source"], row["metric"]): row for row in rows}
 
 
 async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: datetime | None = None, related_cap: int = 25) -> dict:
@@ -158,6 +190,9 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
         ),
     )
     snapshots = 0
+    snapshot_rows = []
+    sighting_rows = []
+    latest = await _latest_by_metric(db, artist_id)
     for source in sources:
         platform = source.get("platform") or ""
         if source.get("status") == "error":
@@ -169,30 +204,22 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
             number = audience_exact(metric)
             if number is None:
                 continue
-            previous = await _latest_snapshot(db, artist_id, platform, label)
+            previous = latest.get((platform, label))
             previous_value = _whole_number(previous.get("value")) if previous else None
             if previous and previous_value is not None and previous_value == number:
                 previous_at = parse_utc(previous.get("captured_at"))
                 if previous_at and moment - previous_at < timedelta(seconds=SNAPSHOT_REPEAT_SECONDS):
                     continue
-            await db.execute(
-                """
-                INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (artist_id, platform, label, number, str(metric.get("value") or number), stamp),
-            )
+            snapshot_rows.append((artist_id, platform, label, number, str(metric.get("value") or number), stamp))
             snapshots += 1
+        taken = 0
         for item in source.get("items") or []:
+            if taken >= SIGHTINGS_PER_SOURCE or len(sighting_rows) >= SIGHTING_CAP:
+                break
             external = (item.get("url") or f"{item.get('kind')}:{item.get('title')}:{item.get('sort_key')}")[:300]
             if not external or not item.get("title"):
                 continue
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO content_sightings
-                    (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            sighting_rows.append(
                 (
                     artist_id,
                     platform,
@@ -202,8 +229,22 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
                     item.get("sort_key") or item.get("display"),
                     item.get("precision"),
                     stamp,
-                ),
+                )
             )
+            taken += 1
+    await db.batch(
+        _value_statements(
+            "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)",
+            snapshot_rows,
+        )
+        + _value_statements(
+            """
+            INSERT OR IGNORE INTO content_sightings
+                (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
+            """.strip(),
+            sighting_rows,
+        )
+    )
     edges, discovered = await _store_related(db, artist_id, bundle, stamp, related_cap)
     return {
         "artist_id": artist_id,
@@ -217,80 +258,143 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
     related = []
     for source in bundle.get("sources") or []:
         if source.get("platform") == "spotify":
-            related = list(source.get("related") or [])
+            related = list(source.get("related") or [])[:12]
             break
-    written = 0
+    edge_rows = []
     for item in related:
         spotify_id = _blank(item.get("spotify_id"))
         to_name = _blank(item.get("name"))
         if not spotify_id or not to_name:
             continue
-        rank = int(item.get("rank") or written + 1)
-        await db.execute(
+        rank = int(item.get("rank") or len(edge_rows) + 1)
+        edge_rows.append((artist_id, spotify_id, to_name[:120], "spotify", rank, stamp, stamp))
+    await db.batch(
+        _value_statements(
             """
             INSERT INTO related_edges
                 (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
-            VALUES (?, ?, ?, 'spotify', ?, ?, ?)
+            """.strip(),
+            edge_rows,
+            """
             ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
                 to_name = excluded.to_name,
                 rank = excluded.rank,
                 last_seen_at = excluded.last_seen_at
-            """,
-            (artist_id, spotify_id, to_name[:120], rank, stamp, stamp),
+            """.strip(),
         )
-        written += 1
+    )
+    written = len(edge_rows)
     discovered = 0
-    if related_cap > 0:
-        row = await db.query_one(
-            "SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1"
+    if related_cap <= 0 or not edge_rows:
+        return written, discovered
+    row = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
+    before = int((row or {}).get("n") or 0)
+    room = related_cap - before
+    if room <= 0:
+        return written, discovered
+    self_spotify = _blank(_links(bundle).get("spotify_id"))
+    candidates = []
+    for item in related:
+        if int(item.get("rank") or 99) > RELATED_RANK_LIMIT:
+            continue
+        spotify_id = _blank(item.get("spotify_id"))
+        to_name = _blank(item.get("name"))
+        if not spotify_id or not to_name or spotify_id == self_spotify:
+            continue
+        candidates.append((spotify_id, to_name[:120], normalize_name(to_name)))
+    if not candidates:
+        return written, discovered
+    marks = ",".join("?" for _ in candidates)
+    existing_rows = await db.query(
+        f"""
+        SELECT id, spotify_id, normalized_name FROM artists
+        WHERE spotify_id IN ({marks}) OR normalized_name IN ({marks})
+        """,
+        tuple([item[0] for item in candidates] + [item[2] for item in candidates]),
+    )
+    by_spotify: dict[str, int] = {}
+    by_name: dict[str, int] = {}
+    for existing in existing_rows:
+        if existing.get("spotify_id"):
+            by_spotify.setdefault(existing["spotify_id"], int(existing["id"]))
+        if existing.get("normalized_name"):
+            by_name.setdefault(existing["normalized_name"], int(existing["id"]))
+    link_updates = []
+    new_rows = []
+    for spotify_id, to_name, normalized in candidates:
+        if room <= 0:
+            break
+        found = by_spotify.get(spotify_id) or by_name.get(normalized)
+        if found:
+            link_updates.append((found, artist_id, spotify_id))
+            continue
+        new_rows.append((to_name, normalized, spotify_id, "related", 1, stamp))
+        room -= 1
+    if new_rows:
+        await db.batch(
+            _value_statements(
+                "INSERT INTO artists (name, normalized_name, spotify_id, origin, tracked, created_at)",
+                new_rows,
+                "ON CONFLICT(normalized_name) DO NOTHING",
+            )
         )
-        room = related_cap - int((row or {}).get("n") or 0)
-        for item in related:
-            if room <= 0:
-                break
-            if int(item.get("rank") or 99) > RELATED_RANK_LIMIT:
-                continue
-            spotify_id = _blank(item.get("spotify_id"))
-            to_name = _blank(item.get("name"))
-            if not spotify_id or not to_name:
-                continue
-            if spotify_id == _blank(_links(bundle).get("spotify_id")):
-                continue
-            existing = await db.query_one(
-                "SELECT id FROM artists WHERE spotify_id = ? OR normalized_name = ?",
-                (spotify_id, normalize_name(to_name)),
-            )
-            if existing:
-                await db.execute(
+        created = await db.query(
+            f"""
+            SELECT id, spotify_id FROM artists
+            WHERE normalized_name IN ({",".join("?" for _ in new_rows)})
+            """,
+            tuple(item[1] for item in new_rows),
+        )
+        created_ids = {item["spotify_id"]: int(item["id"]) for item in created if item.get("spotify_id")}
+        for _, _, spotify_id, _, _, _ in new_rows:
+            created_id = created_ids.get(spotify_id)
+            if created_id is not None:
+                link_updates.append((created_id, artist_id, spotify_id))
+        after = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
+        discovered = max(0, int((after or {}).get("n") or 0) - before)
+    if link_updates:
+        await db.batch(
+            [
+                (
                     """
                     UPDATE related_edges SET to_artist_id = ?
                     WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
                     """,
-                    (int(existing["id"]), artist_id, spotify_id),
+                    params,
                 )
-                continue
-            await db.execute(
-                """
-                INSERT INTO artists (name, normalized_name, spotify_id, origin, tracked, created_at)
-                VALUES (?, ?, ?, 'related', 1, ?)
-                """,
-                (to_name[:120], normalize_name(to_name), spotify_id, stamp),
-            )
-            created = await db.query_one("SELECT id FROM artists WHERE normalized_name = ?", (normalize_name(to_name),))
-            if created:
-                await db.execute(
-                    """
-                    UPDATE related_edges SET to_artist_id = ?
-                    WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
-                    """,
-                    (int(created["id"]), artist_id, spotify_id),
-                )
-            room -= 1
-            discovered += 1
+                for params in link_updates
+            ]
+        )
     return written, discovered
 
 
+async def load_growth(db, name: str) -> dict:
+    """One indexed read of recent exact audience points. No writes."""
+    normalized = normalize_name(name)
+    if not normalized:
+        return empty_history("No exact audience count has been stored yet.")
+    rows = await db.query(
+        """
+        SELECT s.source AS source, s.metric AS metric, s.value AS value, s.captured_at AS captured_at
+        FROM artists AS a
+        INNER JOIN metric_snapshots AS s ON s.artist_id = a.id
+        WHERE a.normalized_name = ? AND s.value IS NOT NULL
+        ORDER BY s.captured_at DESC, s.id DESC
+        LIMIT ?
+        """,
+        (normalized, GROWTH_ROW_LIMIT),
+    )
+    history = empty_history("No exact audience count has been stored yet.")
+    if not rows:
+        return history
+    history["available"] = True
+    history["reason"] = None
+    history["growth"] = build_growth(rows)
+    return history
+
+
 async def load_artist_history(db, name: str) -> dict:
+    """Several queries. The dashboard uses load_growth instead, so this stays off the request path."""
     artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalize_name(name),))
     if not artist:
         return empty_history("This artist has no stored snapshots yet.")

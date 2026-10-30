@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
+from analytics import normalize_name
 from cache import binding, cache_from_env
 from db import SqliteDatabase, migrate, parse_utc, utc_now
 from history import remember
@@ -14,6 +17,8 @@ from runtime import env_get
 
 DEFAULT_STALE_SECONDS = 6 * 60 * 60
 SCAN_WINDOW = 50
+# Queue send on a dashboard request. Failures and slow bindings are ignored.
+ENQUEUE_TIMEOUT_S = 0.15
 
 
 def settings(env) -> dict:
@@ -114,6 +119,7 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
         http=client,
         cache=cache,
         known_links=known_links(row),
+        include_related=True,
     )
     saved = await remember(db, row["name"], bundle, origin=row.get("origin") or "search", now=now, related_cap=related_cap)
     statuses = [source.get("status") for source in bundle.get("sources") or []]
@@ -246,22 +252,68 @@ async def enqueue_stale(db, env, queue, *, now: datetime | None = None) -> dict:
     return {"status": "queued", "attempted": sent, "cursor": last_id}
 
 
-def _artist_id(message) -> int | None:
+def _message_fields(message) -> tuple[int | None, str | None, str]:
     body = getattr(message, "body", message)
     if isinstance(body, str):
         try:
             body = json.loads(body)
         except json.JSONDecodeError:
-            return None
+            return None, None, "search"
+    artist_id = None
+    name = None
+    origin = "search"
     if isinstance(body, dict):
+        if body.get("origin"):
+            origin = str(body.get("origin"))
+        if body.get("name"):
+            name = str(body.get("name"))
         try:
-            return int(body["artist_id"])
-        except (KeyError, TypeError, ValueError):
-            return None
+            if body.get("artist_id") is not None:
+                artist_id = int(body["artist_id"])
+        except (TypeError, ValueError):
+            artist_id = None
+        return artist_id, name, origin
     try:
-        return int(body["artist_id"])
+        return int(body["artist_id"]), None, "search"
     except Exception:
+        return None, None, "search"
+
+
+async def enqueue_search(name: str, env) -> None:
+    """One queue send. The consumer does the crawl. A miss or a slow send is ignored."""
+    cleaned = (name or "").strip()[:120]
+    if not cleaned:
+        return
+    queue = env_binding(env, "CRAWL_QUEUE")
+    if queue is None or not hasattr(queue, "send"):
+        return
+    try:
+        sent = queue.send({"name": cleaned, "origin": "search"})
+        if hasattr(sent, "__await__"):
+            await asyncio.wait_for(sent, ENQUEUE_TIMEOUT_S)
+    except Exception:
+        return
+
+
+async def _ensure_named_artist(db, name: str, origin: str, now: datetime) -> dict | None:
+    cleaned = (name or "").strip()[:120]
+    normalized = normalize_name(cleaned)
+    if not cleaned or not normalized:
         return None
+    if origin not in {"search", "related"}:
+        origin = "search"
+    await db.execute(
+        """
+        INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+        VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT(normalized_name) DO UPDATE SET
+            name = excluded.name,
+            tracked = 1,
+            origin = CASE WHEN excluded.origin = 'search' THEN 'search' ELSE artists.origin END
+        """,
+        (cleaned, normalized, origin, utc_now(now)),
+    )
+    return await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalized,))
 
 
 async def _finish_message(message, method: str) -> None:
@@ -290,11 +342,17 @@ async def run_queue_batch(batch, env, *, collect=collect_artist, http=None, cach
     store = cache if cache is not None else cache_from_env(env)
     moment = datetime.now(timezone.utc)
     for message in messages:
-        artist_id = _artist_id(message)
+        artist_id, name, origin = _message_fields(message)
         row = None
         if artist_id is not None:
             row = await db.query_one("SELECT * FROM artists WHERE id = ? AND tracked = 1", (artist_id,))
+        elif name:
+            row = await _ensure_named_artist(db, name, origin, moment)
         if row is None:
+            await _finish_message(message, "ack")
+            continue
+        # A dashboard burst can enqueue the same name many times. Crawl the stale one.
+        if not _stale(row, moment, config["stale_seconds"]):
             await _finish_message(message, "ack")
             continue
         try:
@@ -332,7 +390,7 @@ def sqlite_path(env) -> str | None:
     return "data/artist-analytics.sqlite"
 
 
-async def open_database(env):
+async def open_database(env, *, migrate_schema: bool = True):
     database = env_binding(env, "DB")
     if database is not None and hasattr(database, "prepare"):
         from db import D1Database
@@ -341,11 +399,15 @@ async def open_database(env):
     path = sqlite_path(env)
     if path is None:
         return None
+    # A dashboard read must not create the sqlite file or apply migrations.
+    if not migrate_schema and path != ":memory:" and not os.path.isfile(path):
+        return None
     pooled = _POOL.get(path)
     if pooled is None:
         pooled = SqliteDatabase(path)
-        await migrate(pooled)
         _POOL[path] = pooled
+    if migrate_schema:
+        await migrate(pooled)
     return pooled
 
 
