@@ -55,21 +55,21 @@ The dashboard and the crawler are separate Workers Builds triggers. Workers Buil
 
 Dashboard trigger: root directory `/`, build command `uv sync`, deploy command `uv run pywrangler deploy`. Config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`).
 
-Crawler trigger: root directory `/`, build command `uv sync`, deploy command:
+Crawler trigger `72c7852f` (`artist-analytics-crawler`): root directory `/`, build command `npm ci`, deploy command:
 
 ```bash
-uv run pywrangler deploy -c wrangler.crawler.jsonc
+npx wrangler deploy -c wrangler.crawler.jsonc
 ```
 
-`pywrangler` always reads the repo-root `pyproject.toml` and vendors dependencies into `python_modules` beside that file. It also reads `wrangler.jsonc` (not the `-c` file) to pick the Python version, so `wrangler.crawler.jsonc` keeps the same `compatibility_date` and `python_workers` flag. `main` is `src/crawler_entry.py`, the same shape as the dashboard's `src/main.py`. The Python Workers runtime injects the `workers` module only for that layout. A config in `crawler/` with `main` set to `../src/crawler_main.py` bundled the entry outside the project root, and startup failed with `ModuleNotFoundError: No module named 'workers'` (validation 10021).
+`wrangler.crawler.jsonc` points at the TypeScript Worker `crawler/src/index.ts` and sets `"workers_dev": false`. It is not a Python Worker. A Free-plan CPU kill leaves a Pyodide isolate failing every later invocation, so the consumer runs in JavaScript. The dashboard trigger stays Python (`uv sync`, then `uv run pywrangler deploy`, config `wrangler.jsonc`). A root `package.json` makes the dashboard's Previews check run `npm` as well; that is expected.
 
-`wrangler.crawler.jsonc` names the script `artist-analytics-crawler`. It binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. The dashboard config only produces `CRAWL_QUEUE`.
+The crawler binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. The dashboard config only produces `CRAWL_QUEUE`.
 
 A queue has one consumer. Deploy the dashboard (which no longer lists a consumer) before the first crawler deploy. If the crawler deploy says the queue already has a consumer:
 
 ```bash
 npx wrangler queues consumer worker remove artist-analytics-crawl artist-analytics
-uv run pywrangler deploy -c wrangler.crawler.jsonc
+npx wrangler deploy -c wrangler.crawler.jsonc
 ```
 
 `public/` exists so the dashboard asset directory is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`. Routes are served by FastAPI (`run_worker_first`). The crawler entrypoint does not import FastAPI or Jinja.
