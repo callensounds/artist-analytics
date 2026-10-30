@@ -72,9 +72,10 @@ def test_templates_and_migrations_live_beside_the_worker():
     assert '"consumers"' not in wrangler
     assert '"crons"' not in wrangler
     assert '\n  "limits"' not in wrangler
-    crawler = (module_dir.parent / "crawler" / "wrangler.jsonc").read_text()
+    crawler = (module_dir.parent / "wrangler.crawler.jsonc").read_text()
     assert '"name": "artist-analytics-crawler"' in crawler
-    assert '"main": "../src/crawler_main.py"' in crawler
+    assert '"main": "src/crawler_entry.py"' in crawler
+    assert '"compatibility_flags": ["python_workers"]' in crawler
     assert '"queue": "artist-analytics-crawl"' in crawler
     assert '"max_batch_size": 1' in crawler
     assert '"max_concurrency": 1' in crawler

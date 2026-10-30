@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
-import crawler_main
+import crawler_entry
 import main
 from cache import MemoryCache
 from crawl import reset_pool, run_batch, run_queue_batch
@@ -646,8 +646,8 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     import crawl
     import db
 
-    scheduled = inspect.signature(crawler_main.Default.scheduled)
-    queue_sig = inspect.signature(crawler_main.Default.queue)
+    scheduled = inspect.signature(crawler_entry.Default.scheduled)
+    queue_sig = inspect.signature(crawler_entry.Default.queue)
     assert [name for name in scheduled.parameters if name != "self"][:3] == ["controller", "env", "ctx"]
     assert [name for name in queue_sig.parameters if name != "self"][:3] == ["batch", "env", "ctx"]
 
@@ -689,15 +689,15 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
             """,
             (utc_now(now),),
         )
-        worker = crawler_main.Default(object(), env)
+        worker = crawler_entry.Default(object(), env)
         # Exact runtime call: scheduled(controller, env, ctx).
-        await crawler_main.Default.scheduled(worker, Controller(), env, object())
+        await crawler_entry.Default.scheduled(worker, Controller(), env, object())
         runs = await database.query("SELECT status, artists_attempted FROM crawl_runs")
         # A positional env with no bindings must still use the entrypoint env.
-        await crawler_main.Default.scheduled(worker, Controller(), object(), None)
+        await crawler_entry.Default.scheduled(worker, Controller(), object(), None)
         message = _Message({"artist_id": 1})
         # The call that raised "takes 2 positional arguments but 4 were given".
-        await crawler_main.Default.queue(worker, Batch([message]), env, object())
+        await crawler_entry.Default.queue(worker, Batch([message]), env, object())
         stored = await database.query("SELECT value FROM metric_snapshots")
         runs_after = await database.query("SELECT status FROM crawl_runs")
         return runs, runs_after, message, stored
@@ -756,9 +756,9 @@ def test_queue_failure_retries_with_delay_and_records_the_run(monkeypatch, capsy
             """,
             (utc_now(now),),
         )
-        worker = crawler_main.Default(object(), env)
+        worker = crawler_entry.Default(object(), env)
         message = _Message({"artist_id": 1})
-        result = await crawler_main.Default.queue(worker, Batch([message]), env, object())
+        result = await crawler_entry.Default.queue(worker, Batch([message]), env, object())
         runs = await database.query(
             "SELECT status, artists_ok, artists_error, snapshots_written, edges_written FROM crawl_runs"
         )
@@ -870,8 +870,8 @@ def test_handler_exception_retries_with_traceback_and_does_not_raise(monkeypatch
             """,
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
-        worker = crawler_main.Default(object(), Env())
-        await crawler_main.Default.queue(worker, Batch([message]), Env(), object())
+        worker = crawler_entry.Default(object(), Env())
+        await crawler_entry.Default.queue(worker, Batch([message]), Env(), object())
         return await database.query("SELECT detail, status FROM crawl_runs")
 
     runs = asyncio.run(run())
@@ -963,12 +963,12 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
     message = _Message({"artist_id": 1, "provider": "musicbrainz"})
 
     async def drain(env, worker, first):
-        await crawler_main.Default.queue(worker, Batch([first]), env, object())
+        await crawler_entry.Default.queue(worker, Batch([first]), env, object())
         pending = list(queue.sent)
         queue.sent.clear()
         while pending:
             body = pending.pop(0)
-            await crawler_main.Default.queue(worker, Batch([_Message(body)]), env, object())
+            await crawler_entry.Default.queue(worker, Batch([_Message(body)]), env, object())
             pending.extend(queue.sent)
             queue.sent.clear()
 
@@ -983,7 +983,7 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
         env = Env()
-        worker = crawler_main.Default(object(), env)
+        worker = crawler_entry.Default(object(), env)
         await drain(env, worker, message)
         snaps = await database.query("SELECT source, metric, value FROM metric_snapshots ORDER BY source")
         runs = await database.query("SELECT status, snapshots_written, edges_written, detail FROM crawl_runs")
@@ -1092,12 +1092,12 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
     message = _Message({"artist_id": 1, "provider": "musicbrainz"})
 
     async def drain(env, worker, first):
-        await crawler_main.Default.queue(worker, Batch([first]), env, object())
+        await crawler_entry.Default.queue(worker, Batch([first]), env, object())
         pending = list(queue.sent)
         queue.sent.clear()
         while pending:
             body = pending.pop(0)
-            await crawler_main.Default.queue(worker, Batch([_Message(body)]), env, object())
+            await crawler_entry.Default.queue(worker, Batch([_Message(body)]), env, object())
             pending.extend(queue.sent)
             queue.sent.clear()
 
@@ -1112,7 +1112,7 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
         env = Env()
-        worker = crawler_main.Default(object(), env)
+        worker = crawler_entry.Default(object(), env)
         await drain(env, worker, message)
         snaps = await database.query("SELECT source, metric, value FROM metric_snapshots")
         runs = await database.query("SELECT status, snapshots_written, detail FROM crawl_runs")

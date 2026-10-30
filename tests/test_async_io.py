@@ -107,7 +107,7 @@ def test_crawler_entrypoint_does_not_import_the_dashboard_stack():
         [
             sys.executable,
             "-c",
-            "import sys, crawler_main\n"
+            "import sys, crawler_entry\n"
             "assert 'fastapi' not in sys.modules\n"
             "assert 'jinja2' not in sys.modules\n"
             "assert 'providers.spotify' not in sys.modules\n"
