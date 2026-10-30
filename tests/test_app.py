@@ -71,8 +71,8 @@ def test_templates_and_migrations_live_beside_the_worker():
     assert '"queue": "artist-analytics-crawl"' in wrangler
     assert '"max_batch_size": 1' in wrangler
     assert '"max_concurrency": 1' in wrangler
-    assert '"max_retries": 3' in wrangler
-    assert '"retry_delay": 60' in wrangler
+    assert '"max_retries": 10' in wrangler
+    assert '"retry_delay": 180' in wrangler
     assert '"dead_letter_queue": "artist-analytics-crawl-dlq"' in wrangler
     assert '"crons": ["*/15 * * * *"]' in wrangler
     assert '\n  "limits"' not in wrangler

@@ -762,7 +762,7 @@ def test_queue_failure_retries_with_delay_and_records_the_run(monkeypatch, capsy
     assert result["retried"] == 1
     assert result["acked"] == 0
     assert message.retried and not message.acked
-    assert message.delay == 60
+    assert message.delay == 180
     assert runs[0]["status"] == "error"
     assert runs[0]["artists_error"] == 1
     assert runs[0]["artists_ok"] == 0
@@ -834,18 +834,9 @@ def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monk
     reset_pool()
 
 
-def test_promising_task_error_retries_then_discards_the_isolate(monkeypatch):
+def test_handler_exception_retries_with_traceback_and_does_not_raise(monkeypatch):
     import crawl
     import db
-    from crawl import raise_discard
-
-    try:
-        raise_discard(SystemError("Cannot enter a promising task from inside another running promising task"))
-    except SystemExit:
-        discarded = True
-    else:
-        discarded = False
-    assert discarded
 
     binding = _D1()
 
@@ -879,13 +870,126 @@ def test_promising_task_error_retries_then_discards_the_isolate(monkeypatch):
         )
         worker = main.Default(object(), Env())
         await main.Default.queue(worker, Batch([message]), Env(), object())
+        return await database.query("SELECT detail, status FROM crawl_runs")
 
-    try:
-        asyncio.run(run())
-    except SystemExit:
-        discarded = True
-    else:
-        discarded = False
-    assert discarded
+    runs = asyncio.run(run())
     assert message.retried and not message.acked
-    assert message.delay == 60
+    assert message.delay == 180
+    assert runs[0]["status"] == "error"
+    assert "SystemError" in runs[0]["detail"]
+    assert "promising task" in runs[0]["detail"]
+    assert "Traceback" in runs[0]["detail"]
+
+
+def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch):
+    """A full crawl through Default.queue, with the counts sitting past a 64KB head."""
+    import crawl
+    import db
+    from http_client import HttpResult
+
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+    monkeypatch.setattr("providers.musicbrainz.MB_INTERVAL", 0)
+    reset_pool()
+    pad = "<!--pad-->" * 9000
+    assert len(pad) > 64_000
+    spotify = (
+        pad
+        + '<div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>'
+        + "<div>Jubilee</div><div>Album • 2021</div>"
+        + "<h2>Fans also like</h2>"
+        + '<a href="/artist/3kzwYV3OCB010YfXMF0Avt"><span>Alvvays</span></a>'
+        + "<div>Appears On</div>"
+    )
+    instagram = pad + (
+        'shortcode\\":\\"abc123\\" taken_at_timestamp\\":1792416619 '
+        'username\\":\\"jbrekkie\\" edge_followed_by\\":{\\"count\\":574486}'
+    )
+    tiktok = pad + '"followerCount":88000,"heartCount":929200'
+    search = {
+        "artists": [
+            {
+                "id": "mb-jb",
+                "name": "Japanese Breakfast",
+                "score": 100,
+                "relations": [
+                    {"url": {"resource": "https://open.spotify.com/artist/7MoIc5s9KXolCBH1fy9kkw"}},
+                    {"url": {"resource": "https://www.instagram.com/jbrekkie/"}},
+                    {"url": {"resource": "https://www.tiktok.com/@jbrekkie"}},
+                ],
+            }
+        ]
+    }
+
+    class Pages:
+        def __init__(self):
+            self.caps = []
+
+        async def get_text(self, url, **kwargs):
+            self.caps.append((url, kwargs.get("max_bytes")))
+            if "instagram.com" in url:
+                return HttpResult(200, instagram, url, {})
+            if "tiktok.com" in url:
+                return HttpResult(200, tiktok, url, {})
+            if "open.spotify.com/artist/" in url:
+                return HttpResult(200, spotify, url, {})
+            return HttpResult(404, "", url, {})
+
+        async def get_json(self, url, **kwargs):
+            if "musicbrainz.org" in url:
+                return HttpResult(200, "{}", url, {}), search
+            if "oembed" in url:
+                return HttpResult(200, "{}", url, {}), {"title": "Japanese Breakfast"}
+            if "itunes.apple.com" in url or "apple.com" in url:
+                return HttpResult(200, "{}", url, {}), {"resultCount": 0, "results": []}
+            return HttpResult(404, "", url, {}), None
+
+    pages = Pages()
+    monkeypatch.setattr(crawl, "HttpClient", lambda *args, **kwargs: pages)
+    binding = _D1()
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    message = _Message({"artist_id": 1})
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?)
+            """,
+            (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
+        )
+        env = Env()
+        worker = main.Default(object(), env)
+        await main.Default.queue(worker, Batch([message]), env, object())
+        snaps = await database.query("SELECT source, metric, value FROM metric_snapshots ORDER BY source")
+        runs = await database.query("SELECT status, snapshots_written, edges_written, detail FROM crawl_runs")
+        return snaps, runs
+
+    snaps, runs = asyncio.run(run())
+    assert message.acked and not message.retried, runs
+    by_source = {row["source"]: row["value"] for row in snaps}
+    assert by_source.get("spotify") == 1473027
+    assert by_source.get("instagram") == 574486
+    assert by_source.get("tiktok") == 88000
+    assert runs[-1]["status"] == "ok"
+    assert runs[-1]["snapshots_written"] >= 3
+    assert "spotify=ok" in runs[-1]["detail"]
+    assert "Traceback" not in (runs[-1]["detail"] or "")
+    def cap_for(fragment: str) -> int:
+        caps = [cap for url, cap in pages.caps if fragment in url and cap]
+        assert caps, fragment
+        return max(caps)
+
+    assert cap_for("instagram.com") >= 250_000
+    assert cap_for("tiktok.com/@") >= 350_000
+    assert cap_for("open.spotify.com/artist/") >= 200_000
