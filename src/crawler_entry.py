@@ -1,16 +1,21 @@
 """Cron and queue entrypoint for the artist-analytics-crawler Worker.
 
+This file is the Workers `main`, same layout as `src/main.py`: repo-root
+`wrangler.crawler.jsonc` points at `src/crawler_entry.py`. The `workers`
+module is injected by the Python Workers runtime only for that layout.
+A config in a subdirectory with `main` outside that directory bundled the
+file as a plain script, and startup failed with
+`ModuleNotFoundError: No module named 'workers'`.
+
 Importing this module does not import FastAPI, Jinja, or a provider parser.
-Those load inside the single message that needs them. A Free-plan CPU kill
-during startup leaves the isolate failing every later invocation until the
-Worker version changes, so this file stays small on purpose.
+Those load inside the single message that needs them.
 """
 
 from __future__ import annotations
 
 try:
     from workers import Response, WorkerEntrypoint
-except ImportError:  # Local tests have no Workers runtime.
+except ImportError:  # Local tests have no Workers runtime. Deploy has it.
 
     class WorkerEntrypoint:
         def __init__(self, ctx=None, env=None):

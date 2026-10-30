@@ -51,20 +51,28 @@ Cloudflare Workers Builds (Git-connected) should deploy this repo from `main`.
 
 **Build / deploy command**
 
+The dashboard and the crawler are separate Workers Builds triggers. Workers Builds overrides the Worker name from the trigger, so the crawler needs its own trigger or the upload is renamed to `artist-analytics`.
+
+Dashboard trigger: root directory `/`, build command `uv sync`, deploy command `uv run pywrangler deploy`. Config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`).
+
+Crawler trigger: root directory `/`, build command `uv sync`, deploy command:
+
 ```bash
-uv run pywrangler deploy && uv run pywrangler deploy -c crawler/wrangler.jsonc
+uv run pywrangler deploy -c wrangler.crawler.jsonc
 ```
 
-Change the Workers Builds deploy command to that. The first command updates `artist-analytics` (dashboard). The second updates `artist-analytics-crawler` (cron and queue consumer). Order matters: a queue has one consumer, and deploying the crawler while `artist-analytics` still consumes `artist-analytics-crawl` fails. The dashboard config no longer lists a consumer, so the first deploy detaches it. If the crawler deploy still reports that the queue already has a consumer, detach it and redeploy only the crawler:
+`pywrangler` always reads the repo-root `pyproject.toml` and vendors dependencies into `python_modules` beside that file. It also reads `wrangler.jsonc` (not the `-c` file) to pick the Python version, so `wrangler.crawler.jsonc` keeps the same `compatibility_date` and `python_workers` flag. `main` is `src/crawler_entry.py`, the same shape as the dashboard's `src/main.py`. The Python Workers runtime injects the `workers` module only for that layout. A config in `crawler/` with `main` set to `../src/crawler_main.py` bundled the entry outside the project root, and startup failed with `ModuleNotFoundError: No module named 'workers'` (validation 10021).
+
+`wrangler.crawler.jsonc` names the script `artist-analytics-crawler`. It binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. The dashboard config only produces `CRAWL_QUEUE`.
+
+A queue has one consumer. Deploy the dashboard (which no longer lists a consumer) before the first crawler deploy. If the crawler deploy says the queue already has a consumer:
 
 ```bash
 npx wrangler queues consumer worker remove artist-analytics-crawl artist-analytics
-uv run pywrangler deploy -c crawler/wrangler.jsonc
+uv run pywrangler deploy -c wrangler.crawler.jsonc
 ```
 
-A same-version redeploy does not clear an isolate that a CPU kill left failing at startup with `Cannot enter a promising task`. This cutover is a new Worker version, which does. Do not roll the crawler back onto the dashboard script.
-
-`wrangler.jsonc` is the dashboard (`python_workers`, `main` = `src/main.py`, `preview_urls` false). It produces `CRAWL_QUEUE` and does not run cron or consume the queue. `crawler/wrangler.jsonc` is `artist-analytics-crawler` (`main` = `../src/crawler_main.py`). It binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. `public/` exists so the dashboard asset directory is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`. Routes are served by FastAPI (`run_worker_first`). The crawler entrypoint does not import FastAPI or Jinja.
+`public/` exists so the dashboard asset directory is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`. Routes are served by FastAPI (`run_worker_first`). The crawler entrypoint does not import FastAPI or Jinja.
 
 Styles are the prebuilt file `src/static/app.css`, served at `/static/app.css`. A Text rule with `fallthrough: true` uploads `**/*.css` without replacing the default HTML rule. `/favicon.ico` is a small inline SVG. Rebuild CSS after template class changes:
 
@@ -81,7 +89,7 @@ Set these with Wrangler. Do not put the values in `wrangler.jsonc` or in git.
 ```bash
 npx wrangler secret put SECRET_KEY
 npx wrangler secret put YOUTUBE_API_KEY
-npx wrangler secret put YOUTUBE_API_KEY -c crawler/wrangler.jsonc
+npx wrangler secret put YOUTUBE_API_KEY -c wrangler.crawler.jsonc
 ```
 
 Secrets are per Worker. `YOUTUBE_API_KEY` has to be set on `artist-analytics-crawler` as well as the dashboard, or the YouTube provider message stays skipped. Set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` on the crawler too if they are set on the dashboard. `SECRET_KEY` is only the dashboard session cookie. `wrangler secret put` redeploys that Worker; set the crawler secrets after the crawler code deploy so the secret version keeps the new consumer.
