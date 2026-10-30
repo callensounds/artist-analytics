@@ -93,7 +93,7 @@ def parse_embed(html: str, handle: str) -> dict:
 
 async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
     handle = (links or {}).get("instagram") or ""
-    if (links or {}).get("_incomplete"):
+    if (links or {}).get("_incomplete") and not handle:
         return unavailable(
             "instagram",
             "Instagram",
@@ -148,7 +148,8 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                 "The public embed page did not include follower counts or taken_at_timestamp values. "
                 "The markup may have changed.",
             )
-        follower_value = compact_count(parsed["followers"]) if parsed["followers"] is not None else None
+        follower_exact = parsed["followers"] if isinstance(parsed["followers"], int) else None
+        follower_value = compact_count(follower_exact) if follower_exact is not None else None
         return SourceResult(
             platform="instagram",
             label="Instagram",
@@ -160,6 +161,7 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                     label="Followers",
                     available=follower_value is not None,
                     value=follower_value,
+                    exact=follower_exact,
                     reason=None
                     if follower_value is not None
                     else "The embed page did not include edge_followed_by.",

@@ -13,6 +13,39 @@
   "observability": {
     "enabled": true
   },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  // D1 and the crawl queue already exist in the account. Workers Builds
+  // attaches these bindings on deploy. It does not apply migrations.
+  // 0001_crawl.sql is already applied remotely; do not rename or edit it.
+  // The Worker records its own schema_migrations rows and skips applied files.
+  // A missing binding is handled in code: history stays empty and the cron
+  // logs that it skipped instead of inventing snapshots.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "artist-analytics",
+      "database_id": "52a9190e-4147-402e-8f75-16f5de58bf84",
+      "migrations_dir": "src/migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "CRAWL_QUEUE",
+        "queue": "artist-analytics-crawl"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "artist-analytics-crawl",
+        "max_batch_size": 1,
+        "max_concurrency": 1,
+        "max_retries": 3
+      }
+    ]
+  },
   // CSS is not in Wrangler's default Python module rules. fallthrough keeps
   // the default Text rule that uploads src/templates/**/*.html.
   "rules": [

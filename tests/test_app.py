@@ -48,16 +48,31 @@ def setup_function():
     main.NEXT_ID = 2
 
 
-def test_templates_are_bundled_beside_the_worker_and_login_renders():
+def test_templates_and_migrations_live_beside_the_worker():
     from pathlib import Path
+
+    import db
 
     module_dir = Path(main.__file__).resolve().parent
     template_dir = Path(main.templates.env.loader.searchpath[0]).resolve()
     assert template_dir == module_dir / "templates"
+    assert db.MIGRATIONS.resolve() == module_dir / "migrations"
     assert (template_dir / "login.html").is_file()
-    assert (template_dir / "base.html").is_file()
+    assert (template_dir / "admin.html").is_file()
+    assert (template_dir / "diag.html").is_file()
+    assert (db.MIGRATIONS / "0001_crawl.sql").is_file()
     wrangler = (module_dir.parent / "wrangler.jsonc").read_text()
     assert '"preview_urls": false' in wrangler
+    assert '"binding": "DB"' in wrangler
+    assert '"database_name": "artist-analytics"' in wrangler
+    assert "52a9190e-4147-402e-8f75-16f5de58bf84" in wrangler
+    assert '"migrations_dir": "src/migrations"' in wrangler
+    assert '"binding": "CRAWL_QUEUE"' in wrangler
+    assert '"queue": "artist-analytics-crawl"' in wrangler
+    assert '"max_batch_size": 1' in wrangler
+    assert '"max_concurrency": 1' in wrangler
+    assert '"max_retries": 3' in wrangler
+    assert '"crons": ["*/15 * * * *"]' in wrangler
     for name in ("base.html", "index.html", "login.html", "register.html", "dashboard.html"):
         assert (template_dir / name).is_file()
     client = TestClient(main.app)

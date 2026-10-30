@@ -78,7 +78,14 @@ async def _finish_catalog(rest, partial, deadline: float | None = None):
         return partial
 
 
-async def collect_artist(name: str, env=None, http=None, cache=None, deadline_s: float = DASHBOARD_DEADLINE) -> dict:
+async def collect_artist(
+    name: str,
+    env=None,
+    http=None,
+    cache=None,
+    known_links=None,
+    deadline_s: float = DASHBOARD_DEADLINE,
+) -> dict:
     deadline = asyncio.get_running_loop().time() + deadline_s
     client = http or HttpClient(deadline=deadline - RENDER_MARGIN)
     store = cache or cache_from_env(env)
@@ -93,6 +100,10 @@ async def collect_artist(name: str, env=None, http=None, cache=None, deadline_s:
         opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
     partial, rest = opened
     links = dict(partial.links or {})
+    # Ids already stored for this artist fill gaps. They are not guessed.
+    for key, value in (known_links or {}).items():
+        if value and not links.get(key):
+            links[key] = value
     # A MusicBrainz error with no saved URLs blocks Spotify, Instagram, and TikTok.
     # Cached relations, or a Spotify id already on the links, still let those cards run.
     if partial.status != "ok" and not _has_saved_links(links):

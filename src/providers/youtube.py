@@ -208,7 +208,13 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
         items = parse_videos(videos)
         stats = channel.get("statistics") or {}
         hidden = stats.get("hiddenSubscriberCount")
-        subscribers = None if hidden else compact_count(stats.get("subscriberCount"))
+        subscriber_exact = None
+        if not hidden and stats.get("subscriberCount") not in (None, ""):
+            try:
+                subscriber_exact = int(stats.get("subscriberCount"))
+            except (TypeError, ValueError):
+                subscriber_exact = None
+        subscribers = compact_count(subscriber_exact) if subscriber_exact is not None else None
         title = (channel.get("snippet") or {}).get("title")
         channel_id = channel.get("id")
         notices = [
@@ -228,6 +234,7 @@ async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResul
                     label="Subscribers",
                     available=bool(subscribers),
                     value=subscribers,
+                    exact=subscriber_exact,
                     reason=None if subscribers else "The channel hides its subscriber count.",
                 ),
                 Metric(label="Recent uploads", available=True, value=str(len(items))),
