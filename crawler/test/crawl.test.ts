@@ -1,6 +1,18 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { type CrawlEnv, handleMessage, resetMusicBrainzPace, runQueue, runScheduled } from "../src/crawl";
+import {
+  type CrawlEnv,
+  MB_INTERVAL_MAX_MS,
+  MB_INTERVAL_MIN_MS,
+  RETRY_DELAY_MAX_SECONDS,
+  RETRY_DELAY_MIN_SECONDS,
+  RetryableFetch,
+  handleMessage,
+  resetMusicBrainzPace,
+  retryDelaySeconds,
+  runQueue,
+  runScheduled,
+} from "../src/crawl";
 import { listenerSlices, parseInstagram, parseMonthlyListeners, parseRelatedArtists, leadingInt, tiktokVideos } from "../src/parse";
 import { type Store, migrate } from "../src/store";
 
@@ -25,7 +37,10 @@ function sqliteStore(db: DatabaseSync): Store {
   };
 }
 
-function memoryEnv(pages: Record<string, { status?: number; body: string }>, key?: string): { env: CrawlEnv; sent: unknown[]; db: DatabaseSync } {
+function memoryEnv(
+  pages: Record<string, { status?: number; body: string; headers?: Record<string, string> }>,
+  key?: string,
+): { env: CrawlEnv; sent: unknown[]; db: DatabaseSync } {
   const db = new DatabaseSync(":memory:");
   const sent: unknown[] = [];
   const env: CrawlEnv = {
@@ -42,7 +57,7 @@ function memoryEnv(pages: Record<string, { status?: number; body: string }>, key
     const match = Object.entries(pages).find(([needle]) => url.includes(needle));
     const page = match?.[1] ?? { status: 404, body: "" };
     const status = page.status ?? 200;
-    return new Response(page.body, { status });
+    return new Response(page.body, { status, headers: page.headers });
   });
   return { env, sent, db };
 }
@@ -177,37 +192,167 @@ describe("crawler messages", () => {
     expect(calls).toEqual([]);
   });
 
-  it("retries a failed provider message after 180 seconds", async () => {
+  it("retries a dropped connection with 120–300s jitter and does not ack", async () => {
     resetMusicBrainzPace();
-    const { env } = memoryEnv({});
+    const { env, db } = memoryEnv({});
     vi.stubGlobal("fetch", async () => {
       throw new Error("network down");
     });
     await migrate(env.DB);
-    const db = (env.DB as unknown as { all: Store["all"] });
-    void db;
-    const database = new DatabaseSync(":memory:");
-    const store = sqliteStore(database);
-    env.DB = store;
-    await migrate(env.DB);
-    database.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Broken', 'broken', 'search', 1, ?)").run("2020-01-01T00:00:00Z");
-    const message = {
-      body: { artist_id: 1, provider: "musicbrainz" },
-      acked: false,
-      retried: false,
-      delay: undefined as number | undefined,
-      ack() {
-        this.acked = true;
-      },
-      retry(options?: { delaySeconds?: number }) {
-        this.retried = true;
-        this.delay = options?.delaySeconds;
-      },
-    };
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Broken', 'broken', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
     const result = await runQueue([message], env);
     expect(result).toEqual({ acked: 0, retried: 1 });
-    expect(message.retried).toBe(true);
-    expect(message.delay).toBe(180);
     expect(message.acked).toBe(false);
+    expect(message.delay).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
+    expect(message.delay).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
+  });
+
+  it("retries MusicBrainz 503 and honors Retry-After without recording an error", async () => {
+    resetMusicBrainzPace();
+    const { env, db } = memoryEnv({
+      "musicbrainz.org": { status: 503, body: "upstream unavailable", headers: { "retry-after": "250" } },
+    });
+    await migrate(env.DB);
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
+    const result = await runQueue([message], env);
+    expect(result).toEqual({ acked: 0, retried: 1 });
+    expect(message.acked).toBe(false);
+    expect(message.delay).toBe(250);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
+  });
+
+  it("floors a short Retry-After at 120 seconds and jitters when the header is absent", () => {
+    const now = Date.parse("2026-10-30T21:00:00Z");
+    expect(retryDelaySeconds("45", now)).toBe(RETRY_DELAY_MIN_SECONDS);
+    expect(retryDelaySeconds("250", now)).toBe(250);
+    expect(retryDelaySeconds("99999", now)).toBe(3600);
+    expect(retryDelaySeconds(new Date(now + 180_000).toUTCString(), now)).toBe(180);
+    expect(retryDelaySeconds(new Date(now + 90_000).toUTCString(), now)).toBe(RETRY_DELAY_MIN_SECONDS);
+    const jitter = retryDelaySeconds(null, now);
+    expect(jitter).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
+    expect(jitter).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+  });
+
+  it("retries Spotify 429 and Apple 503, and still acks an Apple 403", async () => {
+    const { env, db } = memoryEnv({
+      "open.spotify.com/artist/": { status: 429, body: "", headers: { "retry-after": "180" } },
+    });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
+    ).run("2020-01-01T00:00:00Z");
+    const spotify = queueMessage({ artist_id: 1, provider: "spotify" });
+    expect(await runQueue([spotify], env)).toEqual({ acked: 0, retried: 1 });
+    expect(spotify.delay).toBe(180);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
+
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("itunes.apple.com")) return new Response("busy", { status: 503, headers: { "retry-after": "30" } });
+      return new Response("", { status: 404 });
+    });
+    const appleBusy = queueMessage({ artist_id: 1, provider: "apple" });
+    expect(await runQueue([appleBusy], env)).toEqual({ acked: 0, retried: 1 });
+    expect(appleBusy.delay).toBe(RETRY_DELAY_MIN_SECONDS);
+    expect(db.prepare("SELECT apple_blocked_until FROM crawl_state WHERE id = 1").get()).toBeUndefined();
+
+    vi.stubGlobal("fetch", async () => new Response("", { status: 403 }));
+    const appleBlocked = queueMessage({ artist_id: 1, provider: "apple" });
+    expect(await runQueue([appleBlocked], env)).toEqual({ acked: 1, retried: 0 });
+    expect(appleBlocked.acked).toBe(true);
+    const state = db.prepare("SELECT apple_blocked_until FROM crawl_state WHERE id = 1").get() as { apple_blocked_until: string };
+    expect(state.apple_blocked_until).toBeTruthy();
+  });
+
+  it("retries a MusicBrainz body that fails mid-read", async () => {
+    resetMusicBrainzPace();
+    const { env, db } = memoryEnv({});
+    vi.stubGlobal("fetch", async () => {
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.error(new Error("socket hang up"));
+          },
+        }),
+        { status: 200 },
+      );
+    });
+    await migrate(env.DB);
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Broken', 'broken', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
+    await runQueue([message], env);
+    expect(message.acked).toBe(false);
+    expect(message.retried).toBe(true);
+    expect(message.delay).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
+    expect(message.delay).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+  });
+
+  it("spaces MusicBrainz requests 1.5–2s apart on the isolate", async () => {
+    resetMusicBrainzPace();
+    let clock = Date.parse("2026-10-30T21:00:00Z");
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const sleeps: number[] = [];
+    const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: TimerHandler, ms?: number) => {
+      sleeps.push(ms ?? 0);
+      if (typeof fn === "function") fn();
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    try {
+      const { env, db } = memoryEnv({ "musicbrainz.org": { status: 503, body: "" } });
+      await migrate(env.DB);
+      db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Pace', 'pace', 'search', 1, ?)").run(
+        "2020-01-01T00:00:00Z",
+      );
+      await expect(handleMessage(env, { artist_id: 1, provider: "musicbrainz" })).rejects.toBeInstanceOf(RetryableFetch);
+      await expect(handleMessage(env, { artist_id: 1, provider: "musicbrainz" })).rejects.toBeInstanceOf(RetryableFetch);
+      const paced = sleeps.filter((ms) => ms >= MB_INTERVAL_MIN_MS);
+      expect(paced).toHaveLength(1);
+      expect(paced[0]).toBeLessThanOrEqual(MB_INTERVAL_MAX_MS);
+    } finally {
+      timer.mockRestore();
+      now.mockRestore();
+    }
+  });
+
+  it("acks a MusicBrainz 500 as a finished error", async () => {
+    resetMusicBrainzPace();
+    const { env, db } = memoryEnv({ "musicbrainz.org": { status: 500, body: "nope" } });
+    await migrate(env.DB);
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Broken', 'broken', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
+    expect(await runQueue([message], env)).toEqual({ acked: 1, retried: 0 });
+    expect(message.acked).toBe(true);
+    const run = db.prepare("SELECT status FROM crawl_runs").get() as { status: string };
+    expect(run.status).toBe("error");
+    expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
   });
 });
+
+function queueMessage(body: unknown) {
+  return {
+    body,
+    acked: false,
+    retried: false,
+    delay: undefined as number | undefined,
+    ack() {
+      this.acked = true;
+    },
+    retry(options?: { delaySeconds?: number }) {
+      this.retried = true;
+      this.delay = options?.delaySeconds;
+    },
+  };
+}

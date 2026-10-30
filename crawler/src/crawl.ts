@@ -30,11 +30,38 @@ import {
 import { type SavedSource, type Store, migrate, parseUtc, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
+export const RETRY_DELAY_MIN_SECONDS = 120;
+export const RETRY_DELAY_MAX_SECONDS = 300;
 const STALE_SECONDS = 6 * 60 * 60;
 const FRESH_SECONDS = 3 * 60 * 60;
 const APPLE_BACKOFF_SECONDS = 30 * 60;
 const SCAN_WINDOW = 50;
-const MB_INTERVAL_MS = 1100;
+export const MB_INTERVAL_MIN_MS = 1500;
+export const MB_INTERVAL_MAX_MS = 2000;
+
+/** A 429, 503, or dropped connection. The queue message must be retried, not acked. */
+export class RetryableFetch extends Error {
+  constructor(readonly delaySeconds: number, message: string) {
+    super(message);
+    this.name = "RetryableFetch";
+  }
+}
+
+export function retryDelaySeconds(retryAfter: string | null, now = Date.now()): number {
+  const header = parseRetryAfter(retryAfter, now);
+  if (header !== null && header > 0) return Math.min(3600, Math.max(RETRY_DELAY_MIN_SECONDS, Math.ceil(header)));
+  const span = RETRY_DELAY_MAX_SECONDS - RETRY_DELAY_MIN_SECONDS;
+  return RETRY_DELAY_MIN_SECONDS + Math.floor(Math.random() * (span + 1));
+}
+
+function parseRetryAfter(value: string | null, now: number): number | null {
+  if (!value) return null;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds)) return seconds;
+  const date = Date.parse(value);
+  if (Number.isNaN(date)) return null;
+  return Math.ceil((date - now) / 1000);
+}
 
 export interface CrawlEnv {
   DB: Store;
@@ -64,7 +91,8 @@ export function resetMusicBrainzPace(): void {
 async function paceMusicBrainz(): Promise<void> {
   const now = Date.now();
   const wait = mbNext - now;
-  mbNext = Math.max(now, mbNext) + MB_INTERVAL_MS;
+  const gap = MB_INTERVAL_MIN_MS + Math.floor(Math.random() * (MB_INTERVAL_MAX_MS - MB_INTERVAL_MIN_MS + 1));
+  mbNext = Math.max(now, mbNext) + gap;
   if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
 }
 
@@ -189,29 +217,45 @@ async function sendFollowups(env: CrawlEnv, artistId: number, links: MbLinks, fr
 }
 
 async function fetchText(url: string, maxBytes: number, headers: Record<string, string> = {}, redirect: RequestRedirect = "manual"): Promise<{ status: number; ok: boolean; text: string }> {
-  const response = await fetch(url, {
-    headers: { "User-Agent": HTTP_USER_AGENT, Accept: "application/json, text/html;q=0.9", ...headers },
-    redirect,
-  });
-  const reader = response.body?.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  if (reader) {
-    while (size < maxBytes) {
-      const part = await reader.read();
-      if (part.done) break;
-      const data = part.value;
-      const room = maxBytes - size;
-      chunks.push(data.byteLength > room ? data.slice(0, room) : data);
-      size += Math.min(data.byteLength, room);
-      if (data.byteLength > room) {
-        await reader.cancel();
-        break;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      headers: { "User-Agent": HTTP_USER_AGENT, Accept: "application/json, text/html;q=0.9", ...headers },
+      redirect,
+    });
+  } catch (error) {
+    throw new RetryableFetch(retryDelaySeconds(null), error instanceof Error ? error.message : "network error");
+  }
+  if (response.status === 429 || response.status === 503) {
+    throw new RetryableFetch(
+      retryDelaySeconds(response.headers.get("retry-after")),
+      `HTTP ${response.status}`,
+    );
+  }
+  try {
+    const reader = response.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader) {
+      while (size < maxBytes) {
+        const part = await reader.read();
+        if (part.done) break;
+        const data = part.value;
+        const room = maxBytes - size;
+        chunks.push(data.byteLength > room ? data.slice(0, room) : data);
+        size += Math.min(data.byteLength, room);
+        if (data.byteLength > room) {
+          await reader.cancel();
+          break;
+        }
       }
     }
+    const text = new TextDecoder().decode(concat(chunks));
+    return { status: response.status, ok: response.ok, text };
+  } catch (error) {
+    if (error instanceof RetryableFetch) throw error;
+    throw new RetryableFetch(retryDelaySeconds(null), error instanceof Error ? error.message : "network error");
   }
-  const text = new TextDecoder().decode(concat(chunks));
-  return { status: response.status, ok: response.ok, text };
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {
@@ -280,8 +324,8 @@ async function musicbrainz(name: string, mbid: string): Promise<{ status: string
 
 async function spotify(artistId: string): Promise<SavedSource> {
   const page = await fetchText(`https://open.spotify.com/artist/${artistId}`, FETCH_BYTES);
-  if (page.status === 403 || page.status === 429) {
-    return { platform: "spotify", status: "unavailable", reason: `Spotify blocked the public artist page (HTTP ${page.status}).`, markCrawled: true };
+  if (page.status === 403) {
+    return { platform: "spotify", status: "unavailable", reason: "Spotify blocked the public artist page (HTTP 403).", markCrawled: true };
   }
   if (!page.ok) return { platform: "spotify", status: "unavailable", reason: `The public Spotify page returned HTTP ${page.status}.`, markCrawled: true };
   const lines = visibleLines(shelfWindow(page.text));
@@ -328,8 +372,8 @@ async function instagram(handle: string): Promise<SavedSource> {
 
 async function tiktok(handle: string): Promise<SavedSource> {
   const page = await fetchText(`https://www.tiktok.com/@${handle}`, 400_000);
-  if (page.status === 403 || page.status === 429) {
-    return { platform: "tiktok", status: "unavailable", reason: `TikTok blocked the profile request (HTTP ${page.status}).`, markCrawled: true };
+  if (page.status === 403) {
+    return { platform: "tiktok", status: "unavailable", reason: "TikTok blocked the profile request (HTTP 403).", markCrawled: true };
   }
   const followers = leadingInt(page.text, "followerCount");
   const likes = leadingInt(page.text, "heartCount");
@@ -355,11 +399,14 @@ async function apple(name: string, appleId: string): Promise<SavedSource & { for
     ? `https://itunes.apple.com/lookup?${new URLSearchParams({ id: lookupId, entity: "album", limit: "25", country: "us" })}`
     : `https://itunes.apple.com/search?${new URLSearchParams({ term: name, entity: "musicArtist", limit: "5", country: "us" })}`;
   const response = await fetchJson(url);
-  if (response.status === 403 || response.status === 429) {
-    const reason = response.status === 403
-      ? "Apple refused the lookup from this network (HTTP 403). Try again shortly."
-      : "Apple is rate-limiting this lookup. Try again shortly.";
-    return { platform: "apple", status: "unavailable", reason, forbidden: response.status === 403, markCrawled: true };
+  if (response.status === 403) {
+    return {
+      platform: "apple",
+      status: "unavailable",
+      reason: "Apple refused the lookup from this network (HTTP 403). Try again shortly.",
+      forbidden: true,
+      markCrawled: true,
+    };
   }
   if (!response.ok || !response.json || typeof response.json !== "object") {
     return { platform: "apple", status: "error", reason: `iTunes Search returned HTTP ${response.status}.`, forbidden: false, markCrawled: true };
@@ -535,19 +582,27 @@ export async function runQueue(messages: QueueMessage[], env: CrawlEnv): Promise
     first.ack();
     acked += 1;
   } catch (error) {
-    console.log(JSON.stringify({ message: "queue message failed", error: error instanceof Error ? error.stack : String(error) }));
-    try {
-      await env.DB.batch([
-        {
-          sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
-                VALUES (?, ?, 'error', 1, 0, 1, ?)`,
-          params: [utcNow(), utcNow(), String(error).slice(0, 2000)],
-        },
-      ]);
-    } catch {
-      // The retry still has to happen if the run row cannot be written.
+    const retryable = error instanceof RetryableFetch;
+    const delay = retryable ? error.delaySeconds : retryDelaySeconds(null);
+    console.log(JSON.stringify({
+      message: retryable ? "queue message retry" : "queue message failed",
+      delaySeconds: delay,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    if (!retryable) {
+      try {
+        await env.DB.batch([
+          {
+            sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
+                  VALUES (?, ?, 'error', 1, 0, 1, ?)`,
+            params: [utcNow(), utcNow(), String(error).slice(0, 2000)],
+          },
+        ]);
+      } catch {
+        // The retry still has to happen if the run row cannot be written.
+      }
     }
-    first.retry({ delaySeconds: RETRY_DELAY_SECONDS });
+    first.retry({ delaySeconds: delay });
     retried += 1;
   }
   return { acked, retried };
