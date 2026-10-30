@@ -21,7 +21,7 @@ SCAN_WINDOW = 50
 # Queue send on a dashboard request. Failures and slow bindings are ignored.
 ENQUEUE_TIMEOUT_S = 0.15
 # Keep a retried message off this isolate until the shared CPU budget can recover.
-RETRY_DELAY_SECONDS = 60
+RETRY_DELAY_SECONDS = 180
 # Skip a provider whose audience snapshot is newer than this. A retry after a
 # CPU kill then does not parse that source again.
 PROVIDER_FRESH_SECONDS = 3 * 60 * 60
@@ -116,23 +116,18 @@ def _log(message: str, **fields) -> None:
     print(json.dumps({"message": message, **fields}, default=str), flush=True)
 
 
-def is_promising_task(exc: BaseException) -> bool:
-    """True when Pyodide's promise bridge is wedged, usually after a CPU kill."""
-    text = " ".join(str(part) for part in (exc, *getattr(exc, "args", ())))
-    return "promising task" in text.casefold()
-
-
-def raise_discard(exc: BaseException) -> None:
-    """Ask the Workers runtime to drop this isolate.
-
-    ``SystemExit`` is a ``BaseException``, so ``except Exception`` in the ASGI
-    adapter and in these handlers does not catch it. An uncaught ``SystemExit``
-    is a fatal script error; the runtime replaces the isolate instead of serving
-    the next request on a loop that can only raise
-    ``Cannot enter a promising task from inside another running promising task``.
-    """
-    _log("isolate broken", hint="promising task", **_exc_fields(exc))
-    raise SystemExit(1) from exc
+def _bundle_detail(name: str, sources: list | None, exc: BaseException | None = None) -> str:
+    bits = [name or ""]
+    for source in sources or []:
+        reason = " ".join(str(source.get("reason") or "").split())[:140]
+        bit = f"{source.get('platform')}={source.get('status')}"
+        if reason:
+            bit += f" ({reason})"
+        bits.append(bit)
+    if exc is not None:
+        bits.append(f"{type(exc).__name__}: {exc!r}")
+        bits.append(traceback.format_exc()[-900:])
+    return " | ".join(bit for bit in bits if bit)[:2000]
 
 
 def _exc_fields(exc: BaseException) -> dict:
@@ -207,9 +202,14 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
         skip_platforms=skip,
     )
     saved = await remember(db, row["name"], bundle, origin=row.get("origin") or "search", now=now, related_cap=related_cap)
-    statuses = [source.get("status") for source in bundle.get("sources") or []]
+    sources = bundle.get("sources") or []
+    statuses = [source.get("status") for source in sources]
     saved["ok"] = "error" not in statuses
     saved["name"] = row["name"]
+    saved["source_notes"] = [
+        {"platform": source.get("platform"), "status": source.get("status"), "reason": source.get("reason")}
+        for source in sources
+    ]
     return saved
 
 
@@ -511,9 +511,8 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                 related_cap=config["related_cap"],
             )
         except Exception as exc:
-            if is_promising_task(exc):
-                raise
-            _log("queue message failed", name=row.get("name"), **_exc_fields(exc))
+            detail = _bundle_detail(str(row.get("name") or ""), None, exc)
+            _log("queue message failed", name=row.get("name"), detail=detail, **_exc_fields(exc))
             try:
                 await record_consumer_run(
                     db,
@@ -524,7 +523,7 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                     snapshots=0,
                     edges=0,
                     discovered=0,
-                    detail=f"{row.get('name')}: {type(exc).__name__}: {exc!r}"[:500],
+                    detail=detail,
                 )
             except Exception as write_exc:
                 _log("crawl run write failed", **_exc_fields(write_exc))
@@ -533,17 +532,33 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
             continue
         snapshots += int(saved.get("snapshots") or 0)
         edges = int(saved.get("edges") or 0)
+        wrote = int(saved.get("snapshots") or 0) or int(saved.get("edges") or 0)
+        if saved.get("ok"):
+            run_status = "ok"
+        elif wrote:
+            run_status = "partial"
+        else:
+            run_status = "error"
+        detail = _bundle_detail(str(saved.get("name") or ""), saved.get("source_notes"))
+        _log(
+            "queue artist",
+            name=saved.get("name"),
+            status=run_status,
+            snapshots=saved.get("snapshots"),
+            edges=saved.get("edges"),
+            detail=detail,
+        )
         try:
             await record_consumer_run(
                 db,
                 now=moment,
-                status="ok" if saved.get("ok") else "error",
-                ok=1 if saved.get("ok") else 0,
-                error=0 if saved.get("ok") else 1,
+                status=run_status,
+                ok=1 if run_status == "ok" else 0,
+                error=0 if run_status == "ok" else 1,
                 snapshots=int(saved.get("snapshots") or 0),
                 edges=edges,
                 discovered=int(saved.get("discovered") or 0),
-                detail=row.get("name") or "",
+                detail=detail,
             )
         except Exception as write_exc:
             _log("crawl run write failed", **_exc_fields(write_exc))

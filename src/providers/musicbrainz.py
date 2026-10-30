@@ -213,7 +213,7 @@ def _mb_message(status: int | None, body: str) -> str:
     return f"MusicBrainz HTTP {status}."
 
 
-async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEUE):
+async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEUE, max_bytes: int | None = None):
     """Two attempts. A 429, 503, or transport failure waits a short jitter, then tries once more."""
     last_error = TransportError("MusicBrainz request failed: no response body")
     for attempt in range(2):
@@ -226,7 +226,7 @@ async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEU
                 params=params,
                 headers=HEADERS,
                 timeout=MB_TIMEOUT,
-                max_bytes=CATALOG_MAX_BYTES,
+                max_bytes=max_bytes,
             )
         except TransportError as exc:
             last_error = TransportError(_mb_message(None, str(exc)))
@@ -561,6 +561,7 @@ async def _catalog(http, mbid: str):
             f"{MB}/release-group",
             {"artist": mbid, "fmt": "json", "limit": CATALOG_LIMIT},
             MB_CATALOG_MAX_QUEUE,
+            max_bytes=CATALOG_MAX_BYTES,
         )
 
     async def releases():
@@ -575,6 +576,7 @@ async def _catalog(http, mbid: str):
                 "inc": "release-groups",
             },
             MB_CATALOG_MAX_QUEUE,
+            max_bytes=CATALOG_MAX_BYTES,
         )
 
     try:

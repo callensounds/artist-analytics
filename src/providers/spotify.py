@@ -40,9 +40,11 @@ LISTENERS_ROUNDED = re.compile(r"([\d.]+[KMB])\s+monthly listeners", re.I)
 PLAYS = re.compile(r"^[\d,]+$")
 # Open artist pages are large. Keep the head, where the visible shelf and listener text sit.
 PAGE_MAX_BYTES = 400_000
-# A crawl does not need the rest of a 400KB artist document. Tag-stripping that much
-# is what pushes a consumer past a few hundred milliseconds of CPU.
-CRAWL_PAGE_BYTES = 64_000
+# Exact "1,473,027 monthly listeners" and "Fans also like" sit well past the first 64KB
+# on a current artist page. Download far enough to reach them, then parse only a window.
+FETCH_BYTES = 260_000
+SHELF_WINDOW = 80_000
+CRAWL_PAGE_BYTES = SHELF_WINDOW
 CRAWL_EMBED_BYTES = 24_000
 
 
@@ -60,6 +62,35 @@ def visible_lines(page: str, limit: int | None = None) -> list[str]:
         if cleaned:
             lines.append(cleaned)
     return lines
+
+
+def listener_slices(page: str) -> str:
+    """Only the characters around each 'monthly listeners' phrase. The exact count is not in the head."""
+    if not page:
+        return ""
+    needle = "monthly listeners"
+    lowered = page.lower()
+    parts = []
+    start = 0
+    while len(parts) < 8:
+        at = lowered.find(needle, start)
+        if at < 0:
+            break
+        parts.append(page[max(0, at - 48) : at + len(needle) + 8])
+        start = at + len(needle)
+    return "\n".join(parts)
+
+
+def shelf_window(page: str) -> str:
+    """Discography HTML starting at the listener label, not the document head."""
+    if not page:
+        return ""
+    start = page.find("monthly-listeners-label")
+    if start < 0:
+        start = page.lower().find("monthly listeners")
+    if start < 0:
+        return page[:SHELF_WINDOW]
+    return page[max(0, start - 2000) : start + SHELF_WINDOW]
 
 
 def parse_monthly_listeners(page: str, lines: list[str] | None = None) -> tuple[str | None, bool]:
@@ -400,8 +431,7 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
             )
         except TransportError:
             oembed_result, oembed_payload = None, None
-        # Dashboard and crawl share this cap. A 400KB artist document was a ~2s CPU kill.
-        page_cap = CRAWL_PAGE_BYTES
+        page_cap = FETCH_BYTES
         embed_cap = CRAWL_EMBED_BYTES
         try:
             artist_page = await http.get_text(
@@ -435,8 +465,9 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
 
         oembed = parse_oembed(oembed_payload if oembed_result and oembed_result.ok else None)
         page_text = artist_page.text if artist_page.ok else ""
-        lines = visible_lines(page_text, limit=page_cap)
-        listeners, listeners_exact = parse_monthly_listeners(page_text[:page_cap], lines)
+        shelf = shelf_window(page_text)
+        lines = visible_lines(shelf)
+        listeners, listeners_exact = parse_monthly_listeners(listener_slices(page_text), lines)
         follower_count = parse_spotify_followers(lines)
         discography = parse_discography(lines)
         popular = parse_popular(lines)

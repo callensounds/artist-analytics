@@ -19,7 +19,9 @@ def script_json(html: str, script_id: str, *, max_chars: int | None = None):
     if raw is None:
         return None
     # A crawl must not json.loads a few hundred kilobytes of rehydration state.
-    if max_chars is not None and len(raw) > max_chars:
+    if max_chars is None:
+        max_chars = 48_000
+    if len(raw) > max_chars:
         return None
     try:
         return json.loads(raw)
@@ -112,7 +114,7 @@ def parse_video(html: str) -> dict | None:
 
 async def _get(http, url: str):
     try:
-        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=64_000)
+        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=400_000)
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
 
@@ -154,15 +156,17 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
         profile = None
         if profile_page.ok:
             page_text = profile_page.text or ""
-            raw = script_body(page_text, 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"') if light else None
-            if light and raw is not None and len(raw) > 48_000:
-                followers = _leading_int(raw[:48_000], "followerCount")
-                hearts = _leading_int(raw[:48_000], "heartCount")
+            # followerCount is near the end of a ~300KB script. A head slice misses it.
+            followers = _leading_int(page_text, "followerCount")
+            if followers is not None:
                 profile = {
                     "user": {"uniqueId": handle, "nickname": handle},
-                    "stats": {"followerCount": followers, "heartCount": hearts},
+                    "stats": {
+                        "followerCount": followers,
+                        "heartCount": _leading_int(page_text, "heartCount"),
+                    },
                 }
-            else:
+            elif len(page_text) <= 80_000:
                 profile = parse_profile(page_text)
         if profile is None:
             return unavailable(

@@ -40,6 +40,27 @@ def login_wall(result) -> bool:
     return False
 
 
+def embed_windows(page: str) -> str:
+    """Follower count and timestamps sit near 190KB. Parse those neighborhoods, not the head."""
+    if not page:
+        return ""
+    parts = []
+    follower = page.find("edge_followed_by")
+    if follower >= 0:
+        parts.append(page[max(0, follower - 400) : follower + 180])
+    token = 'taken_at_timestamp\\":'
+    start = 0
+    found = 0
+    while found < 6:
+        at = page.find(token, start)
+        if at < 0:
+            break
+        parts.append(page[max(0, at - 6000) : at + 2500])
+        start = at + len(token)
+        found += 1
+    return "\n".join(parts)
+
+
 def parse_embed(html: str, handle: str, *, light: bool = False) -> dict:
     """Pair each taken_at_timestamp with the nearest preceding shortcode."""
     posts = []
@@ -125,7 +146,7 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                 url,
                 timeout=15,
                 allow_redirects=False,
-                max_bytes=48_000,
+                max_bytes=300_000,
             )
         except TransportError as exc:
             return unavailable("instagram", "Instagram", str(exc))
@@ -147,7 +168,9 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                 "Instagram",
                 f"The public embed page returned HTTP {result.status}.",
             )
-        parsed = parse_embed((result.text or "")[:48_000], handle, light=True)
+        page = result.text or ""
+        windows = embed_windows(page)
+        parsed = parse_embed(windows or page[:48_000], handle, light=not windows)
         if parsed["private"] and not parsed["posts"]:
             return unavailable(
                 "instagram",

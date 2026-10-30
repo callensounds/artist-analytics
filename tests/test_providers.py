@@ -1021,39 +1021,50 @@ def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):
     assert seen_headers[0]["User-Agent"] == MB_USER_AGENT
 
 
-def test_fetch_path_parse_stays_inside_the_byte_cap(monkeypatch):
-    """Cold dashboards use the same caps as a crawl. Nothing past the cap is parsed."""
-    from providers.instagram import fetch_instagram
+def test_fetch_path_reads_markers_past_the_old_head_cap(monkeypatch):
+    """Data sits far past 48KB/64KB. Parsers use a window around the marker, not the head."""
+    from providers.instagram import embed_windows, parse_embed
     from providers.musicbrainz import CATALOG_LIMIT, CATALOG_MAX_BYTES, _catalog
-    from providers.spotify import CRAWL_EMBED_BYTES, CRAWL_PAGE_BYTES, fetch_spotify, visible_lines
-    from providers.tiktok import fetch_tiktok
+    from providers.spotify import FETCH_BYTES, SHELF_WINDOW, listener_slices, parse_monthly_listeners, parse_related_artists, shelf_window
+    from providers.tiktok import _leading_int
 
-    caps = []
+    pad = "x" * 70_000
+    spotify = (
+        pad
+        + '<meta property="og:description" content="Artist · 1.5M monthly listeners."/>'
+        + ("<div>noise</div>" * 4000)
+        + '<div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>'
+        + "<div>Album Title</div><div>Album • 2020</div>"
+        + "<h2>Fans also like</h2>"
+        + '<a href="/artist/3kzwYV3OCB010YfXMF0Avt"><span>Alvvays</span></a>'
+        + "<div>Appears On</div>"
+    )
+    assert spotify.find("1,473,027") > 64_000
+    listeners, exact = parse_monthly_listeners(listener_slices(spotify))
+    assert exact and listeners == "1,473,027"
+    assert len(listener_slices(spotify)) < 2000
+    assert len(shelf_window(spotify)) <= SHELF_WINDOW + 2000
+    related = parse_related_artists(spotify)
+    assert related and related[0]["name"] == "Alvvays"
+    assert FETCH_BYTES >= spotify.find("Fans also like")
 
-    class Http:
-        async def get_text(self, url, **kwargs):
-            caps.append(kwargs.get("max_bytes"))
-            return HttpResult(404, "", url, {})
+    instagram = pad + (
+        'shortcode\\":\\"abc123\\" text\\":\\"one month\\"'
+        ' taken_at_timestamp\\":1792416619'
+        ' username\\":\\"jbrekkie\\"'
+        ' edge_followed_by\\":{\\"count\\":574486}'
+    )
+    assert instagram.find("edge_followed_by") > 48_000
+    windows = embed_windows(instagram)
+    assert len(windows) < 20_000
+    parsed = parse_embed(windows, "jbrekkie")
+    assert parsed["followers"] == 574486
+    assert parsed["posts"]
 
-        async def get_json(self, url, **kwargs):
-            caps.append(kwargs.get("max_bytes"))
-            return HttpResult(404, "", url, {}), None
-
-    http = Http()
-    cache = MemoryCache({})
-    asyncio.run(fetch_spotify("Example", {"spotify_id": "abc"}, None, http, cache))
-    asyncio.run(fetch_instagram("Example", {"instagram": "example"}, http, cache))
-    asyncio.run(fetch_tiktok("Example", {"tiktok": "example"}, http, cache))
-    text_caps = [cap for cap in caps if cap is not None]
-    assert text_caps
-    assert max(text_caps) <= CRAWL_PAGE_BYTES
-
-    page = ("<span>keep</span>\n" * 5000) + "TAIL_MARKER"
-    assert len(page) > CRAWL_PAGE_BYTES
-    parsed = "\n".join(visible_lines(page, limit=CRAWL_PAGE_BYTES))
-    assert "TAIL_MARKER" not in parsed
-    assert len(parsed) <= CRAWL_PAGE_BYTES + 64
-    assert CRAWL_EMBED_BYTES <= CRAWL_PAGE_BYTES
+    tiktok = pad + '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{"stats":{"followerCount":88000,"heartCount":929200}}</script>'
+    assert tiktok.find("followerCount") > 64_000
+    assert _leading_int(tiktok, "followerCount") == 88000
+    assert _leading_int(tiktok, "heartCount") == 929200
 
     catalog_calls = []
 
