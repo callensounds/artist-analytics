@@ -40,10 +40,18 @@ LISTENERS_ROUNDED = re.compile(r"([\d.]+[KMB])\s+monthly listeners", re.I)
 PLAYS = re.compile(r"^[\d,]+$")
 # Open artist pages are large. Keep the head, where the visible shelf and listener text sit.
 PAGE_MAX_BYTES = 400_000
+# A crawl does not need the rest of a 400KB artist document. Tag-stripping that much
+# is what pushes a consumer past a few hundred milliseconds of CPU.
+CRAWL_PAGE_BYTES = 64_000
+CRAWL_EMBED_BYTES = 24_000
 
 
-def visible_lines(page: str) -> list[str]:
-    text = drop_blocks(page or "", "<script", "</script>")
+def visible_lines(page: str, limit: int | None = None) -> list[str]:
+    text = page or ""
+    if limit is not None and len(text) > limit:
+        # Crawl only needs the head of the page. The dashboard still passes the whole body.
+        text = text[:limit]
+    text = drop_blocks(text, "<script", "</script>")
     text = drop_blocks(text, "<style", "</style>")
     text = strip_tags(text)
     lines = []
@@ -390,12 +398,15 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
             )
         except TransportError:
             oembed_result, oembed_payload = None, None
+        light = bool(getattr(http, "crawl_light", False))
+        page_cap = CRAWL_PAGE_BYTES if light else PAGE_MAX_BYTES
+        embed_cap = CRAWL_EMBED_BYTES if light else PAGE_MAX_BYTES
         try:
             artist_page = await http.get_text(
                 artist_url,
                 timeout=15,
                 allow_redirects=False,
-                max_bytes=PAGE_MAX_BYTES,
+                max_bytes=page_cap,
             )
         except TransportError as exc:
             return unavailable("spotify", "Spotify", str(exc))
@@ -404,7 +415,7 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
                 embed_url,
                 timeout=12,
                 allow_redirects=False,
-                max_bytes=PAGE_MAX_BYTES,
+                max_bytes=embed_cap,
             )
         except TransportError:
             embed_page = None
@@ -422,8 +433,8 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
 
         oembed = parse_oembed(oembed_payload if oembed_result and oembed_result.ok else None)
         page_text = artist_page.text if artist_page.ok else ""
-        lines = visible_lines(page_text)
-        listeners, listeners_exact = parse_monthly_listeners(page_text, lines)
+        lines = visible_lines(page_text, limit=CRAWL_PAGE_BYTES if light else None)
+        listeners, listeners_exact = parse_monthly_listeners(page_text[:page_cap], lines)
         follower_count = parse_spotify_followers(lines)
         discography = parse_discography(lines)
         popular = parse_popular(lines)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import traceback
 from datetime import datetime, timedelta, timezone
 
 from analytics import normalize_name
@@ -19,6 +20,11 @@ DEFAULT_STALE_SECONDS = 6 * 60 * 60
 SCAN_WINDOW = 50
 # Queue send on a dashboard request. Failures and slow bindings are ignored.
 ENQUEUE_TIMEOUT_S = 0.15
+# Keep a retried message off this isolate until the shared CPU budget can recover.
+RETRY_DELAY_SECONDS = 60
+# Skip a provider whose audience snapshot is newer than this. A retry after a
+# CPU kill then does not parse that source again.
+PROVIDER_FRESH_SECONDS = 3 * 60 * 60
 
 
 def settings(env) -> dict:
@@ -110,6 +116,15 @@ def _log(message: str, **fields) -> None:
     print(json.dumps({"message": message, **fields}, default=str), flush=True)
 
 
+def _exc_fields(exc: BaseException) -> dict:
+    """JS rejections often stringify as '#<Object>'. Keep the traceback and repr."""
+    return {
+        "error": type(exc).__name__,
+        "repr": repr(exc)[:500],
+        "trace": traceback.format_exc()[-1800:],
+    }
+
+
 def handler_env(owner, passed):
     """Entrypoint env when it has bindings, otherwise the env argument.
 
@@ -131,9 +146,38 @@ def handler_env(owner, passed):
     return own if own is not None else passed
 
 
+async def fresh_sources(db, artist_id: int, now: datetime, seconds: int = PROVIDER_FRESH_SECONDS) -> set[str]:
+    rows = await db.query(
+        """
+        SELECT source, MAX(captured_at) AS captured_at
+        FROM metric_snapshots
+        WHERE artist_id = ?
+        GROUP BY source
+        """,
+        (artist_id,),
+    )
+    fresh = set()
+    for row in rows:
+        captured = parse_utc(row.get("captured_at"))
+        if captured is not None and now - captured < timedelta(seconds=seconds):
+            fresh.add(str(row.get("source") or ""))
+    fresh.discard("")
+    return fresh
+
+
 async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datetime, related_cap: int) -> dict:
     # A fresh client per artist so one crawl cannot spend another's byte budget.
     client = http if http is not None else HttpClient()
+    try:
+        client.crawl_light = True
+    except Exception:
+        pass
+    skip: set[str] = set()
+    if row.get("id") is not None:
+        try:
+            skip = await fresh_sources(db, int(row["id"]), now)
+        except Exception:
+            skip = set()
     bundle = await collect(
         row["name"],
         env=env,
@@ -141,6 +185,7 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
         cache=cache,
         known_links=known_links(row),
         include_related=True,
+        skip_platforms=skip,
     )
     saved = await remember(db, row["name"], bundle, origin=row.get("origin") or "search", now=now, related_cap=related_cap)
     statuses = [source.get("status") for source in bundle.get("sources") or []]
@@ -337,13 +382,59 @@ async def _ensure_named_artist(db, name: str, origin: str, now: datetime) -> dic
     return await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalized,))
 
 
-async def _finish_message(message, method: str) -> None:
+async def _finish_message(message, method: str, *, delay_seconds: int | None = None) -> None:
     fn = getattr(message, method, None)
     if fn is None:
         return
-    result = fn()
+    try:
+        if method == "retry" and delay_seconds:
+            try:
+                result = fn({"delaySeconds": int(delay_seconds)})
+            except TypeError:
+                result = fn()
+        else:
+            result = fn()
+    except Exception as exc:
+        _log("queue settle failed", method=method, **_exc_fields(exc))
+        return
     if hasattr(result, "__await__"):
-        await result
+        try:
+            await result
+        except Exception as exc:
+            _log("queue settle failed", method=method, **_exc_fields(exc))
+
+
+async def record_consumer_run(
+    db,
+    *,
+    now: datetime,
+    status: str,
+    ok: int,
+    error: int,
+    snapshots: int,
+    edges: int,
+    discovered: int,
+    detail: str,
+) -> None:
+    await db.execute(
+        """
+        INSERT INTO crawl_runs (
+            started_at, finished_at, status, artists_attempted, artists_ok, artists_error,
+            snapshots_written, edges_written, discovered, detail
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(now),
+            utc_now(now),
+            status,
+            ok,
+            error,
+            snapshots,
+            edges,
+            discovered,
+            (detail or "")[:2000],
+        ),
+    )
 
 
 async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) -> dict:
@@ -351,7 +442,7 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
     # in this invocation. The rest go back on the queue instead of stacking subrequests.
     incoming = list(getattr(batch, "messages", None) or [])
     for extra in incoming[1:]:
-        await _finish_message(extra, "retry")
+        await _finish_message(extra, "retry", delay_seconds=RETRY_DELAY_SECONDS)
     messages = incoming[:1]
     extra_retries = max(0, len(incoming) - 1)
     if collect is None:
@@ -359,7 +450,7 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
     db = await open_database(env)
     if db is None:
         for message in messages:
-            await _finish_message(message, "retry")
+            await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
         return {
             "messages": len(incoming),
             "acked": 0,
@@ -400,11 +491,41 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                 now=moment,
                 related_cap=config["related_cap"],
             )
-        except Exception:
-            await _finish_message(message, "retry")
+        except Exception as exc:
+            _log("queue message failed", name=row.get("name"), **_exc_fields(exc))
+            try:
+                await record_consumer_run(
+                    db,
+                    now=moment,
+                    status="error",
+                    ok=0,
+                    error=1,
+                    snapshots=0,
+                    edges=0,
+                    discovered=0,
+                    detail=f"{row.get('name')}: {type(exc).__name__}: {exc!r}"[:500],
+                )
+            except Exception as write_exc:
+                _log("crawl run write failed", **_exc_fields(write_exc))
+            await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
             retried += 1
             continue
         snapshots += int(saved.get("snapshots") or 0)
+        edges = int(saved.get("edges") or 0)
+        try:
+            await record_consumer_run(
+                db,
+                now=moment,
+                status="ok" if saved.get("ok") else "error",
+                ok=1 if saved.get("ok") else 0,
+                error=0 if saved.get("ok") else 1,
+                snapshots=int(saved.get("snapshots") or 0),
+                edges=edges,
+                discovered=int(saved.get("discovered") or 0),
+                detail=row.get("name") or "",
+            )
+        except Exception as write_exc:
+            _log("crawl run write failed", **_exc_fields(write_exc))
         await _finish_message(message, "ack")
         acked += 1
     return {

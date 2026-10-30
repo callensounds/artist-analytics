@@ -40,7 +40,7 @@ def login_wall(result) -> bool:
     return False
 
 
-def parse_embed(html: str, handle: str) -> dict:
+def parse_embed(html: str, handle: str, *, light: bool = False) -> dict:
     """Pair each taken_at_timestamp with the nearest preceding shortcode."""
     posts = []
     seen = set()
@@ -48,7 +48,10 @@ def parse_embed(html: str, handle: str) -> dict:
     full_name = None
     private = False
     page = html or ""
+    post_cap = 4 if light else 12
     for stamp in TIMESTAMP_RE.finditer(page):
+        if len(posts) >= post_cap:
+            break
         before = page[max(0, stamp.start() - 8000) : stamp.start()]
         after = page[stamp.end() : stamp.end() + 2500]
         shortcodes = list(SHORTCODE_RE.finditer(before))
@@ -63,9 +66,14 @@ def parse_embed(html: str, handle: str) -> dict:
         seen.add(shortcode)
         if 'is_private\\":true' in after:
             private = True
-        captions = list(CAPTION_RE.finditer(before))
-        caption = decode_js(captions[-1].group(1)) if captions else shortcode
-        likes = list(LIKES_RE.finditer(before))
+        # Caption and like scans walk the same window again. A crawl only needs the time and the follower count.
+        if light:
+            caption = shortcode
+            likes = []
+        else:
+            captions = list(CAPTION_RE.finditer(before))
+            caption = decode_js(captions[-1].group(1)) if captions else shortcode
+            likes = list(LIKES_RE.finditer(before))
         follower_match = FOLLOWERS_RE.search(after) or FOLLOWERS_RE.search(before)
         name_match = FULL_NAME_RE.search(after) or FULL_NAME_RE.search(before)
         if follower_match and followers is None:
@@ -113,7 +121,13 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
     async def produce() -> SourceResult:
         url = f"https://www.instagram.com/{handle}/embed/"
         try:
-            result = await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=300_000)
+            light = bool(getattr(http, "crawl_light", False))
+            result = await http.get_text(
+                url,
+                timeout=15,
+                allow_redirects=False,
+                max_bytes=48_000 if light else 300_000,
+            )
         except TransportError as exc:
             return unavailable("instagram", "Instagram", str(exc))
         if login_wall(result):
@@ -134,7 +148,7 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                 "Instagram",
                 f"The public embed page returned HTTP {result.status}.",
             )
-        parsed = parse_embed(result.text, handle)
+        parsed = parse_embed(result.text, handle, light=light)
         if parsed["private"] and not parsed["posts"]:
             return unavailable(
                 "instagram",

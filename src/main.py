@@ -6,7 +6,18 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from crawl import enqueue_search, handler_env, open_database, run_queue_batch, run_scheduled, status_report, _log
+from crawl import (
+    RETRY_DELAY_SECONDS,
+    _exc_fields,
+    _finish_message,
+    _log,
+    enqueue_search,
+    handler_env,
+    open_database,
+    run_queue_batch,
+    run_scheduled,
+    status_report,
+)
 from diag import diagnose
 from history import empty_history, load_growth
 from http_client import HttpClient
@@ -323,12 +334,18 @@ class Default(_Entrypoint):
 
     async def queue(self, batch=None, env=None, ctx=None):
         resolved = handler_env(self, env)
-        _log("queue start", messages=len(list(getattr(batch, "messages", None) or [])))
+        messages = list(getattr(batch, "messages", None) or [])
+        _log("queue start", messages=len(messages))
         try:
             result = await run_queue_batch(batch, resolved)
         except Exception as exc:
-            _log("queue error", error=exc.__class__.__name__)
-            raise
+            # A thrown handler becomes an 'exception' outcome and, after a CPU kill,
+            # the next isolates often only have '#<Object>' and no Python traceback.
+            # Retry the message with a delay and return normally.
+            _log("queue error", **_exc_fields(exc))
+            for message in messages:
+                await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
+            result = {"messages": len(messages), "acked": 0, "retried": len(messages), "snapshots": 0}
         _log(
             "queue end",
             messages=result.get("messages", 0),

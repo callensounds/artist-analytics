@@ -166,29 +166,31 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
     musicbrainz_failed = any(
         source.get("platform") == "musicbrainz" and source.get("status") == "error" for source in sources
     )
-    await db.execute(
-        """
-        UPDATE artists SET
-            musicbrainz_id = COALESCE(?, musicbrainz_id),
-            spotify_id = COALESCE(?, spotify_id),
-            apple_id = COALESCE(?, apple_id),
-            youtube_channel_id = COALESCE(?, youtube_channel_id),
-            instagram_handle = COALESCE(?, instagram_handle),
-            tiktok_handle = COALESCE(?, tiktok_handle),
-            last_crawled_at = COALESCE(?, last_crawled_at)
-        WHERE id = ?
-        """,
+    statements = [
         (
-            _mbid(bundle),
-            _blank(links.get("spotify_id")),
-            _blank(links.get("apple_id")),
-            _blank(channel_ids[0] if channel_ids else None),
-            _blank(links.get("instagram")),
-            _blank(links.get("tiktok")),
-            None if musicbrainz_failed else stamp,
-            artist_id,
-        ),
-    )
+            """
+            UPDATE artists SET
+                musicbrainz_id = COALESCE(?, musicbrainz_id),
+                spotify_id = COALESCE(?, spotify_id),
+                apple_id = COALESCE(?, apple_id),
+                youtube_channel_id = COALESCE(?, youtube_channel_id),
+                instagram_handle = COALESCE(?, instagram_handle),
+                tiktok_handle = COALESCE(?, tiktok_handle),
+                last_crawled_at = COALESCE(?, last_crawled_at)
+            WHERE id = ?
+            """,
+            (
+                _mbid(bundle),
+                _blank(links.get("spotify_id")),
+                _blank(links.get("apple_id")),
+                _blank(channel_ids[0] if channel_ids else None),
+                _blank(links.get("instagram")),
+                _blank(links.get("tiktok")),
+                None if musicbrainz_failed else stamp,
+                artist_id,
+            ),
+        )
+    ]
     snapshots = 0
     snapshot_rows = []
     sighting_rows = []
@@ -232,12 +234,14 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
                 )
             )
             taken += 1
-    await db.batch(
+    statements.extend(
         _value_statements(
             "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)",
             snapshot_rows,
         )
-        + _value_statements(
+    )
+    statements.extend(
+        _value_statements(
             """
             INSERT OR IGNORE INTO content_sightings
                 (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
@@ -245,7 +249,10 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
             sighting_rows,
         )
     )
-    edges, discovered = await _store_related(db, artist_id, bundle, stamp, related_cap)
+    related_sql, edges, discovered = await _store_related(db, artist_id, bundle, stamp, related_cap)
+    statements.extend(related_sql)
+    # One round trip for every write after the artist row exists.
+    await db.batch(statements)
     return {
         "artist_id": artist_id,
         "snapshots": snapshots,
@@ -254,7 +261,7 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
     }
 
 
-async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_cap: int) -> tuple[int, int]:
+async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_cap: int) -> tuple[list[tuple[str, tuple]], int, int]:
     related = []
     for source in bundle.get("sources") or []:
         if source.get("platform") == "spotify":
@@ -268,30 +275,28 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
             continue
         rank = int(item.get("rank") or len(edge_rows) + 1)
         edge_rows.append((artist_id, spotify_id, to_name[:120], "spotify", rank, stamp, stamp))
-    await db.batch(
-        _value_statements(
-            """
-            INSERT INTO related_edges
-                (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
-            """.strip(),
-            edge_rows,
-            """
-            ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
-                to_name = excluded.to_name,
-                rank = excluded.rank,
-                last_seen_at = excluded.last_seen_at
-            """.strip(),
-        )
+    statements = _value_statements(
+        """
+        INSERT INTO related_edges
+            (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
+        """.strip(),
+        edge_rows,
+        """
+        ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
+            to_name = excluded.to_name,
+            rank = excluded.rank,
+            last_seen_at = excluded.last_seen_at
+        """.strip(),
     )
     written = len(edge_rows)
     discovered = 0
     if related_cap <= 0 or not edge_rows:
-        return written, discovered
+        return statements, written, discovered
     row = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
     before = int((row or {}).get("n") or 0)
     room = related_cap - before
     if room <= 0:
-        return written, discovered
+        return statements, written, discovered
     self_spotify = _blank(_links(bundle).get("spotify_id"))
     candidates = []
     for item in related:
@@ -303,7 +308,7 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
             continue
         candidates.append((spotify_id, to_name[:120], normalize_name(to_name)))
     if not candidates:
-        return written, discovered
+        return statements, written, discovered
     marks = ",".join("?" for _ in candidates)
     existing_rows = await db.query(
         f"""
@@ -331,41 +336,44 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
         new_rows.append((to_name, normalized, spotify_id, "related", 1, stamp))
         room -= 1
     if new_rows:
-        await db.batch(
+        statements.extend(
             _value_statements(
                 "INSERT INTO artists (name, normalized_name, spotify_id, origin, tracked, created_at)",
                 new_rows,
                 "ON CONFLICT(normalized_name) DO NOTHING",
             )
         )
-        created = await db.query(
-            f"""
-            SELECT id, spotify_id FROM artists
-            WHERE normalized_name IN ({",".join("?" for _ in new_rows)})
-            """,
-            tuple(item[1] for item in new_rows),
-        )
-        created_ids = {item["spotify_id"]: int(item["id"]) for item in created if item.get("spotify_id")}
-        for _, _, spotify_id, _, _, _ in new_rows:
-            created_id = created_ids.get(spotify_id)
-            if created_id is not None:
-                link_updates.append((created_id, artist_id, spotify_id))
-        after = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
-        discovered = max(0, int((after or {}).get("n") or 0) - before)
+        discovered = len(new_rows)
+        for to_name, normalized, spotify_id, _, _, _ in new_rows:
+            link_updates.append((normalized, spotify_id, artist_id, spotify_id))
     if link_updates:
-        await db.batch(
-            [
-                (
-                    """
-                    UPDATE related_edges SET to_artist_id = ?
-                    WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
-                    """,
-                    params,
+        for params in link_updates:
+            if len(params) == 3:
+                statements.append(
+                    (
+                        """
+                        UPDATE related_edges SET to_artist_id = ?
+                        WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
+                        """,
+                        params,
+                    )
                 )
-                for params in link_updates
-            ]
-        )
-    return written, discovered
+            else:
+                # Runs after the insert in this same batch, so the new row is visible.
+                statements.append(
+                    (
+                        """
+                        UPDATE related_edges SET to_artist_id = (
+                            SELECT id FROM artists
+                            WHERE normalized_name = ? OR spotify_id = ?
+                            LIMIT 1
+                        )
+                        WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
+                        """,
+                        params,
+                    )
+                )
+    return statements, written, discovered
 
 
 async def load_growth(db, name: str) -> dict:

@@ -7,7 +7,7 @@ import asyncio
 from analytics import build_insights, build_patterns
 from cache import cache_from_env
 from http_client import HttpClient
-from models import errored
+from models import SourceResult, errored
 from providers.apple import fetch_apple
 from providers.instagram import fetch_instagram
 from providers.musicbrainz import MB_OPEN_TIMEOUT, open_musicbrainz, timed_out
@@ -78,6 +78,20 @@ async def _finish_catalog(rest, partial, deadline: float | None = None):
         return partial
 
 
+def _skipped(platform: str, label: str) -> SourceResult:
+    return SourceResult(
+        platform=platform,
+        label=label,
+        status="ok",
+        notices=["Skipped; a snapshot from the last few hours is already stored."],
+        cacheable=False,
+    )
+
+
+async def _passthrough(value):
+    return value
+
+
 async def collect_artist(
     name: str,
     env=None,
@@ -86,20 +100,30 @@ async def collect_artist(
     known_links=None,
     deadline_s: float = DASHBOARD_DEADLINE,
     include_related: bool = False,
+    skip_platforms=None,
 ) -> dict:
     deadline = asyncio.get_running_loop().time() + deadline_s
     client = http or HttpClient(deadline=deadline - RENDER_MARGIN)
     store = cache or cache_from_env(env)
+    skipped = {platform for platform in (skip_platforms or set()) if platform}
+    light = bool(getattr(client, "crawl_light", False))
     # Identity (search + URL relations) has to finish first. The catalog does not.
-    try:
-        opened = await asyncio.wait_for(open_musicbrainz(name, client, store), _budget(deadline, MB_OPEN_TIMEOUT))
-    except asyncio.TimeoutError:
-        opened = (await timed_out(name, store), None)
-    except Exception:
-        opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
-    if not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
-        opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
-    partial, rest = opened
+    if "musicbrainz" in skipped:
+        partial, rest = _skipped("musicbrainz", "MusicBrainz"), None
+    else:
+        try:
+            opened = await asyncio.wait_for(open_musicbrainz(name, client, store), _budget(deadline, MB_OPEN_TIMEOUT))
+        except asyncio.TimeoutError:
+            opened = (await timed_out(name, store), None)
+        except Exception:
+            opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
+        if not isinstance(opened, tuple) or len(opened) != 2 or opened[0] is None:
+            opened = (errored("musicbrainz", "MusicBrainz", "MusicBrainz failed before returning a result."), None)
+        partial, rest = opened
+        # The release catalog is a large JSON parse. Audience snapshots do not need it.
+        if light and rest is not None:
+            rest.close()
+            rest = None
     links = dict(partial.links or {})
     # Ids already stored for this artist fill gaps. They are not guessed.
     for key, value in (known_links or {}).items():
@@ -110,18 +134,19 @@ async def collect_artist(
     if partial.status != "ok" and not _has_saved_links(links):
         links["_incomplete"] = True
 
+    async def _run(platform: str, label: str, coro):
+        if platform in skipped:
+            coro.close()
+            return _skipped(platform, label)
+        return await _bounded(coro, platform, label, deadline)
+
     musicbrainz, apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
-        _finish_catalog(rest, partial, deadline),
-        _bounded(fetch_apple(name, links, client, store), "apple", "Apple Music", deadline),
-        _bounded(
-            fetch_spotify(name, links, env, client, store, include_related=include_related),
-            "spotify",
-            "Spotify",
-            deadline,
-        ),
-        _bounded(fetch_youtube(name, links, env, client, store), "youtube", "YouTube", deadline),
-        _bounded(fetch_instagram(name, links, client, store), "instagram", "Instagram", deadline),
-        _bounded(fetch_tiktok(name, links, client, store), "tiktok", "TikTok", deadline),
+        _passthrough(partial) if "musicbrainz" in skipped else _finish_catalog(rest, partial, deadline),
+        _run("apple", "Apple Music", fetch_apple(name, links, client, store)),
+        _run("spotify", "Spotify", fetch_spotify(name, links, env, client, store, include_related=include_related)),
+        _run("youtube", "YouTube", fetch_youtube(name, links, env, client, store)),
+        _run("instagram", "Instagram", fetch_instagram(name, links, client, store)),
+        _run("tiktok", "TikTok", fetch_tiktok(name, links, client, store)),
         return_exceptions=True,
     )
     if isinstance(musicbrainz, BaseException) or musicbrainz is None:
