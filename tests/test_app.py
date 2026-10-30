@@ -72,6 +72,8 @@ def test_templates_and_migrations_live_beside_the_worker():
     assert '"max_batch_size": 1' in wrangler
     assert '"max_concurrency": 1' in wrangler
     assert '"max_retries": 3' in wrangler
+    assert '"retry_delay": 60' in wrangler
+    assert '"dead_letter_queue": "artist-analytics-crawl-dlq"' in wrangler
     assert '"crons": ["*/15 * * * *"]' in wrangler
     for name in ("base.html", "index.html", "login.html", "register.html", "dashboard.html"):
         assert (template_dir / name).is_file()

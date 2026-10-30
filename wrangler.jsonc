@@ -42,7 +42,12 @@
         "queue": "artist-analytics-crawl",
         "max_batch_size": 1,
         "max_concurrency": 1,
-        "max_retries": 3
+        "max_retries": 3,
+        // Wait a minute before a retry so a CPU kill does not immediately reuse the isolate.
+        "retry_delay": 60,
+        // Created on deploy if it does not already exist. Messages that exhaust
+        // max_retries land here instead of being deleted. Not consumed by this Worker.
+        "dead_letter_queue": "artist-analytics-crawl-dlq"
       }
     ]
   },

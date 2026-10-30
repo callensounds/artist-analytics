@@ -14,9 +14,12 @@ MAX_VIDEOS = 6
 PAGE_MAX_BYTES = 400_000
 
 
-def script_json(html: str, script_id: str):
+def script_json(html: str, script_id: str, *, max_chars: int | None = None):
     raw = script_body(html or "", f'id="{script_id}"')
     if raw is None:
+        return None
+    # A crawl must not json.loads a few hundred kilobytes of rehydration state.
+    if max_chars is not None and len(raw) > max_chars:
         return None
     try:
         return json.loads(raw)
@@ -29,6 +32,21 @@ def login_wall(result) -> bool:
         location = result.header("location").lower()
         return any(token in location for token in ("/login", "captcha", "challenge"))
     return False
+
+
+def _leading_int(text: str, key: str) -> int | None:
+    token = f'"{key}":'
+    at = (text or "").find(token)
+    if at < 0:
+        return None
+    start = at + len(token)
+    end = start
+    limit = min(len(text), start + 16)
+    while end < limit and text[end].isdigit():
+        end += 1
+    if end == start:
+        return None
+    return int(text[start:end])
 
 
 def parse_profile(html: str) -> dict | None:
@@ -93,8 +111,9 @@ def parse_video(html: str) -> dict | None:
 
 
 async def _get(http, url: str):
+    cap = 64_000 if getattr(http, "crawl_light", False) else PAGE_MAX_BYTES
     try:
-        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=PAGE_MAX_BYTES)
+        return await http.get_text(url, timeout=15, allow_redirects=False, max_bytes=cap)
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
 
@@ -132,7 +151,20 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
             )
         if profile_page.status in {403, 429}:
             return unavailable("tiktok", "TikTok", f"TikTok blocked the profile request (HTTP {profile_page.status}).")
-        profile = parse_profile(profile_page.text) if profile_page.ok else None
+        light = bool(getattr(http, "crawl_light", False))
+        profile = None
+        if profile_page.ok:
+            page_text = profile_page.text or ""
+            raw = script_body(page_text, 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"') if light else None
+            if light and raw is not None and len(raw) > 48_000:
+                followers = _leading_int(raw[:48_000], "followerCount")
+                hearts = _leading_int(raw[:48_000], "heartCount")
+                profile = {
+                    "user": {"uniqueId": handle, "nickname": handle},
+                    "stats": {"followerCount": followers, "heartCount": hearts},
+                }
+            else:
+                profile = parse_profile(page_text)
         if profile is None:
             return unavailable(
                 "tiktok",
@@ -196,7 +228,8 @@ async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
             )
 
         items = []
-        if videos:
+        # Video pages are another full JSON document each. Audience counts do not need them on a crawl.
+        if videos and not light:
             results = await asyncio.gather(*(load_video(video) for video in videos), return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception) or result is None:

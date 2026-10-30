@@ -142,7 +142,7 @@ def test_batch_skips_a_fresh_artist_and_queue_acks(monkeypatch, tmp_path):
     )
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         seen.append((name, known_links))
         return _bundle(listeners=50, related=[])
 
@@ -181,8 +181,9 @@ def test_batch_skips_a_fresh_artist_and_queue_acks(monkeypatch, tmp_path):
         def ack(self):
             self.acked = True
 
-        def retry(self):
+        def retry(self, options=None, **kwargs):
             self.retried = True
+            self.delay = (options or {}).get("delaySeconds") if isinstance(options, dict) else kwargs.get("delaySeconds")
 
     message = Message({"artist_id": 1})
     missing = Message({"artist_id": 99})
@@ -228,8 +229,9 @@ class _Message:
     def ack(self):
         self.acked = True
 
-    def retry(self):
+    def retry(self, options=None, **kwargs):
         self.retried = True
+        self.delay = (options or {}).get("delaySeconds") if isinstance(options, dict) else kwargs.get("delaySeconds")
 
 
 class _Queue:
@@ -311,7 +313,7 @@ def test_queue_send_failure_crawls_one_artist_in_process(monkeypatch, tmp_path):
     _insert_stale(database, "Second Act", "secondact", now)
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         seen.append(name)
         return _bundle(listeners=7, related=[])
 
@@ -348,7 +350,7 @@ def test_queue_consumer_refreshes_one_message_and_retries_the_rest(monkeypatch, 
     _insert_stale(database, "Later Act", "lateract", now)
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         seen.append(name)
         return _bundle(listeners=50, related=[])
 
@@ -382,7 +384,7 @@ def test_d1_binding_stores_exact_integers_asynchronously(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", fail_thread)
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         assert known_links == {"spotify_id": "sp-stale"}
         assert include_related is True
         return _bundle(listeners=50, related=[])
@@ -471,7 +473,7 @@ def test_admin_requires_login_and_dashboard_shows_stored_growth(monkeypatch, tmp
     # The crawler stored this. The dashboard request only reads it.
     asyncio.run(remember(database, "Example", _bundle(), related_cap=10))
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         return _bundle()
 
     monkeypatch.setattr(main, "collect_artist", fake_collect)
@@ -512,7 +514,7 @@ def test_queue_name_message_crawls_once_then_skips_a_fresh_repeat(monkeypatch, t
     reset_pool()
     seen = []
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         assert include_related is True
         seen.append(name)
         return _bundle(listeners=9, related=[])
@@ -561,8 +563,8 @@ def test_remember_uses_d1_batch_for_writes():
     assert saved["snapshots"] == 1
     assert saved["discovered"] == 1
     assert rows[0]["value"] == 1000
-    assert binding.batch_sizes
-    assert sum(binding.batch_sizes) >= 1
+    assert len(binding.batch_sizes) == 1
+    assert binding.batch_sizes[0] >= 1
 
 
 def test_dashboard_route_performs_no_d1_writes(monkeypatch):
@@ -592,7 +594,7 @@ def test_dashboard_route_performs_no_d1_writes(monkeypatch):
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
     reset_pool()
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         assert include_related is False
         return _bundle()
 
@@ -661,7 +663,7 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     reset_pool()
     now = datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False):
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
         assert include_related is True
         return _bundle(listeners=42, related=[])
 
@@ -710,4 +712,123 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     assert "scheduled end" in logs
     assert "queue start" in logs
     assert "queue end" in logs
+    reset_pool()
+
+
+def test_queue_failure_retries_with_delay_and_records_the_run(monkeypatch, capsys):
+    import crawl
+    import db
+
+    binding = _D1()
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+            self.CRAWL_QUEUE = _Queue()
+
+    env = Env()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    reset_pool()
+    now = datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+
+    async def explode(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+        raise RuntimeError("parse blew up")
+
+    monkeypatch.setattr(crawl, "collect_artist", explode)
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Broken Act', 'brokenact', 'search', 1, ?)
+            """,
+            (utc_now(now),),
+        )
+        worker = main.Default(object(), env)
+        message = _Message({"artist_id": 1})
+        result = await main.Default.queue(worker, Batch([message]), env, object())
+        runs = await database.query(
+            "SELECT status, artists_ok, artists_error, snapshots_written, edges_written FROM crawl_runs"
+        )
+        return result, message, runs
+
+    result, message, runs = asyncio.run(run())
+    assert result["retried"] == 1
+    assert result["acked"] == 0
+    assert message.retried and not message.acked
+    assert message.delay == 60
+    assert runs[0]["status"] == "error"
+    assert runs[0]["artists_error"] == 1
+    assert runs[0]["artists_ok"] == 0
+    logs = capsys.readouterr().out
+    assert "queue message failed" in logs
+    assert "RuntimeError" in logs
+    assert "parse blew up" in logs
+    assert "Traceback" in logs
+    reset_pool()
+
+
+def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monkeypatch):
+    import crawl
+    import db
+
+    binding = _D1()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+    reset_pool()
+    now = datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+    seen = []
+
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+        seen.append(set(skip_platforms or []))
+        return _bundle(listeners=11, related=[])
+
+    monkeypatch.setattr(crawl, "collect_artist", fake_collect)
+
+    class Batch:
+        def __init__(self, messages):
+            self.messages = messages
+
+    class Env:
+        def __init__(self):
+            self.DB = binding
+
+    async def run():
+        database = db.D1Database(binding)
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Fresh Source', 'freshsource', 'search', 1, ?)
+            """,
+            (utc_now(now),),
+        )
+        await database.execute(
+            """
+            INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+            VALUES (1, 'spotify', 'Monthly listeners', 10, '10', ?)
+            """,
+            (utc_now(datetime.now(timezone.utc)),),
+        )
+        message = _Message({"artist_id": 1})
+        await run_queue_batch(Batch([message]), {"DB": binding}, cache=MemoryCache({}))
+        runs = await database.query(
+            """
+            SELECT status, artists_ok, artists_error, snapshots_written, edges_written
+            FROM crawl_runs
+            """
+        )
+        return message, runs
+
+    message, runs = asyncio.run(run())
+    assert seen == [{"spotify"}]
+    assert message.acked and not message.retried
+    assert runs[0]["status"] == "ok"
+    assert runs[0]["artists_ok"] == 1
+    assert runs[0]["snapshots_written"] >= 1
     reset_pool()
