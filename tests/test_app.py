@@ -69,13 +69,20 @@ def test_templates_and_migrations_live_beside_the_worker():
     assert '"migrations_dir": "src/migrations"' in wrangler
     assert '"binding": "CRAWL_QUEUE"' in wrangler
     assert '"queue": "artist-analytics-crawl"' in wrangler
-    assert '"max_batch_size": 1' in wrangler
-    assert '"max_concurrency": 1' in wrangler
-    assert '"max_retries": 10' in wrangler
-    assert '"retry_delay": 180' in wrangler
-    assert '"dead_letter_queue": "artist-analytics-crawl-dlq"' in wrangler
-    assert '"crons": ["*/15 * * * *"]' in wrangler
+    assert '"consumers"' not in wrangler
+    assert '"crons"' not in wrangler
     assert '\n  "limits"' not in wrangler
+    crawler = (module_dir.parent / "crawler" / "wrangler.jsonc").read_text()
+    assert '"name": "artist-analytics-crawler"' in crawler
+    assert '"main": "../src/crawler_main.py"' in crawler
+    assert '"queue": "artist-analytics-crawl"' in crawler
+    assert '"max_batch_size": 1' in crawler
+    assert '"max_concurrency": 1' in crawler
+    assert '"max_retries": 10' in crawler
+    assert '"retry_delay": 180' in crawler
+    assert '"dead_letter_queue": "artist-analytics-crawl-dlq"' in crawler
+    assert '"crons": ["*/15 * * * *"]' in crawler
+    assert '\n  "limits"' not in crawler
     for name in ("base.html", "index.html", "login.html", "register.html", "dashboard.html"):
         assert (template_dir / name).is_file()
     client = TestClient(main.app)

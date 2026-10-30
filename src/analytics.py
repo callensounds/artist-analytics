@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from dateutil import parser as date_parser
-
 WEEKDAYS = [
     "Monday",
     "Tuesday",
@@ -96,18 +94,26 @@ def choose_best_date(candidates: list[tuple[str, str | None]]) -> tuple[str, str
         valid.append((text, place or None))
     if not valid:
         return "", None
-    earliest = [
-        item
-        for item in valid
-        if not any(is_strictly_earlier(other, item[0]) for other, _ in valid)
-    ]
-    return max(
-        earliest,
+    # One pass per calendar field. The old check compared every candidate to every
+    # other candidate, which got expensive on a release group with many events.
+    min_year = min(calendar_parts(text)[0] for text, _ in valid)
+    valid = [item for item in valid if calendar_parts(item[0])[0] == min_year]
+    with_month = [item for item in valid if len(calendar_parts(item[0])) >= 2]
+    if with_month:
+        min_month = min(calendar_parts(item[0])[1] for item in with_month)
+        valid = [item for item in valid if len(calendar_parts(item[0])) < 2 or calendar_parts(item[0])[1] == min_month]
+        with_day = [item for item in valid if len(calendar_parts(item[0])) >= 3]
+        if with_day:
+            min_day = min(calendar_parts(item[0])[2] for item in with_day)
+            valid = [item for item in valid if len(calendar_parts(item[0])) < 3 or calendar_parts(item[0])[2] == min_day]
+    text, place = max(
+        valid,
         key=lambda item: (
             PRECISION_RANK[classify_date(item[0])],
             1 if item[1] else 0,
         ),
     )
+    return text, place
 
 
 def spotify_precision(date_value: str, stated: str | None) -> str:
@@ -122,9 +128,14 @@ def spotify_precision(date_value: str, stated: str | None) -> str:
 
 
 def parse_utc(value: str) -> datetime | None:
+    """ISO-8601 only. dateutil.parser pulled a large pure-Python module into every cold start."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    text = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
     try:
-        parsed = date_parser.parse(value)
-    except (ValueError, OverflowError, TypeError):
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)

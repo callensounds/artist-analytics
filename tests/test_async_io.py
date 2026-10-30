@@ -95,6 +95,33 @@ def test_no_await_while_an_exception_is_propagating():
     assert offenders == []
 
 
+def test_crawler_entrypoint_does_not_import_the_dashboard_stack():
+    """Cold-start CPU counts. The crawler module must not load FastAPI or Jinja."""
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(SRC)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, crawler_main\n"
+            "assert 'fastapi' not in sys.modules\n"
+            "assert 'jinja2' not in sys.modules\n"
+            "assert 'providers.spotify' not in sys.modules\n"
+            "assert 'providers.musicbrainz' not in sys.modules\n",
+        ],
+        cwd=SRC.parent,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_requests_is_not_a_runtime_dependency():
     pyproject = (SRC.parent / "pyproject.toml").read_text(encoding="utf-8")
     runtime = pyproject.split("[dependency-groups]", 1)[0]

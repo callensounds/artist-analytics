@@ -65,19 +65,26 @@ def visible_lines(page: str, limit: int | None = None) -> list[str]:
 
 
 def listener_slices(page: str) -> str:
-    """Only the characters around each 'monthly listeners' phrase. The exact count is not in the head."""
+    """Only the characters around each 'monthly listeners' phrase. The exact count is not in the head.
+
+    Search the original string. ``str.lower`` on a 260KB artist page allocates a second copy.
+    """
     if not page:
         return ""
-    needle = "monthly listeners"
-    lowered = page.lower()
+    needles = ("monthly listeners", "Monthly listeners", "Monthly Listeners")
+    found = []
+    for needle in needles:
+        start = 0
+        while len(found) < 8:
+            at = page.find(needle, start)
+            if at < 0:
+                break
+            found.append((at, needle))
+            start = at + len(needle)
+    found.sort()
     parts = []
-    start = 0
-    while len(parts) < 8:
-        at = lowered.find(needle, start)
-        if at < 0:
-            break
+    for at, needle in found[:8]:
         parts.append(page[max(0, at - 48) : at + len(needle) + 8])
-        start = at + len(needle)
     return "\n".join(parts)
 
 
@@ -87,7 +94,10 @@ def shelf_window(page: str) -> str:
         return ""
     start = page.find("monthly-listeners-label")
     if start < 0:
-        start = page.lower().find("monthly listeners")
+        for needle in ("monthly listeners", "Monthly listeners", "Monthly Listeners"):
+            start = page.find(needle)
+            if start >= 0:
+                break
     if start < 0:
         return page[:SHELF_WINDOW]
     return page[max(0, start - 2000) : start + SHELF_WINDOW]
