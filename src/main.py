@@ -340,12 +340,16 @@ class Default(_Entrypoint):
         resolved = handler_env(self, env)
         messages = list(getattr(batch, "messages", None) or [])
         _log("queue start", messages=len(messages))
+        failure = None
         try:
             result = await run_queue_batch(batch, resolved)
         except Exception as exc:
-            # Do not raise. A thrown queue handler becomes an exception outcome and
-            # drops the message after max_retries. Retry it and return.
-            _log("queue error", **_exc_fields(exc))
+            # Do not raise, and do not await message.retry until this exception has
+            # finished propagating. A thrown queue handler becomes an exception
+            # outcome and drops the message after max_retries.
+            failure = _exc_fields(exc)
+        if failure is not None:
+            _log("queue error", **failure)
             for message in messages:
                 await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
             result = {"messages": len(messages), "acked": 0, "retried": len(messages), "snapshots": 0}
