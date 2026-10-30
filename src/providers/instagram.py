@@ -121,12 +121,11 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
     async def produce() -> SourceResult:
         url = f"https://www.instagram.com/{handle}/embed/"
         try:
-            light = bool(getattr(http, "crawl_light", False))
             result = await http.get_text(
                 url,
                 timeout=15,
                 allow_redirects=False,
-                max_bytes=48_000 if light else 300_000,
+                max_bytes=48_000,
             )
         except TransportError as exc:
             return unavailable("instagram", "Instagram", str(exc))
@@ -148,7 +147,7 @@ async def fetch_instagram(name: str, links: dict, http, cache) -> SourceResult:
                 "Instagram",
                 f"The public embed page returned HTTP {result.status}.",
             )
-        parsed = parse_embed(result.text, handle, light=light)
+        parsed = parse_embed((result.text or "")[:48_000], handle, light=True)
         if parsed["private"] and not parsed["posts"]:
             return unavailable(
                 "instagram",

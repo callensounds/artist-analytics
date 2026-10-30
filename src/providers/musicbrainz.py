@@ -221,7 +221,13 @@ async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEU
             break
         await _mb_slot(http, max_queue)
         try:
-            result, payload = await http.get_json(url, params=params, headers=HEADERS, timeout=MB_TIMEOUT)
+            result, payload = await http.get_json(
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=MB_TIMEOUT,
+                max_bytes=CATALOG_MAX_BYTES,
+            )
         except TransportError as exc:
             last_error = TransportError(_mb_message(None, str(exc)))
             if attempt == 0:
@@ -531,12 +537,29 @@ async def fetch_musicbrainz(name: str, http, cache) -> SourceResult:
     return await rest
 
 
+# One page. Offset pages are not followed on a dashboard or a crawl.
+CATALOG_LIMIT = "25"
+CATALOG_MAX_BYTES = 100_000
+
+
+def _groups_need_release_events(groups_result: dict) -> bool:
+    """Release-group dates are enough when several already include a calendar day."""
+    dated = 0
+    for row in (groups_result or {}).get("release-groups") or []:
+        raw = str((row or {}).get("first-release-date") or "")
+        if len(raw) >= 10:
+            dated += 1
+            if dated >= 5:
+                return False
+    return True
+
+
 async def _catalog(http, mbid: str):
     async def groups():
         return await _get_json(
             http,
             f"{MB}/release-group",
-            {"artist": mbid, "fmt": "json", "limit": "100"},
+            {"artist": mbid, "fmt": "json", "limit": CATALOG_LIMIT},
             MB_CATALOG_MAX_QUEUE,
         )
 
@@ -547,22 +570,27 @@ async def _catalog(http, mbid: str):
             {
                 "artist": mbid,
                 "fmt": "json",
-                "limit": "100",
+                "limit": CATALOG_LIMIT,
                 "status": "official",
                 "inc": "release-groups",
             },
             MB_CATALOG_MAX_QUEUE,
         )
 
-    groups_result, releases_result = await asyncio.gather(groups(), releases(), return_exceptions=True)
-    if isinstance(groups_result, Exception):
-        if isinstance(groups_result, TransportError):
-            raise groups_result
-        raise TransportError("MusicBrainz release groups could not be loaded.") from groups_result
-    release_notice = None
-    if isinstance(releases_result, Exception):
-        releases_result = {"releases": []}
-        release_notice = (
-            "Official release events could not be loaded, so dates fall back to release-group first-release-date values."
+    try:
+        groups_result = await groups()
+    except Exception as groups_error:
+        if isinstance(groups_error, TransportError):
+            raise
+        raise TransportError("MusicBrainz release groups could not be loaded.") from groups_error
+    if not _groups_need_release_events(groups_result):
+        return groups_result, {"releases": []}, None
+    try:
+        releases_result = await releases()
+    except Exception:
+        return (
+            groups_result,
+            {"releases": []},
+            "Official release events could not be loaded, so dates fall back to release-group first-release-date values.",
         )
-    return groups_result, releases_result, release_notice
+    return groups_result, releases_result, None

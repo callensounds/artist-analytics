@@ -5,6 +5,11 @@
   "compatibility_date": "2026-10-25",
   "compatibility_flags": ["python_workers"],
   "preview_urls": false,
+  // Paid Workers accept this and raise the per-invocation CPU cap to 30s.
+  // The Free plan rejects limits.cpu_ms. If the build fails on this block, delete it.
+  "limits": {
+    "cpu_ms": 30000
+  },
   "assets": {
     "directory": "./public/",
     "binding": "ASSETS",

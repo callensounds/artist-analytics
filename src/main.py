@@ -13,7 +13,9 @@ from crawl import (
     _log,
     enqueue_search,
     handler_env,
+    is_promising_task,
     open_database,
+    raise_discard,
     run_queue_batch,
     run_scheduled,
     status_report,
@@ -31,6 +33,16 @@ except ImportError:  # The workers runtime exists on Cloudflare, not in local te
 
 app = FastAPI(title="Average Analytics")
 app.add_middleware(WorkerSessionMiddleware, fallback_secret=FALLBACK_SESSION_SECRET)
+
+
+@app.middleware("http")
+async def discard_broken_isolate(request, call_next):
+    try:
+        return await call_next(request)
+    except BaseException as exc:
+        if is_promising_task(exc):
+            raise_discard(exc)
+        raise
 
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
 # so a ../templates path exists locally and 500s on every HTML route after deploy.
@@ -215,7 +227,11 @@ async def dashboard(request: Request, artist: str | None = None):
     history_task = asyncio.create_task(read_dashboard_history(query, env))
     try:
         bundle = await collect_artist(query, env=env)
-    except Exception:
+    except BaseException as exc:
+        if is_promising_task(exc):
+            raise_discard(exc)
+        if not isinstance(exc, Exception):
+            raise
         bundle = {
             "sources": [],
             "patterns": {"release_hours": [], "social_hours": [], "weekdays": [], "hour_labels": [], "weekday_labels": []},
@@ -223,15 +239,26 @@ async def dashboard(request: Request, artist: str | None = None):
         }
     try:
         history = await history_task
-    except Exception:
+    except BaseException as exc:
+        if is_promising_task(exc):
+            raise_discard(exc)
+        if not isinstance(exc, Exception):
+            raise
         history = empty_history("Stored growth could not be read on this request.")
+    for source in bundle.get("sources") or []:
+        items = source.get("items") or []
+        if len(items) > 20:
+            source["items"] = items[:20]
     live = _live_related(bundle)
     if live and not history.get("related"):
         history["related"] = live
     try:
         await enqueue_task
-    except Exception:
-        pass
+    except BaseException as exc:
+        if is_promising_task(exc):
+            raise_discard(exc)
+        if not isinstance(exc, Exception):
+            raise
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -319,7 +346,11 @@ class Default(_Entrypoint):
         _log("scheduled start", cron=getattr(controller, "cron", None))
         try:
             result = await run_scheduled(resolved)
-        except Exception as exc:
+        except BaseException as exc:
+            if is_promising_task(exc):
+                raise_discard(exc)
+            if not isinstance(exc, Exception):
+                raise
             _log("scheduled error", error=exc.__class__.__name__)
             raise
         _log(
@@ -338,7 +369,16 @@ class Default(_Entrypoint):
         _log("queue start", messages=len(messages))
         try:
             result = await run_queue_batch(batch, resolved)
-        except Exception as exc:
+        except BaseException as exc:
+            if is_promising_task(exc):
+                for message in messages:
+                    try:
+                        await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
+                    except Exception:
+                        _log("queue retry failed", **_exc_fields(exc))
+                raise_discard(exc)
+            if not isinstance(exc, Exception):
+                raise
             # A thrown handler becomes an 'exception' outcome and, after a CPU kill,
             # the next isolates often only have '#<Object>' and no Python traceback.
             # Retry the message with a delay and return normally.

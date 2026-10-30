@@ -116,6 +116,25 @@ def _log(message: str, **fields) -> None:
     print(json.dumps({"message": message, **fields}, default=str), flush=True)
 
 
+def is_promising_task(exc: BaseException) -> bool:
+    """True when Pyodide's promise bridge is wedged, usually after a CPU kill."""
+    text = " ".join(str(part) for part in (exc, *getattr(exc, "args", ())))
+    return "promising task" in text.casefold()
+
+
+def raise_discard(exc: BaseException) -> None:
+    """Ask the Workers runtime to drop this isolate.
+
+    ``SystemExit`` is a ``BaseException``, so ``except Exception`` in the ASGI
+    adapter and in these handlers does not catch it. An uncaught ``SystemExit``
+    is a fatal script error; the runtime replaces the isolate instead of serving
+    the next request on a loop that can only raise
+    ``Cannot enter a promising task from inside another running promising task``.
+    """
+    _log("isolate broken", hint="promising task", **_exc_fields(exc))
+    raise SystemExit(1) from exc
+
+
 def _exc_fields(exc: BaseException) -> dict:
     """JS rejections often stringify as '#<Object>'. Keep the traceback and repr."""
     return {
@@ -492,6 +511,8 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
                 related_cap=config["related_cap"],
             )
         except Exception as exc:
+            if is_promising_task(exc):
+                raise
             _log("queue message failed", name=row.get("name"), **_exc_fields(exc))
             try:
                 await record_consumer_run(
