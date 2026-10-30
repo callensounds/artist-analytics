@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from diag import diagnose
-from http_client import RequestsClient
+from http_client import HttpClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
 
@@ -186,7 +186,7 @@ async def admin_diag(request: Request):
     if not user:
         return RedirectResponse("/login", status_code=303)
     try:
-        report = await diagnose(request.scope.get("env"), RequestsClient())
+        report = await diagnose(request.scope.get("env"), HttpClient(deadline=None))
     except Exception:
         report = {
             "secrets": [],

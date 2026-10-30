@@ -30,11 +30,14 @@ MB_USER_AGENT = "AverageAnalytics/1.0 ( callen@callensounds.com )"
 MB_INTERVAL = 1.1
 MB_TTL = 24 * 60 * 60
 MB_RELATIONS_TTL = 7 * 24 * 60 * 60
-MB_TIMEOUT = 12
-# Search, one lookup, and one retry have to fit. The other providers stay on a shorter budget.
-MB_OPEN_TIMEOUT = 22
+MB_TIMEOUT = 4.5
+# Search plus one lookup, inside the dashboard's ~10s deadline. The catalog gets what is left.
+MB_OPEN_TIMEOUT = 5.5
+# A request that would queue longer than this for a MusicBrainz slot gets an error card instead.
+MB_MAX_QUEUE = 3.0
 HEADERS = {"Accept": "application/json", "User-Agent": MB_USER_AGENT}
-_mb_lock = asyncio.Lock()
+# Next free slot, in event-loop time, for this isolate. A plain float, not an asyncio
+# primitive: no Lock or Semaphore is built at import time or shared across requests.
 _mb_next = 0.0
 
 
@@ -148,15 +151,52 @@ def aggregate_catalog(release_groups: list[dict], releases: list[dict]) -> list[
     return sort_items(items)
 
 
-async def _mb_slot() -> None:
-    """One MusicBrainz request at a time, at most about one per second, per isolate."""
+class MusicBrainzBusy(TransportError):
+    pass
+
+
+# Catalog calls only take a slot when the queue is short, so identity lookups go first.
+MB_CATALOG_MAX_QUEUE = 1.2
+# Requests for an artist another request is already looking up poll the cache this often.
+MB_PEER_POLL = 0.25
+# query -> event-loop time after which the marker is stale. Plain data, no asyncio primitive.
+_mb_inflight: dict[str, float] = {}
+# At about one request a second, two lookups (search + artist) each fit in the identity
+# budget. More owners at once would push every lookup past it and none would finish.
+MB_MAX_OWNERS = 2
+
+
+def _owners(now: float) -> int:
+    return sum(1 for expiry in _mb_inflight.values() if expiry > now)
+
+
+def _max_queue(http, limit: float = MB_MAX_QUEUE) -> float:
+    remaining = getattr(http, "remaining", None)
+    left = remaining() if callable(remaining) else None
+    if left is not None:
+        limit = min(limit, left - 0.5)
+    return limit
+
+
+async def _mb_slot(http=None, max_queue: float = MB_MAX_QUEUE) -> None:
+    """At most about one MusicBrainz request per MB_INTERVAL, per isolate.
+
+    The slot is reserved synchronously (read and write with no await in between),
+    then the caller sleeps until it. A request that would wait past its budget
+    does not reserve a slot and fails fast, so a burst cannot build an
+    unbounded queue behind one shared lock.
+    """
     global _mb_next
-    async with _mb_lock:
-        loop = asyncio.get_running_loop()
-        delay = _mb_next - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        _mb_next = loop.time() + MB_INTERVAL
+    now = asyncio.get_running_loop().time()
+    slot = max(now, _mb_next)
+    if slot - now > _max_queue(http, max_queue):
+        raise MusicBrainzBusy(
+            "MusicBrainz is busy: this server keeps to about one request per second and the queue is full. "
+            "Refresh in a few seconds."
+        )
+    _mb_next = slot + MB_INTERVAL
+    if slot > now:
+        await asyncio.sleep(slot - now)
 
 
 def _body_snippet(text: str) -> str:
@@ -173,11 +213,13 @@ def _mb_message(status: int | None, body: str) -> str:
     return f"MusicBrainz HTTP {status}."
 
 
-async def _get_json(http, url: str, params: dict):
+async def _get_json(http, url: str, params: dict, max_queue: float = MB_MAX_QUEUE):
     """Two attempts. A 429, 503, or transport failure waits a short jitter, then tries once more."""
     last_error = TransportError("MusicBrainz request failed: no response body")
     for attempt in range(2):
-        await _mb_slot()
+        if attempt and _max_queue(http, max_queue) < 1.0:
+            break
+        await _mb_slot(http, max_queue)
         try:
             result, payload = await http.get_json(url, params=params, headers=HEADERS, timeout=MB_TIMEOUT)
         except TransportError as exc:
@@ -201,6 +243,8 @@ def _relations_payload(result: SourceResult) -> dict:
     return {
         "links": links,
         "name": result.profile_name or "",
+        "mbid": (result.links or {}).get("_mbid") or "",
+        "match": ((result.metrics or [None])[0].value if result.metrics else None) or "",
     }
 
 
@@ -256,6 +300,8 @@ async def _match(name: str, http) -> SourceResult:
             f"{MB}/artist/",
             {"query": f'artist:"{query}"', "fmt": "json", "limit": "5", "inc": "url-rels"},
         )
+    except MusicBrainzBusy:
+        raise
     except TransportError as exc:
         return errored("musicbrainz", "MusicBrainz", str(exc))
     artists = search.get("artists") or []
@@ -279,6 +325,8 @@ async def _match(name: str, http) -> SourceResult:
     else:
         try:
             artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
+        except MusicBrainzBusy:
+            raise
         except TransportError as exc:
             return errored("musicbrainz", "MusicBrainz", str(exc))
     links = extract_links(artist_doc.get("relations") or [])
@@ -312,6 +360,8 @@ async def _finish(partial: SourceResult, http) -> SourceResult:
     except TransportError as exc:
         partial.links = public
         partial.notices = list(partial.notices or []) + [str(exc)]
+        # Keep the match on the page, but do not cache a dashboard without its catalog.
+        partial.cacheable = False
         return partial
     items = aggregate_catalog(groups.get("release-groups") or [], releases.get("releases") or [])
     day_level = sum(1 for item in items if item.precision in {"day", "time"})
@@ -343,6 +393,82 @@ async def _finish(partial: SourceResult, http) -> SourceResult:
     )
 
 
+async def _peer_result(cache, query: str) -> SourceResult | None:
+    """What another request already stored for this query: the full result, or its URL relations."""
+    if cache is None or not query:
+        return None
+    raw = await cache.get(cache_key("musicbrainz", query))
+    if raw:
+        try:
+            return source_from_dict(json.loads(raw))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    raw = await cache.get(cache_key("mb-rels", query))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("links"), dict):
+        return None
+    name = payload.get("name") or query
+    mbid = payload.get("mbid") or ""
+    return SourceResult(
+        platform="musicbrainz",
+        label="MusicBrainz",
+        status="ok",
+        profile_name=name,
+        profile_url=f"https://musicbrainz.org/artist/{mbid}" if mbid else None,
+        metrics=[Metric(label="Match", available=True, value=payload.get("match") or name)],
+        notices=["The release catalog is still loading in another request. Refresh for MusicBrainz release dates."],
+        links=dict(payload["links"]),
+        ttl=MB_TTL,
+        cacheable=False,
+    )
+
+
+async def _match_or_wait(name: str, http, cache, query: str) -> tuple[SourceResult, bool]:
+    """Look the artist up, or wait for the request that already is. Returns (result, did_the_lookup).
+
+    Concurrent requests for one artist share the lookup through the cache, which holds
+    plain strings. No future, lock, or JS object crosses from one request to another.
+    """
+    loop = asyncio.get_running_loop()
+    remaining = getattr(http, "remaining", None)
+    left = remaining() if callable(remaining) else None
+    budget = MB_OPEN_TIMEOUT if left is None else min(MB_OPEN_TIMEOUT, left)
+    give_up = loop.time() + budget - 0.3
+    last_busy: MusicBrainzBusy | None = None
+    waited = False
+    while True:
+        if waited:
+            # Check what a peer stored before taking over its marker.
+            peer = await _peer_result(cache, query)
+            if peer is not None:
+                return peer, False
+        now = loop.time()
+        if _mb_inflight.get(query, 0.0) <= now and _owners(now) < MB_MAX_OWNERS:
+            marker = now + MB_OPEN_TIMEOUT + 1.0
+            _mb_inflight[query] = marker
+            try:
+                result = await _match(name, http)
+                if result.status == "ok":
+                    await _store_relations(cache, query, result)
+                return result, True
+            except MusicBrainzBusy as exc:
+                last_busy = exc
+            finally:
+                if _mb_inflight.get(query) == marker:
+                    _mb_inflight.pop(query, None)
+        if loop.time() + MB_PEER_POLL >= give_up:
+            raise last_busy or MusicBrainzBusy(
+                "MusicBrainz is busy with other lookups on this server. Refresh in a few seconds."
+            )
+        await asyncio.sleep(MB_PEER_POLL)
+        waited = True
+
+
 async def open_musicbrainz(name: str, http, cache):
     """URL relations first. The catalog coroutine can run beside the other providers."""
     query = sanitize_artist_query(name)
@@ -353,10 +479,13 @@ async def open_musicbrainz(name: str, http, cache):
                 return source_from_dict(json.loads(raw)), None
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
-    partial = await _match(name, http)
-    if partial.status == "ok":
-        await _store_relations(cache, query, partial)
-    else:
+    try:
+        partial, owner = await _match_or_wait(name, http, cache, query)
+    except MusicBrainzBusy as exc:
+        partial, owner = errored("musicbrainz", "MusicBrainz", str(exc)), True
+    if not owner:
+        return partial, None
+    if partial.status != "ok":
         cached_links = await _load_relations(cache, query)
         if cached_links:
             partial.links = dict(cached_links)
@@ -376,6 +505,25 @@ async def open_musicbrainz(name: str, http, cache):
     return partial, finish()
 
 
+async def timed_out(name: str, cache) -> SourceResult:
+    """The identity step ran out of time. Cached URL relations still let the other cards run."""
+    result = errored(
+        "musicbrainz",
+        "MusicBrainz",
+        "MusicBrainz took too long and was skipped so the rest of the page could load.",
+    )
+    try:
+        cached_links = await asyncio.wait_for(_load_relations(cache, sanitize_artist_query(name)), 1.0)
+    except Exception:
+        cached_links = None
+    if cached_links:
+        result.links = dict(cached_links)
+        result.notices = [
+            "MusicBrainz did not answer in time. Spotify, Instagram, and TikTok are using URL relations cached for 7 days."
+        ]
+    return result
+
+
 async def fetch_musicbrainz(name: str, http, cache) -> SourceResult:
     partial, rest = await open_musicbrainz(name, http, cache)
     if rest is None:
@@ -389,6 +537,7 @@ async def _catalog(http, mbid: str):
             http,
             f"{MB}/release-group",
             {"artist": mbid, "fmt": "json", "limit": "100"},
+            MB_CATALOG_MAX_QUEUE,
         )
 
     async def releases():
@@ -402,6 +551,7 @@ async def _catalog(http, mbid: str):
                 "status": "official",
                 "inc": "release-groups",
             },
+            MB_CATALOG_MAX_QUEUE,
         )
 
     groups_result, releases_result = await asyncio.gather(groups(), releases(), return_exceptions=True)

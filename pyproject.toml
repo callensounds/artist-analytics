@@ -6,7 +6,6 @@ dependencies = [
     "fastapi",
     "jinja2",
     "python-multipart",
-    "requests",
     "python-dateutil",
     "pytz",
     "itsdangerous",
