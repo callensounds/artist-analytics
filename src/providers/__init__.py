@@ -8,12 +8,57 @@ from analytics import build_insights, build_patterns
 from cache import cache_from_env
 from http_client import HttpClient
 from models import SourceResult, errored
-from providers.apple import fetch_apple
-from providers.instagram import fetch_instagram
-from providers.musicbrainz import MB_CRAWL_MAX_QUEUE, MB_CRAWL_OPEN_TIMEOUT, MB_OPEN_TIMEOUT, open_musicbrainz, timed_out
-from providers.spotify import fetch_spotify
-from providers.tiktok import fetch_tiktok
-from providers.youtube import fetch_youtube
+
+# Bound on first use. Importing this package must not load every provider, or the
+# crawler Worker pays for Spotify, TikTok, and FastAPI's neighbors on a one-provider message.
+fetch_apple = None
+fetch_instagram = None
+fetch_spotify = None
+fetch_tiktok = None
+fetch_youtube = None
+open_musicbrainz = None
+timed_out = None
+MB_OPEN_TIMEOUT = None
+MB_CRAWL_OPEN_TIMEOUT = None
+MB_CRAWL_MAX_QUEUE = None
+
+
+def _bind_fetchers() -> None:
+    global fetch_apple, fetch_instagram, fetch_spotify, fetch_tiktok, fetch_youtube
+    if fetch_apple is None:
+        from providers.apple import fetch_apple as impl
+
+        fetch_apple = impl
+    if fetch_instagram is None:
+        from providers.instagram import fetch_instagram as impl
+
+        fetch_instagram = impl
+    if fetch_spotify is None:
+        from providers.spotify import fetch_spotify as impl
+
+        fetch_spotify = impl
+    if fetch_tiktok is None:
+        from providers.tiktok import fetch_tiktok as impl
+
+        fetch_tiktok = impl
+    if fetch_youtube is None:
+        from providers.youtube import fetch_youtube as impl
+
+        fetch_youtube = impl
+
+
+def _bind_musicbrainz() -> None:
+    global open_musicbrainz, timed_out, MB_OPEN_TIMEOUT, MB_CRAWL_OPEN_TIMEOUT, MB_CRAWL_MAX_QUEUE
+    from providers import musicbrainz as mb
+
+    if MB_OPEN_TIMEOUT is None:
+        MB_OPEN_TIMEOUT = mb.MB_OPEN_TIMEOUT
+        MB_CRAWL_OPEN_TIMEOUT = mb.MB_CRAWL_OPEN_TIMEOUT
+        MB_CRAWL_MAX_QUEUE = mb.MB_CRAWL_MAX_QUEUE
+    if open_musicbrainz is None:
+        open_musicbrainz = mb.open_musicbrainz
+    if timed_out is None:
+        timed_out = mb.timed_out
 
 # The whole dashboard answers within about 10s. Rendering gets the last half second.
 DASHBOARD_DEADLINE = 9.5
@@ -137,8 +182,15 @@ async def collect_artist(
     include_related: bool = False,
     skip_platforms=None,
 ) -> dict:
+    _bind_fetchers()
+    _bind_musicbrainz()
     client = http or HttpClient()
     light = bool(getattr(client, "crawl_light", False))
+    if not light:
+        try:
+            client.dashboard_catalog = True
+        except Exception:
+            pass
     if light and deadline_s == DASHBOARD_DEADLINE:
         deadline_s = CRAWL_DEADLINE
     deadline = asyncio.get_running_loop().time() + deadline_s

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
+import crawler_main
 import main
 from cache import MemoryCache
 from crawl import reset_pool, run_batch, run_queue_batch
@@ -631,8 +632,8 @@ def test_dashboard_route_performs_no_d1_writes(monkeypatch):
     assert page.status_code == 200
     assert hung.status_code == 200
     assert binding.writes == []
-    assert queue.sent == [{"name": "Example", "origin": "search"}]
-    assert slow.sent == [{"name": "Example", "origin": "search"}]
+    assert queue.sent == [{"name": "Example", "origin": "search", "provider": "musicbrainz"}]
+    assert slow.sent == [{"name": "Example", "origin": "search", "provider": "musicbrainz"}]
     assert elapsed < 2
     assert hung_elapsed < 1
     stored = asyncio.run(db.D1Database(binding).query("SELECT COUNT(*) AS n FROM artists"))
@@ -645,8 +646,8 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     import crawl
     import db
 
-    scheduled = inspect.signature(main.Default.scheduled)
-    queue_sig = inspect.signature(main.Default.queue)
+    scheduled = inspect.signature(crawler_main.Default.scheduled)
+    queue_sig = inspect.signature(crawler_main.Default.queue)
     assert [name for name in scheduled.parameters if name != "self"][:3] == ["controller", "env", "ctx"]
     assert [name for name in queue_sig.parameters if name != "self"][:3] == ["batch", "env", "ctx"]
 
@@ -663,11 +664,12 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     reset_pool()
     now = datetime(2026, 10, 30, 18, 0, tzinfo=timezone.utc)
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
-        assert include_related is True
-        return _bundle(listeners=42, related=[])
+    async def no_match(http, name, mbid=""):
+        from models import unavailable
 
-    monkeypatch.setattr(crawl, "collect_artist", fake_collect)
+        return unavailable("musicbrainz", "MusicBrainz", "none")
+
+    monkeypatch.setattr("providers.musicbrainz.fetch_identity", no_match)
 
     class Controller:
         cron = "*/15 * * * *"
@@ -687,15 +689,15 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
             """,
             (utc_now(now),),
         )
-        worker = main.Default(object(), env)
+        worker = crawler_main.Default(object(), env)
         # Exact runtime call: scheduled(controller, env, ctx).
-        await main.Default.scheduled(worker, Controller(), env, object())
+        await crawler_main.Default.scheduled(worker, Controller(), env, object())
         runs = await database.query("SELECT status, artists_attempted FROM crawl_runs")
         # A positional env with no bindings must still use the entrypoint env.
-        await main.Default.scheduled(worker, Controller(), object(), None)
+        await crawler_main.Default.scheduled(worker, Controller(), object(), None)
         message = _Message({"artist_id": 1})
         # The call that raised "takes 2 positional arguments but 4 were given".
-        await main.Default.queue(worker, Batch([message]), env, object())
+        await crawler_main.Default.queue(worker, Batch([message]), env, object())
         stored = await database.query("SELECT value FROM metric_snapshots")
         runs_after = await database.query("SELECT status FROM crawl_runs")
         return runs, runs_after, message, stored
@@ -704,9 +706,13 @@ def test_worker_handlers_accept_the_runtime_positional_arguments(monkeypatch, ca
     assert runs and runs[0]["status"] == "queued"
     assert int(runs[0]["artists_attempted"]) == 1
     assert len(runs_after) >= 2
-    assert queue.sent == [{"artist_id": 1}, {"artist_id": 1}]
+    assert queue.sent[:2] == [
+        {"artist_id": 1, "provider": "musicbrainz"},
+        {"artist_id": 1, "provider": "musicbrainz"},
+    ]
+    assert all(body.get("provider") != "spotify" for body in queue.sent)
     assert message.acked and not message.retried
-    assert stored[0]["value"] == 42
+    assert stored == []
     logs = capsys.readouterr().out
     assert "scheduled start" in logs
     assert "scheduled end" in logs
@@ -731,10 +737,10 @@ def test_queue_failure_retries_with_delay_and_records_the_run(monkeypatch, capsy
     reset_pool()
     now = datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
 
-    async def explode(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+    async def explode(http, name, mbid=""):
         raise RuntimeError("parse blew up")
 
-    monkeypatch.setattr(crawl, "collect_artist", explode)
+    monkeypatch.setattr("providers.musicbrainz.fetch_identity", explode)
 
     class Batch:
         def __init__(self, messages):
@@ -750,9 +756,9 @@ def test_queue_failure_retries_with_delay_and_records_the_run(monkeypatch, capsy
             """,
             (utc_now(now),),
         )
-        worker = main.Default(object(), env)
+        worker = crawler_main.Default(object(), env)
         message = _Message({"artist_id": 1})
-        result = await main.Default.queue(worker, Batch([message]), env, object())
+        result = await crawler_main.Default.queue(worker, Batch([message]), env, object())
         runs = await database.query(
             "SELECT status, artists_ok, artists_error, snapshots_written, edges_written FROM crawl_runs"
         )
@@ -782,13 +788,10 @@ def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monk
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
     reset_pool()
     now = datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
-    seen = []
+    async def fetched(*args, **kwargs):
+        raise AssertionError("a fresh Spotify snapshot was fetched again")
 
-    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
-        seen.append(set(skip_platforms or []))
-        return _bundle(listeners=11, related=[])
-
-    monkeypatch.setattr(crawl, "collect_artist", fake_collect)
+    monkeypatch.setattr("providers.spotify.fetch_spotify", fetched)
 
     class Batch:
         def __init__(self, messages):
@@ -815,7 +818,7 @@ def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monk
             """,
             (utc_now(datetime.now(timezone.utc)),),
         )
-        message = _Message({"artist_id": 1})
+        message = _Message({"artist_id": 1, "provider": "spotify"})
         await run_queue_batch(Batch([message]), {"DB": binding}, cache=MemoryCache({}))
         runs = await database.query(
             """
@@ -826,11 +829,10 @@ def test_consumer_skips_a_provider_with_a_fresh_snapshot_and_records_counts(monk
         return message, runs
 
     message, runs = asyncio.run(run())
-    assert seen == [{"spotify"}]
     assert message.acked and not message.retried
     assert runs[0]["status"] == "ok"
     assert runs[0]["artists_ok"] == 1
-    assert runs[0]["snapshots_written"] >= 1
+    assert runs[0]["snapshots_written"] == 0
     reset_pool()
 
 
@@ -847,10 +849,10 @@ def test_handler_exception_retries_with_traceback_and_does_not_raise(monkeypatch
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
     reset_pool()
 
-    async def explode(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+    async def explode(http, name, mbid=""):
         raise SystemError("Cannot enter a promising task from inside another running promising task")
 
-    monkeypatch.setattr(crawl, "collect_artist", explode)
+    monkeypatch.setattr("providers.musicbrainz.fetch_identity", explode)
 
     class Batch:
         def __init__(self, messages):
@@ -868,8 +870,8 @@ def test_handler_exception_retries_with_traceback_and_does_not_raise(monkeypatch
             """,
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
-        worker = main.Default(object(), Env())
-        await main.Default.queue(worker, Batch([message]), Env(), object())
+        worker = crawler_main.Default(object(), Env())
+        await crawler_main.Default.queue(worker, Batch([message]), Env(), object())
         return await database.query("SELECT detail, status FROM crawl_runs")
 
     runs = asyncio.run(run())
@@ -947,16 +949,28 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
     pages = Pages()
     monkeypatch.setattr(crawl, "HttpClient", lambda *args, **kwargs: pages)
     binding = _D1()
+    queue = _Queue()
 
     class Env:
         def __init__(self):
             self.DB = binding
+            self.CRAWL_QUEUE = queue
 
     class Batch:
         def __init__(self, messages):
             self.messages = messages
 
-    message = _Message({"artist_id": 1})
+    message = _Message({"artist_id": 1, "provider": "musicbrainz"})
+
+    async def drain(env, worker, first):
+        await crawler_main.Default.queue(worker, Batch([first]), env, object())
+        pending = list(queue.sent)
+        queue.sent.clear()
+        while pending:
+            body = pending.pop(0)
+            await crawler_main.Default.queue(worker, Batch([_Message(body)]), env, object())
+            pending.extend(queue.sent)
+            queue.sent.clear()
 
     async def run():
         database = db.D1Database(binding)
@@ -969,8 +983,8 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
         env = Env()
-        worker = main.Default(object(), env)
-        await main.Default.queue(worker, Batch([message]), env, object())
+        worker = crawler_main.Default(object(), env)
+        await drain(env, worker, message)
         snaps = await database.query("SELECT source, metric, value FROM metric_snapshots ORDER BY source")
         runs = await database.query("SELECT status, snapshots_written, edges_written, detail FROM crawl_runs")
         return snaps, runs
@@ -981,10 +995,12 @@ def test_queue_handler_writes_snapshots_from_pages_with_late_markers(monkeypatch
     assert by_source.get("spotify") == 1473027
     assert by_source.get("instagram") == 574486
     assert by_source.get("tiktok") == 88000
-    assert runs[-1]["status"] == "ok"
-    assert runs[-1]["snapshots_written"] >= 3
-    assert "spotify=ok" in runs[-1]["detail"]
-    assert "Traceback" not in (runs[-1]["detail"] or "")
+    details = " ".join(row["detail"] or "" for row in runs)
+    assert sum(row["snapshots_written"] or 0 for row in runs) >= 3
+    assert "spotify=ok" in details
+    assert "instagram=ok" in details
+    assert "tiktok=ok" in details
+    assert "Traceback" not in details
     def cap_for(fragment: str) -> int:
         caps = [cap for url, cap in pages.caps if fragment in url and cap]
         assert caps, fragment
@@ -1062,16 +1078,28 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
     pages = Pages()
     monkeypatch.setattr(crawl, "HttpClient", lambda *args, **kwargs: pages)
     binding = _D1()
+    queue = _Queue()
 
     class Env:
         def __init__(self):
             self.DB = binding
+            self.CRAWL_QUEUE = queue
 
     class Batch:
         def __init__(self, messages):
             self.messages = messages
 
-    message = _Message({"artist_id": 1})
+    message = _Message({"artist_id": 1, "provider": "musicbrainz"})
+
+    async def drain(env, worker, first):
+        await crawler_main.Default.queue(worker, Batch([first]), env, object())
+        pending = list(queue.sent)
+        queue.sent.clear()
+        while pending:
+            body = pending.pop(0)
+            await crawler_main.Default.queue(worker, Batch([_Message(body)]), env, object())
+            pending.extend(queue.sent)
+            queue.sent.clear()
 
     async def run():
         database = db.D1Database(binding)
@@ -1084,8 +1112,8 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
             (utc_now(datetime(2026, 10, 30, tzinfo=timezone.utc)),),
         )
         env = Env()
-        worker = main.Default(object(), env)
-        await main.Default.queue(worker, Batch([message]), env, object())
+        worker = crawler_main.Default(object(), env)
+        await drain(env, worker, message)
         snaps = await database.query("SELECT source, metric, value FROM metric_snapshots")
         runs = await database.query("SELECT status, snapshots_written, detail FROM crawl_runs")
         state = await database.query_one("SELECT apple_blocked_until FROM crawl_state WHERE id = 1")
@@ -1095,8 +1123,8 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
             "UPDATE artists SET last_crawled_at = ? WHERE id = 1",
             (utc_now(datetime(2020, 1, 1, tzinfo=timezone.utc)),),
         )
-        again = _Message({"artist_id": 1})
-        await main.Default.queue(worker, Batch([again]), env, object())
+        again = _Message({"artist_id": 1, "provider": "musicbrainz"})
+        await drain(env, worker, again)
         return snaps, runs, state, again, first_urls
 
     snaps, runs, state, again, first_urls = asyncio.run(run())
@@ -1106,12 +1134,12 @@ def test_queue_handler_writes_other_snapshots_when_itunes_returns_403(monkeypatc
     assert by_source.get("instagram") == 574486
     assert by_source.get("tiktok") == 88000
     assert runs[-1]["status"] == "ok"
-    assert runs[-1]["snapshots_written"] >= 3
-    assert "apple=unavailable" in runs[-1]["detail"]
-    assert "HTTP 403" in runs[-1]["detail"]
-    assert "SystemError" not in (runs[-1]["detail"] or "")
-    assert "Traceback" not in (runs[-1]["detail"] or "")
-    assert pages.mb_open_timeout == MB_CRAWL_OPEN_TIMEOUT
+    details = " ".join(row["detail"] or "" for row in runs)
+    assert sum(row["snapshots_written"] or 0 for row in runs) >= 3
+    assert "apple=unavailable" in details
+    assert "HTTP 403" in details
+    assert "SystemError" not in details
+    assert "Traceback" not in details
     until = db.parse_utc(state["apple_blocked_until"])
     assert until is not None
     remaining = until - datetime.now(timezone.utc)

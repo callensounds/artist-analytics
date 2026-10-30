@@ -628,14 +628,99 @@ def _groups_need_release_events(groups_result: dict) -> bool:
     return True
 
 
+async def fetch_identity(http, name: str, mbid: str = "") -> SourceResult:
+    """One MusicBrainz request: a lookup when ``mbid`` is set, otherwise a search.
+
+    The catalog is not loaded. If the search omits URL relations, ``links['_needs_lookup']``
+    is set and the caller queues a second message for the lookup instead of doing it here.
+    """
+    if mbid:
+        try:
+            artist_doc = await _get_json(http, f"{MB}/artist/{mbid}", {"inc": "url-rels", "fmt": "json"})
+        except MusicBrainzBusy:
+            raise
+        except TransportError as exc:
+            return errored("musicbrainz", "MusicBrainz", str(exc))
+        links = extract_links(artist_doc.get("relations") or [])
+        links["_mbid"] = mbid
+        profile = artist_doc.get("name") or name
+        return SourceResult(
+            platform="musicbrainz",
+            label="MusicBrainz",
+            status="ok",
+            profile_name=profile,
+            profile_url=f"https://musicbrainz.org/artist/{mbid}",
+            metrics=[Metric(label="Match", available=True, value=profile)],
+            links=links,
+            ttl=MB_TTL,
+        )
+    query = sanitize_artist_query(name)
+    if not query:
+        return unavailable("musicbrainz", "MusicBrainz", "Enter an artist name to search MusicBrainz.")
+    try:
+        search = await _get_json(
+            http,
+            f"{MB}/artist/",
+            {"query": f'artist:"{query}"', "fmt": "json", "limit": "5"},
+        )
+    except MusicBrainzBusy:
+        raise
+    except TransportError as exc:
+        return errored("musicbrainz", "MusicBrainz", str(exc))
+    chosen = None
+    for artist in search.get("artists") or []:
+        score = int(artist.get("score") or 0)
+        if score >= 80 or names_match(artist.get("name") or "", query):
+            chosen = artist
+            break
+    if chosen is None:
+        return unavailable(
+            "musicbrainz",
+            "MusicBrainz",
+            "No confident MusicBrainz artist match. Apple and YouTube can still be matched by name.",
+        )
+    found = chosen["id"]
+    if isinstance(chosen.get("relations"), list):
+        links = extract_links(chosen.get("relations") or [])
+        links["_mbid"] = found
+        profile = chosen.get("name") or name
+        return SourceResult(
+            platform="musicbrainz",
+            label="MusicBrainz",
+            status="ok",
+            profile_name=profile,
+            profile_url=f"https://musicbrainz.org/artist/{found}",
+            metrics=[Metric(label="Match", available=True, value=profile)],
+            links=links,
+            ttl=MB_TTL,
+        )
+    return SourceResult(
+        platform="musicbrainz",
+        label="MusicBrainz",
+        status="ok",
+        profile_name=chosen.get("name") or name,
+        profile_url=f"https://musicbrainz.org/artist/{found}",
+        metrics=[Metric(label="Match", available=True, value=chosen.get("name") or name)],
+        links={"_mbid": found, "_needs_lookup": "1"},
+        cacheable=False,
+        ttl=MB_TTL,
+    )
+
+
 async def _catalog(http, mbid: str):
+    # The dashboard renders this page. A short release-group sample is enough.
+    # The queue never calls this; each crawl message is one provider.
+    dashboard = bool(getattr(http, "dashboard_catalog", False))
+    limit = "8" if dashboard else CATALOG_LIMIT
+    max_bytes = 40_000 if dashboard else CATALOG_MAX_BYTES
+
     async def groups():
         return await _get_json(
             http,
             f"{MB}/release-group",
-            {"artist": mbid, "fmt": "json", "limit": CATALOG_LIMIT},
+            {"artist": mbid, "fmt": "json", "limit": limit},
             MB_CATALOG_MAX_QUEUE,
-            max_bytes=CATALOG_MAX_BYTES,
+            max_bytes=max_bytes,
         )
 
     async def releases():
@@ -659,6 +744,12 @@ async def _catalog(http, mbid: str):
         if isinstance(groups_error, TransportError):
             raise
         raise TransportError("MusicBrainz release groups could not be loaded.") from groups_error
+    if dashboard:
+        return (
+            groups_result,
+            {"releases": []},
+            "Dashboard catalog is a short release-group sample so the page stays inside the CPU budget.",
+        )
     if not _groups_need_release_events(groups_result):
         return groups_result, {"releases": []}, None
     try:

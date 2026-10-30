@@ -52,10 +52,19 @@ Cloudflare Workers Builds (Git-connected) should deploy this repo from `main`.
 **Build / deploy command**
 
 ```bash
-uv run pywrangler deploy
+uv run pywrangler deploy && uv run pywrangler deploy -c crawler/wrangler.jsonc
 ```
 
-The Worker config is `wrangler.jsonc` (`python_workers`, `main` = `src/main.py`, `preview_urls` false). `public/` exists so the static assets directory in that config is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`, so both are inside the Worker bundle. Wrangler uploads `**/*.html` from that directory with the Worker (its default module rules). Routes are served by FastAPI (`run_worker_first`).
+Change the Workers Builds deploy command to that. The first command updates `artist-analytics` (dashboard). The second updates `artist-analytics-crawler` (cron and queue consumer). Order matters: a queue has one consumer, and deploying the crawler while `artist-analytics` still consumes `artist-analytics-crawl` fails. The dashboard config no longer lists a consumer, so the first deploy detaches it. If the crawler deploy still reports that the queue already has a consumer, detach it and redeploy only the crawler:
+
+```bash
+npx wrangler queues consumer worker remove artist-analytics-crawl artist-analytics
+uv run pywrangler deploy -c crawler/wrangler.jsonc
+```
+
+A same-version redeploy does not clear an isolate that a CPU kill left failing at startup with `Cannot enter a promising task`. This cutover is a new Worker version, which does. Do not roll the crawler back onto the dashboard script.
+
+`wrangler.jsonc` is the dashboard (`python_workers`, `main` = `src/main.py`, `preview_urls` false). It produces `CRAWL_QUEUE` and does not run cron or consume the queue. `crawler/wrangler.jsonc` is `artist-analytics-crawler` (`main` = `../src/crawler_main.py`). It binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. `public/` exists so the dashboard asset directory is valid. HTML templates live in `src/templates` and the crawl schema lives in `src/migrations`. Routes are served by FastAPI (`run_worker_first`). The crawler entrypoint does not import FastAPI or Jinja.
 
 Styles are the prebuilt file `src/static/app.css`, served at `/static/app.css`. A Text rule with `fallthrough: true` uploads `**/*.css` without replacing the default HTML rule. `/favicon.ico` is a small inline SVG. Rebuild CSS after template class changes:
 
@@ -72,7 +81,10 @@ Set these with Wrangler. Do not put the values in `wrangler.jsonc` or in git.
 ```bash
 npx wrangler secret put SECRET_KEY
 npx wrangler secret put YOUTUBE_API_KEY
+npx wrangler secret put YOUTUBE_API_KEY -c crawler/wrangler.jsonc
 ```
+
+Secrets are per Worker. `YOUTUBE_API_KEY` has to be set on `artist-analytics-crawler` as well as the dashboard, or the YouTube provider message stays skipped. Set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` on the crawler too if they are set on the dashboard. `SECRET_KEY` is only the dashboard session cookie. `wrangler secret put` redeploys that Worker; set the crawler secrets after the crawler code deploy so the secret version keeps the new consumer.
 
 | Secret | Required to boot | What it unlocks |
 | --- | --- | --- |
@@ -93,11 +105,11 @@ Paste the id into the commented `kv_namespaces` block in `wrangler.jsonc` (bindi
 
 ## Crawl
 
-`wrangler.jsonc` binds the existing D1 database `artist-analytics` (`DB`, id `52a9190e-4147-402e-8f75-16f5de58bf84`, migrations in `src/migrations`) and the existing queue `artist-analytics-crawl` (producer `CRAWL_QUEUE`; consumer `max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180). Failed deliveries go to `artist-analytics-crawl-dlq`. Wrangler creates that dead-letter queue on deploy when the name is new; if a deploy does not create queues, create `artist-analytics-crawl-dlq` once in the dashboard before relying on it. A cron trigger runs at `*/15 * * * *` UTC. Workers Builds deploys with `uv run pywrangler deploy` and attaches those bindings. That command does not run `wrangler d1 migrations apply`. Migration `0001_crawl.sql` is already applied on the remote database; do not rename or edit it. A later schema change is a new file under `src/migrations`. The scheduled handler and the queue consumer apply any migration file not yet recorded in `schema_migrations`. The dashboard request does not. Every statement in `0001_crawl.sql` is `CREATE TABLE IF NOT EXISTS` or `CREATE INDEX IF NOT EXISTS`, so recording it again does not change the remote schema.
+Both Workers bind the existing D1 database `artist-analytics` (`DB`, id `52a9190e-4147-402e-8f75-16f5de58bf84`, migrations in `src/migrations`). The queue is `artist-analytics-crawl`. The crawler is the consumer (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180) and the dashboard is only a producer. Failed deliveries go to `artist-analytics-crawl-dlq`. Wrangler creates that dead-letter queue on deploy when the name is new; if a deploy does not create queues, create `artist-analytics-crawl-dlq` once in the dashboard before relying on it. The crawler's cron is `*/15 * * * *` UTC. The deploy command does not run `wrangler d1 migrations apply`. Migration `0001_crawl.sql` is already applied on the remote database; do not rename or edit it. A later schema change is a new file under `src/migrations`. The crawler's scheduled handler and queue consumer apply any migration file not yet recorded in `schema_migrations`. The dashboard request does not. Every statement in `0001_crawl.sql` is `CREATE TABLE IF NOT EXISTS` or `CREATE INDEX IF NOT EXISTS`, so recording it again does not change the remote schema.
 
-Each cron invocation refreshes one stale tracked artist (`CRAWL_BATCH_SIZE`, default 1, maximum 5). When `CRAWL_QUEUE` is bound, the cron only enqueues up to `CRAWL_ENQUEUE_LIMIT` artist ids (default 10) and the consumer crawls one message per invocation. If the binding is missing or a send fails, that invocation crawls one batch in process. The cursor is stored and wraps after the last artist. An artist is stale 6 hours after `last_crawled_at` (`CRAWL_STALE_SECONDS`). A MusicBrainz error does not mark the artist fresh. If `DB` is missing, the cron logs that it skipped and does not invent snapshots. Local `uvicorn` uses `data/artist-analytics.sqlite` when it is not running under pytest.
+Each cron invocation enqueues one `{artist_id, provider: "musicbrainz"}` message per stale artist, up to `CRAWL_ENQUEUE_LIMIT` (default 10). That message does a single MusicBrainz search. If the search omits URL relations, it enqueues one lookup message (`mbid` set) instead of calling MusicBrainz again in the same invocation. When the ids are known, they are stored on the `artists` row and the handler enqueues one message per later provider: `spotify`, `instagram`, `tiktok`, `apple`, and `youtube` when a key is set. Each of those reads the stored ids, does one fetch and parse, and writes one `db.batch`. A provider with a snapshot younger than 3 hours is acked without a fetch. An artist is stale 6 hours after `last_crawled_at` (`CRAWL_STALE_SECONDS`). A MusicBrainz error does not mark the artist fresh. If `DB` is missing, the cron logs that it skipped and does not invent snapshots. If the queue binding is missing, the cron still crawls one artist in process. Local `uvicorn` uses `data/artist-analytics.sqlite` when it is not running under pytest.
 
-Searching an artist on the dashboard does not write D1. It enqueues one `{name, origin: "search"}` message on `CRAWL_QUEUE` (awaited, 150ms timeout, failures ignored) and may read growth with a single indexed query. Snapshots, first-seen rows, and Spotify "Fans also like" edges are written by the queue consumer, one artist per message, with `db.batch`. A fresh artist is acked without another crawl, so a burst does not fan the same name out. Related artists in the top 5 are auto-tracked until `RELATED_AUTOTRACK_CAP` (default 25). Set the cap to `0` to keep the edges without tracking anyone new. The public Spotify page's "Fans also like" list is parsed only on that crawl, not while rendering the dashboard. Logged-in users can open `/admin` to see runs and refresh one batch.
+Searching an artist on the dashboard does not write D1. It enqueues one `{name, origin: "search", provider: "musicbrainz"}` message on `CRAWL_QUEUE` (awaited, 150ms timeout, failures ignored) and may read growth with a single indexed query. The MusicBrainz message fans the other providers out. Snapshots and Spotify "Fans also like" edges are written by those provider messages. A fresh artist is acked without another identity crawl, so a burst does not fan the same name out. Related artists in the top 5 are auto-tracked until `RELATED_AUTOTRACK_CAP` (default 25). Set the cap to `0` to keep the edges without tracking anyone new. The public Spotify page's "Fans also like" list is parsed only on the Spotify crawl message, not while rendering the dashboard. Logged-in users can open `/admin` to see runs and refresh one batch.
 
 Audience charts plot only exact integers (monthly listeners, followers, subscribers). A rounded `1.2M` string is not turned into a point. First-seen is when this app stored the row. The source's own timestamp stays separate.
 

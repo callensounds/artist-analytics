@@ -13,8 +13,11 @@ from cache import binding, cache_from_env
 from db import SqliteDatabase, migrate, parse_utc, utc_now
 from history import remember
 from http_client import HttpClient
-from providers import collect_artist
 from runtime import env_get
+
+# One queue message is one of these. MusicBrainz runs first and stores ids;
+# the others then read that row and do a single fetch.
+PROVIDERS = ("musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube")
 
 DEFAULT_STALE_SECONDS = 6 * 60 * 60
 SCAN_WINDOW = 50
@@ -159,7 +162,10 @@ def _bundle_detail(name: str, sources: list | None, exc: BaseException | None = 
         bits.append(bit)
     if exc is not None:
         bits.append(f"{type(exc).__name__}: {exc!r}")
-        bits.append(traceback.format_exc()[-900:])
+        formatted = traceback.format_exc()
+        if len(formatted) > 900:
+            formatted = formatted[:160] + "\n" + formatted[-720:]
+        bits.append(formatted)
     return " | ".join(bit for bit in bits if bit)[:2000]
 
 
@@ -233,6 +239,8 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
         apple_blocked = False
     if apple_blocked:
         skip.add("apple")
+    if collect is None:
+        from providers import collect_artist as collect
     bundle = await collect(
         row["name"],
         env=env,
@@ -259,7 +267,7 @@ async def refresh_artist(db, env, row: dict, *, collect, http, cache, now: datet
     return saved
 
 
-async def run_batch(db, env, *, collect=collect_artist, http=None, cache=None, now: datetime | None = None, limit: int | None = None) -> dict:
+async def run_batch(db, env, *, collect=None, http=None, cache=None, now: datetime | None = None, limit: int | None = None) -> dict:
     moment = now or datetime.now(timezone.utc)
     config = settings(env)
     batch_limit = limit if limit is not None else config["batch_size"]
@@ -361,7 +369,7 @@ async def enqueue_stale(db, env, queue, *, now: datetime | None = None) -> dict:
     )
     sent = 0
     for row in chosen:
-        result = queue.send({"artist_id": int(row["id"])})
+        result = queue.send({"artist_id": int(row["id"]), "provider": "musicbrainz"})
         if hasattr(result, "__await__"):
             await result
         sent += 1
@@ -383,31 +391,33 @@ async def enqueue_stale(db, env, queue, *, now: datetime | None = None) -> dict:
     return {"status": "queued", "attempted": sent, "cursor": last_id}
 
 
-def _message_fields(message) -> tuple[int | None, str | None, str]:
+def _message_fields(message) -> dict:
     body = getattr(message, "body", message)
+    fields = {"artist_id": None, "name": None, "origin": "search", "provider": "musicbrainz", "mbid": ""}
     if isinstance(body, str):
         try:
             body = json.loads(body)
         except json.JSONDecodeError:
-            return None, None, "search"
-    artist_id = None
-    name = None
-    origin = "search"
-    if isinstance(body, dict):
-        if body.get("origin"):
-            origin = str(body.get("origin"))
-        if body.get("name"):
-            name = str(body.get("name"))
+            return fields
+    if not isinstance(body, dict):
         try:
-            if body.get("artist_id") is not None:
-                artist_id = int(body["artist_id"])
-        except (TypeError, ValueError):
-            artist_id = None
-        return artist_id, name, origin
+            fields["artist_id"] = int(body["artist_id"])
+        except Exception:
+            pass
+        return fields
+    if body.get("origin"):
+        fields["origin"] = str(body.get("origin"))
+    if body.get("name"):
+        fields["name"] = str(body.get("name"))
+    provider = str(body.get("provider") or "musicbrainz")
+    fields["provider"] = provider if provider in PROVIDERS else "musicbrainz"
+    fields["mbid"] = str(body.get("mbid") or "")
     try:
-        return int(body["artist_id"]), None, "search"
-    except Exception:
-        return None, None, "search"
+        if body.get("artist_id") is not None:
+            fields["artist_id"] = int(body["artist_id"])
+    except (TypeError, ValueError):
+        fields["artist_id"] = None
+    return fields
 
 
 async def enqueue_search(name: str, env) -> None:
@@ -419,7 +429,7 @@ async def enqueue_search(name: str, env) -> None:
     if queue is None or not hasattr(queue, "send"):
         return
     try:
-        sent = queue.send({"name": cleaned, "origin": "search"})
+        sent = queue.send({"name": cleaned, "origin": "search", "provider": "musicbrainz"})
         if hasattr(sent, "__await__"):
             await asyncio.wait_for(sent, ENQUEUE_TIMEOUT_S)
     except Exception:
@@ -502,6 +512,249 @@ async def record_consumer_run(
     )
 
 
+def _crawl_run_statement(now, status, ok, error, snapshots, edges, discovered, detail):
+    return (
+        """
+        INSERT INTO crawl_runs (
+            started_at, finished_at, status, artists_attempted, artists_ok, artists_error,
+            snapshots_written, edges_written, discovered, detail
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(now),
+            utc_now(now),
+            status,
+            ok,
+            error,
+            snapshots,
+            edges,
+            discovered,
+            (detail or "")[:2000],
+        ),
+    )
+
+
+async def _send_json(queue, body) -> None:
+    if queue is None or not hasattr(queue, "send"):
+        return
+    result = queue.send(body)
+    if hasattr(result, "__await__"):
+        await result
+
+
+def _followup_providers(links: dict, fresh: set[str], *, youtube: bool, apple_blocked: bool) -> list[str]:
+    chosen = []
+    if links.get("spotify_id") and "spotify" not in fresh:
+        chosen.append("spotify")
+    if links.get("instagram") and "instagram" not in fresh:
+        chosen.append("instagram")
+    if links.get("tiktok") and "tiktok" not in fresh:
+        chosen.append("tiktok")
+    if not apple_blocked and "apple" not in fresh:
+        chosen.append("apple")
+    if youtube and "youtube" not in fresh:
+        chosen.append("youtube")
+    return chosen
+
+
+async def _fetch_one(provider: str, name: str, links: dict, env, http, cache):
+    if provider == "spotify":
+        from providers.spotify import fetch_spotify
+
+        return await fetch_spotify(name, links, env, http, cache, include_related=True)
+    if provider == "instagram":
+        from providers.instagram import fetch_instagram
+
+        return await fetch_instagram(name, links, http, cache)
+    if provider == "tiktok":
+        from providers.tiktok import fetch_tiktok
+
+        return await fetch_tiktok(name, links, http, cache)
+    if provider == "apple":
+        from providers.apple import fetch_apple
+
+        return await fetch_apple(name, links, http, cache)
+    if provider == "youtube":
+        from providers.youtube import fetch_youtube
+
+        return await fetch_youtube(name, links, env, http, cache)
+    from models import unavailable
+
+    return unavailable(provider, provider, "This crawler message has no provider.")
+
+
+def _notes(source: dict) -> list[dict]:
+    return [{"platform": source.get("platform"), "status": source.get("status"), "reason": source.get("reason")}]
+
+
+async def _save_one(db, row, source: dict, *, now, related_cap: int):
+    notes = _notes(source)
+    detail = _bundle_detail(str(row.get("name") or ""), notes)
+    ok = source.get("status") != "error"
+
+    def extra(snapshots, edges, discovered):
+        wrote = snapshots or edges
+        if ok:
+            status = "ok"
+        elif wrote:
+            status = "partial"
+        else:
+            status = "error"
+        return [
+            _crawl_run_statement(
+                now,
+                status,
+                1 if status == "ok" else 0,
+                0 if status == "ok" else 1,
+                snapshots,
+                edges,
+                discovered,
+                detail,
+            )
+        ]
+
+    saved = await remember(
+        db,
+        row["name"],
+        {"sources": [source]},
+        origin=row.get("origin") or "search",
+        now=now,
+        related_cap=related_cap,
+        artist_row=row,
+        extra=extra,
+    )
+    saved["logged"] = True
+    saved["ok"] = ok
+    saved["name"] = row["name"]
+    saved["source_notes"] = notes
+    return saved
+
+
+async def _crawl_identity(db, env, row, fields, http, now, related_cap) -> dict:
+    from providers.musicbrainz import fetch_identity
+
+    result = await fetch_identity(http, row["name"], fields.get("mbid") or "")
+    links = dict(result.links or {})
+    if links.get("_needs_lookup") and links.get("_mbid"):
+        await _send_json(
+            env_binding(env, "CRAWL_QUEUE"),
+            {"artist_id": int(row["id"]), "provider": "musicbrainz", "mbid": links["_mbid"]},
+        )
+        return {
+            "ok": True,
+            "snapshots": 0,
+            "edges": 0,
+            "discovered": 0,
+            "name": row["name"],
+            "source_notes": [{"platform": "musicbrainz", "status": "ok", "reason": "lookup queued"}],
+        }
+    saved = await _save_one(db, row, result.to_dict(), now=now, related_cap=0)
+    if result.status in {"ok", "unavailable"}:
+        fresh: set[str] = set()
+        try:
+            fresh = await fresh_sources(db, int(row["id"]), now)
+        except Exception:
+            fresh = set()
+        blocked = False
+        try:
+            until = await apple_blocked_until(db)
+            blocked = until is not None and until > now
+        except Exception:
+            blocked = False
+        # A miss still lets Apple match by name. Spotify, Instagram, and TikTok
+        # need an id stored from a successful identity.
+        stored = links if result.status == "ok" else {}
+        await _fan_out(env, int(row["id"]), stored, fresh, apple_blocked=blocked)
+    return saved
+
+
+async def _fan_out(env, artist_id: int, links: dict, fresh: set[str], *, apple_blocked: bool) -> None:
+    queue = env_binding(env, "CRAWL_QUEUE")
+    youtube = bool(env_get(env, "YOUTUBE_API_KEY"))
+    for provider in _followup_providers(links, fresh, youtube=youtube, apple_blocked=apple_blocked):
+        await _send_json(queue, {"artist_id": artist_id, "provider": provider})
+
+
+async def _crawl_followup(db, env, row, provider, http, cache, now, related_cap) -> dict:
+    if provider == "apple":
+        try:
+            until = await apple_blocked_until(db)
+            if until is not None and until > now:
+                return {
+                    "ok": True,
+                    "snapshots": 0,
+                    "edges": 0,
+                    "discovered": 0,
+                    "name": row["name"],
+                    "source_notes": [{"platform": "apple", "status": "ok", "reason": "skipped during Apple backoff"}],
+                }
+        except Exception:
+            pass
+    if provider == "youtube" and not env_get(env, "YOUTUBE_API_KEY"):
+        return {
+            "ok": True,
+            "snapshots": 0,
+            "edges": 0,
+            "discovered": 0,
+            "name": row["name"],
+            "source_notes": [{"platform": "youtube", "status": "missing_credentials", "reason": "no key"}],
+        }
+    fresh: set[str] = set()
+    try:
+        fresh = await fresh_sources(db, int(row["id"]), now)
+    except Exception:
+        fresh = set()
+    if provider in fresh:
+        return {
+            "ok": True,
+            "snapshots": 0,
+            "edges": 0,
+            "discovered": 0,
+            "name": row["name"],
+            "source_notes": [{"platform": provider, "status": "ok", "reason": "snapshot is fresh"}],
+        }
+    links = known_links(row)
+    if provider == "spotify" and not links.get("spotify_id"):
+        return _missing_id(row, "spotify")
+    if provider == "instagram" and not links.get("instagram"):
+        return _missing_id(row, "instagram")
+    if provider == "tiktok" and not links.get("tiktok"):
+        return _missing_id(row, "tiktok")
+    result = await _fetch_one(provider, row["name"], links, env, http, cache)
+    source = result.to_dict()
+    if provider == "apple" and "HTTP 403" in str(source.get("reason") or ""):
+        try:
+            await block_apple(db, now)
+        except Exception:
+            pass
+    cap = related_cap if provider == "spotify" else 0
+    return await _save_one(db, row, source, now=now, related_cap=cap)
+
+
+def _missing_id(row, provider: str) -> dict:
+    return {
+        "ok": True,
+        "snapshots": 0,
+        "edges": 0,
+        "discovered": 0,
+        "name": row["name"],
+        "source_notes": [
+            {"platform": provider, "status": "unavailable", "reason": "MusicBrainz has not stored an id for this provider."}
+        ],
+    }
+
+
+async def crawl_provider_message(db, env, row, fields, *, http, cache, now, related_cap) -> dict:
+    client = http if http is not None else HttpClient()
+    try:
+        client.crawl_light = True
+    except Exception:
+        pass
+    if fields["provider"] == "musicbrainz":
+        return await _crawl_identity(db, env, row, fields, client, now, related_cap)
+    return await _crawl_followup(db, env, row, fields["provider"], client, cache, now, related_cap)
+
+
 async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) -> dict:
     # max_batch_size is 1. If a batch is larger anyway, only the first artist runs
     # in this invocation. The rest go back on the queue instead of stacking subrequests.
@@ -510,8 +763,6 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
         await _finish_message(extra, "retry", delay_seconds=RETRY_DELAY_SECONDS)
     messages = incoming[:1]
     extra_retries = max(0, len(incoming) - 1)
-    if collect is None:
-        collect = collect_artist
     db = await open_database(env)
     if db is None:
         for message in messages:
@@ -530,7 +781,8 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
     retried = 0
     snapshots = 0
     for message in messages:
-        artist_id, name, origin = _message_fields(message)
+        fields = _message_fields(message)
+        artist_id, name, origin = fields["artist_id"], fields["name"], fields["origin"]
         row = None
         if artist_id is not None:
             row = await db.query_one("SELECT * FROM artists WHERE id = ? AND tracked = 1", (artist_id,))
@@ -540,23 +792,38 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
             await _finish_message(message, "ack")
             acked += 1
             continue
-        # A dashboard burst can enqueue the same name many times. Crawl the stale one.
-        if not _stale(row, moment, config["stale_seconds"]):
+        # A full-artist test passes collect=. Production messages are one provider.
+        # Only the MusicBrainz identity message is deduped by last_crawled_at.
+        # Follow-up provider messages must still run after that timestamp moves.
+        identity = fields["provider"] == "musicbrainz" and not fields["mbid"]
+        if (collect is not None or identity) and not _stale(row, moment, config["stale_seconds"]):
             await _finish_message(message, "ack")
             acked += 1
             continue
         failure = None
         try:
-            saved = await refresh_artist(
-                db,
-                env,
-                row,
-                collect=collect,
-                http=http,
-                cache=store,
-                now=moment,
-                related_cap=config["related_cap"],
-            )
+            if collect is not None:
+                saved = await refresh_artist(
+                    db,
+                    env,
+                    row,
+                    collect=collect,
+                    http=http,
+                    cache=store,
+                    now=moment,
+                    related_cap=config["related_cap"],
+                )
+            else:
+                saved = await crawl_provider_message(
+                    db,
+                    env,
+                    row,
+                    fields,
+                    http=http,
+                    cache=store,
+                    now=moment,
+                    related_cap=config["related_cap"],
+                )
         except Exception as exc:
             # format_exc only works while the exception is active. The D1 write and
             # message.retry below are JS promises and must run after this block.
@@ -604,20 +871,25 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
             edges=saved.get("edges"),
             detail=detail,
         )
-        try:
-            await record_consumer_run(
-                db,
-                now=moment,
-                status=run_status,
-                ok=1 if run_status == "ok" else 0,
-                error=0 if run_status == "ok" else 1,
-                snapshots=int(saved.get("snapshots") or 0),
-                edges=edges,
-                discovered=int(saved.get("discovered") or 0),
-                detail=detail,
-            )
-        except Exception as write_exc:
-            _log("crawl run write failed", **_exc_fields(write_exc))
+        if not saved.get("logged"):
+            try:
+                await record_consumer_run(
+                    db,
+                    now=moment,
+                    status=run_status,
+                    ok=1 if run_status == "ok" else 0,
+                    error=0 if run_status == "ok" else 1,
+                    snapshots=int(saved.get("snapshots") or 0),
+                    edges=edges,
+                    discovered=int(saved.get("discovered") or 0),
+                    detail=detail,
+                )
+            except Exception as write_exc:
+                write_fields = _exc_fields(write_exc)
+            else:
+                write_fields = None
+            if write_fields is not None:
+                _log("crawl run write failed", **write_fields)
         await _finish_message(message, "ack")
         acked += 1
     return {

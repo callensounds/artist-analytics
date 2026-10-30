@@ -1,4 +1,5 @@
 import asyncio
+import html
 import secrets
 from pathlib import Path
 
@@ -7,14 +8,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from crawl import (
-    RETRY_DELAY_SECONDS,
-    _exc_fields,
-    _finish_message,
-    _log,
     enqueue_search,
-    handler_env,
     open_database,
-    run_queue_batch,
     run_scheduled,
     status_report,
 )
@@ -59,6 +54,83 @@ NEXT_ID = 2
 
 # Overlaps the provider fan-out. A stuck D1 read cannot stretch the page.
 GROWTH_READ_TIMEOUT_S = 1.5
+
+
+def render_source_cards(sources: list[dict] | None) -> str:
+    """Source cards are plain strings. Jinja compiling that loop was the slow template step."""
+    parts = ['<div class="grid lg:grid-cols-2 gap-6">']
+    for source in sources or []:
+        label = html.escape(str(source.get("label") or ""))
+        status = html.escape(str(source.get("status") or "").replace("_", " "))
+        parts.append('<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">')
+        parts.append('<div class="flex items-start justify-between gap-3 mb-3"><div>')
+        parts.append('<h2 class="text-lg font-semibold flex items-center gap-2">')
+        image = source.get("image_url")
+        if image:
+            parts.append(
+                f'<img src="{html.escape(str(image), quote=True)}" alt="" class="w-8 h-8 rounded-md object-cover">'
+            )
+        parts.append(f"{label}</h2>")
+        profile = source.get("profile_name")
+        if profile:
+            safe_name = html.escape(str(profile))
+            url = source.get("profile_url")
+            if url:
+                parts.append(
+                    '<p class="text-sm text-slate-300">'
+                    f'<a href="{html.escape(str(url), quote=True)}" class="text-emerald-400 hover:underline">{safe_name}</a></p>'
+                )
+            else:
+                parts.append(f'<p class="text-sm text-slate-300">{safe_name}</p>')
+        parts.append("</div>")
+        parts.append(f'<span class="text-xs uppercase tracking-wide text-slate-400">{status}</span></div>')
+        reason = source.get("reason")
+        if reason:
+            parts.append(f'<p class="text-sm text-slate-300 mb-3">{html.escape(str(reason))}</p>')
+        metrics = source.get("metrics") or []
+        if metrics:
+            parts.append('<dl class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">')
+            for metric in metrics:
+                parts.append('<div class="bg-slate-900/50 rounded-xl p-3">')
+                parts.append(f'<dt class="text-xs text-slate-400">{html.escape(str(metric.get("label") or ""))}</dt>')
+                if metric.get("available") and metric.get("value") is not None:
+                    parts.append(
+                        f'<dd class="text-sm font-medium mt-1 break-words">{html.escape(str(metric.get("value")))}</dd>'
+                    )
+                else:
+                    extra = f" — {html.escape(str(metric.get('reason')))}" if metric.get("reason") else ""
+                    parts.append(f'<dd class="text-sm text-slate-500 mt-1">Unavailable{extra}</dd>')
+                parts.append("</div>")
+            parts.append("</dl>")
+        items = source.get("items") or []
+        if items:
+            parts.append('<div class="max-h-80 overflow-y-auto divide-y divide-slate-700">')
+            for item in items[:20]:
+                title = html.escape(str(item.get("title") or ""))
+                url = item.get("url")
+                if url:
+                    title = f'<a href="{html.escape(str(url), quote=True)}" class="hover:text-emerald-300">{title}</a>'
+                detail = html.escape(str(item.get("detail") or item.get("kind") or ""))
+                display = html.escape(str(item.get("display") or ""))
+                precision = html.escape(str(item.get("precision_label") or ""))
+                weekday = html.escape(str(item.get("weekday"))) if item.get("weekday") else ""
+                clock = f"{precision} · {weekday}" if weekday else precision
+                parts.append(
+                    '<div class="py-2 flex justify-between gap-3"><div class="min-w-0">'
+                    f'<div class="text-sm font-medium truncate">{title}</div>'
+                    f'<div class="text-xs text-slate-500">{detail}</div></div>'
+                    '<div class="text-right shrink-0">'
+                    f'<div class="font-mono text-sm text-emerald-300">{display}</div>'
+                    f'<div class="text-xs text-slate-500">{clock}</div></div></div>'
+                )
+            parts.append("</div>")
+        elif source.get("status") == "ok":
+            parts.append('<p class="text-sm text-slate-400">This source returned profile data, but no dated rows.</p>')
+        for note in source.get("notices") or []:
+            parts.append(f'<p class="text-xs text-slate-500 mt-3">{html.escape(str(note))}</p>')
+        parts.append("</section>")
+    parts.append("</div>")
+    return "".join(parts)
 
 
 def _live_related(bundle: dict) -> list[dict]:
@@ -243,6 +315,7 @@ async def dashboard(request: Request, artist: str | None = None):
             "user": user,
             "query": query,
             "sources": bundle["sources"],
+            "source_cards": render_source_cards(bundle["sources"]),
             "patterns": bundle.get("patterns") or {
                 "release_hours": [],
                 "social_hours": [],
@@ -316,48 +389,9 @@ if asgi is not None:
 
 
 class Default(_Entrypoint):
-    # The runtime calls scheduled(controller, env, ctx) and queue(batch, env, ctx).
-    # env and ctx are optional so a runtime that only passes the event still runs.
-    async def scheduled(self, controller=None, env=None, ctx=None):
-        resolved = handler_env(self, env)
-        _log("scheduled start", cron=getattr(controller, "cron", None))
-        try:
-            result = await run_scheduled(resolved)
-        except Exception as exc:
-            _log("scheduled error", **_exc_fields(exc))
-            raise
-        _log(
-            "scheduled end",
-            status=result.get("status"),
-            attempted=result.get("attempted", 0),
-            ok=result.get("ok", 0),
-            error=result.get("error", 0),
-            reason=result.get("reason"),
-        )
-        return result
+    """Dashboard fetch handler only.
 
-    async def queue(self, batch=None, env=None, ctx=None):
-        resolved = handler_env(self, env)
-        messages = list(getattr(batch, "messages", None) or [])
-        _log("queue start", messages=len(messages))
-        failure = None
-        try:
-            result = await run_queue_batch(batch, resolved)
-        except Exception as exc:
-            # Do not raise, and do not await message.retry until this exception has
-            # finished propagating. A thrown queue handler becomes an exception
-            # outcome and drops the message after max_retries.
-            failure = _exc_fields(exc)
-        if failure is not None:
-            _log("queue error", **failure)
-            for message in messages:
-                await _finish_message(message, "retry", delay_seconds=RETRY_DELAY_SECONDS)
-            result = {"messages": len(messages), "acked": 0, "retried": len(messages), "snapshots": 0}
-        _log(
-            "queue end",
-            messages=result.get("messages", 0),
-            acked=result.get("acked", 0),
-            retried=result.get("retried", 0),
-            snapshots=result.get("snapshots", 0),
-        )
-        return result
+    Cron and the queue consumer run on artist-analytics-crawler so a CPU kill
+    in this isolate cannot poison crawl invocations, and a crawl kill cannot
+    poison dashboard isolates.
+    """

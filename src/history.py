@@ -143,24 +143,37 @@ async def _latest_by_metric(db, artist_id: int) -> dict[tuple[str, str], dict]:
     return {(row["source"], row["metric"]): row for row in rows}
 
 
-async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: datetime | None = None, related_cap: int = 25) -> dict:
+async def remember(
+    db,
+    name: str,
+    bundle: dict,
+    *,
+    origin: str = "search",
+    now: datetime | None = None,
+    related_cap: int = 25,
+    artist_row: dict | None = None,
+    extra=None,
+) -> dict:
     moment = now or datetime.now(timezone.utc)
     stamp = utc_now(moment)
     normalized = normalize_name(name)
     links = _links(bundle)
     channel_ids = links.get("youtube_channel_ids") or []
-    await db.execute(
-        """
-        INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
-        VALUES (?, ?, ?, 1, ?)
-        ON CONFLICT(normalized_name) DO UPDATE SET
-            name = excluded.name,
-            tracked = 1,
-            origin = CASE WHEN excluded.origin = 'search' THEN 'search' ELSE artists.origin END
-        """,
-        (name.strip()[:120], normalized, origin, stamp),
-    )
-    artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalized,))
+    if artist_row is None:
+        await db.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(normalized_name) DO UPDATE SET
+                name = excluded.name,
+                tracked = 1,
+                origin = CASE WHEN excluded.origin = 'search' THEN 'search' ELSE artists.origin END
+            """,
+            (name.strip()[:120], normalized, origin, stamp),
+        )
+        artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalized,))
+    else:
+        artist = artist_row
     artist_id = int(artist["id"])
     sources = bundle.get("sources") or []
     musicbrainz_failed = any(
@@ -251,6 +264,8 @@ async def remember(db, name: str, bundle: dict, *, origin: str = "search", now: 
     )
     related_sql, edges, discovered = await _store_related(db, artist_id, bundle, stamp, related_cap)
     statements.extend(related_sql)
+    if extra is not None:
+        statements.extend(extra(snapshots, edges, discovered))
     # One round trip for every write after the artist row exists.
     await db.batch(statements)
     return {

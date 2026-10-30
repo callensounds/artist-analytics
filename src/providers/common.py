@@ -52,9 +52,13 @@ def drop_blocks(text: str, start_tag: str, end_tag: str) -> str:
     """Remove start_tag...end_tag regions with str.find. Case-insensitive, non-overlapping."""
     if not text:
         return ""
-    lowered = text.lower()
     start_l = start_tag.lower()
     end_l = end_tag.lower()
+    # Spotify's shelf is already lowercase. Avoid copying an 80KB string just to search it.
+    if start_tag.islower() and start_tag.upper() not in text and start_tag.title() not in text:
+        lowered = text
+    else:
+        lowered = text.lower()
     parts = []
     cursor = 0
     while cursor < len(text):
