@@ -101,7 +101,7 @@ async def _get(http, url: str):
 
 async def fetch_tiktok(name: str, links: dict, http, cache) -> SourceResult:
     handle = (links or {}).get("tiktok") or ""
-    if (links or {}).get("_incomplete") and not handle:
+    if (links or {}).get("_incomplete"):
         return unavailable(
             "tiktok",
             "TikTok",

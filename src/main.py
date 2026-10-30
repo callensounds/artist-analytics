@@ -1,3 +1,4 @@
+import asyncio
 import secrets
 from pathlib import Path
 
@@ -5,10 +6,9 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from crawl import open_database, run_scheduled, settings, status_report
-from db import migrate
+from crawl import enqueue_search, open_database, run_scheduled, status_report
 from diag import diagnose
-from history import empty_history, load_artist_history, remember
+from history import empty_history, load_growth
 from http_client import HttpClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
@@ -46,6 +46,9 @@ USERS = {
 }
 NEXT_ID = 2
 
+# Overlaps the provider fan-out. A stuck D1 read cannot stretch the page.
+GROWTH_READ_TIMEOUT_S = 1.5
+
 
 def _live_related(bundle: dict) -> list[dict]:
     for source in bundle.get("sources") or []:
@@ -64,25 +67,20 @@ def _live_related(bundle: dict) -> list[dict]:
     return []
 
 
-async def attach_history(name: str, bundle: dict, env) -> dict:
-    live = _live_related(bundle)
-    db = await open_database(env)
-    if db is None:
-        history = empty_history(
-            "Growth and first-seen times are stored when D1 is bound, or in the local sqlite file. "
-            "Related names from this page load are shown without first-seen dates."
-        )
-        history["related"] = live
-        return history
+async def read_dashboard_history(name: str, env) -> dict:
+    """At most one indexed read. Migrations and writes stay on the crawl."""
     try:
-        await migrate(db)
-        await remember(db, name, bundle, origin="search", related_cap=settings(env)["related_cap"])
-        history = await load_artist_history(db, name)
+        db = await open_database(env, migrate_schema=False)
     except Exception:
-        history = empty_history("The history database could not be updated on this request.")
-    if not history["related"] and live:
-        history["related"] = live
-    return history
+        db = None
+    if db is None:
+        return empty_history(
+            "Growth is stored by the crawler when D1 is bound. This page does not write history."
+        )
+    try:
+        return await asyncio.wait_for(load_growth(db, name), GROWTH_READ_TIMEOUT_S)
+    except Exception:
+        return empty_history("Stored growth could not be read on this request.")
 
 
 def get_current_user(request: Request):
@@ -200,8 +198,12 @@ async def dashboard(request: Request, artist: str | None = None):
     query = (artist or "").strip() or user["artist_name"]
     if len(query) > 120:
         query = query[:120]
+    env = request.scope.get("env")
+    # Enqueue and the growth read run beside the provider calls. Both are bounded.
+    enqueue_task = asyncio.create_task(enqueue_search(query, env))
+    history_task = asyncio.create_task(read_dashboard_history(query, env))
     try:
-        bundle = await collect_artist(query, env=request.scope.get("env"))
+        bundle = await collect_artist(query, env=env)
     except Exception:
         bundle = {
             "sources": [],
@@ -209,9 +211,16 @@ async def dashboard(request: Request, artist: str | None = None):
             "insights": ["The dashboard could not load sources. Refresh to try again."],
         }
     try:
-        history = await attach_history(query, bundle, request.scope.get("env"))
+        history = await history_task
     except Exception:
-        history = empty_history("The history database could not be read on this request.")
+        history = empty_history("Stored growth could not be read on this request.")
+    live = _live_related(bundle)
+    if live and not history.get("related"):
+        history["related"] = live
+    try:
+        await enqueue_task
+    except Exception:
+        pass
     return templates.TemplateResponse(
         request,
         "dashboard.html",

@@ -120,6 +120,18 @@ class SqliteDatabase:
         rows = await self.query(sql, params)
         return rows[0] if rows else None
 
+    async def batch(self, statements: list[tuple[str, tuple]]) -> None:
+        """One commit for many writes. Callers chunk under D1's parameter limit."""
+        if not statements:
+            return
+        try:
+            for sql, params in statements:
+                self.conn.execute(sql, params)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
 
 class D1Database:
     """Await the D1 binding. ``prepare`` and ``bind`` are sync; ``run`` and ``all`` are promises."""
@@ -146,6 +158,20 @@ class D1Database:
     async def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         rows = await self.query(sql, params)
         return rows[0] if rows else None
+
+    async def batch(self, statements: list[tuple[str, tuple]]) -> None:
+        """One D1 round trip. A binding without ``batch`` falls back to sequential ``run`` calls."""
+        if not statements:
+            return
+        batch_fn = getattr(self.binding, "batch", None)
+        if batch_fn is None:
+            for sql, params in statements:
+                await self.execute(sql, params)
+            return
+        prepared = []
+        for sql, params in statements:
+            prepared.append(await self._statement(sql, params))
+        await _await(batch_fn(prepared))
 
 
 async def migrate(db) -> None:

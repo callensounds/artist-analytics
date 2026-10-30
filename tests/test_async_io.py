@@ -310,6 +310,9 @@ def test_concurrent_dashboards_with_async_d1_do_not_block(forbid_blocking, monke
             return Statement(self.conn, sql)
 
     binding = Database()
+    from db import migrate
+
+    asyncio.run(migrate(D1Database(binding)))
 
     class Env:
         DB = binding
@@ -339,7 +342,7 @@ def test_concurrent_dashboards_with_async_d1_do_not_block(forbid_blocking, monke
     assert [r.status_code for r in responses] == [200] * len(responses)
     assert all("growth-data" in response.text for response in responses)
     stored = asyncio.run(D1Database(binding).query("SELECT COUNT(*) AS n FROM artists"))
-    assert stored[0]["n"] >= 5
+    assert stored[0]["n"] == 0
 
 
 def test_body_is_capped_and_the_stream_cancelled(forbid_blocking):

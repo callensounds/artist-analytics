@@ -85,6 +85,7 @@ async def collect_artist(
     cache=None,
     known_links=None,
     deadline_s: float = DASHBOARD_DEADLINE,
+    include_related: bool = False,
 ) -> dict:
     deadline = asyncio.get_running_loop().time() + deadline_s
     client = http or HttpClient(deadline=deadline - RENDER_MARGIN)
@@ -112,7 +113,12 @@ async def collect_artist(
     musicbrainz, apple, spotify, youtube, instagram, tiktok = await asyncio.gather(
         _finish_catalog(rest, partial, deadline),
         _bounded(fetch_apple(name, links, client, store), "apple", "Apple Music", deadline),
-        _bounded(fetch_spotify(name, links, env, client, store), "spotify", "Spotify", deadline),
+        _bounded(
+            fetch_spotify(name, links, env, client, store, include_related=include_related),
+            "spotify",
+            "Spotify",
+            deadline,
+        ),
         _bounded(fetch_youtube(name, links, env, client, store), "youtube", "YouTube", deadline),
         _bounded(fetch_instagram(name, links, client, store), "instagram", "Instagram", deadline),
         _bounded(fetch_tiktok(name, links, client, store), "tiktok", "TikTok", deadline),

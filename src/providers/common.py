@@ -9,7 +9,7 @@ from models import SourceResult, source_from_dict
 
 
 # Bump when a cached error must not outlive a code fix.
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v3"
 
 
 async def cached(cache, key: str, producer) -> SourceResult:
