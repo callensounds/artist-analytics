@@ -6,7 +6,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from crawl import enqueue_search, open_database, run_scheduled, status_report
+from crawl import enqueue_search, handler_env, open_database, run_queue_batch, run_scheduled, status_report, _log
 from diag import diagnose
 from history import empty_history, load_growth
 from http_client import HttpClient
@@ -288,14 +288,52 @@ async def admin_crawl(request: Request):
     return RedirectResponse("/admin", status_code=303)
 
 
+class _Entrypoint:
+    """Used when the workers runtime is not installed. Production subclasses the ASGI entrypoint."""
+
+    def __init__(self, ctx=None, env=None):
+        self.ctx = ctx
+        self.env = env
+
+
 if asgi is not None:
-    _App = asgi.entrypoint(app)
+    _Entrypoint = asgi.entrypoint(app)
 
-    class Default(_App):
-        async def scheduled(self, controller, env, ctx):
-            await run_scheduled(env)
 
-        async def queue(self, batch):
-            from crawl import run_queue_batch
+class Default(_Entrypoint):
+    # The runtime calls scheduled(controller, env, ctx) and queue(batch, env, ctx).
+    # env and ctx are optional so a runtime that only passes the event still runs.
+    async def scheduled(self, controller=None, env=None, ctx=None):
+        resolved = handler_env(self, env)
+        _log("scheduled start", cron=getattr(controller, "cron", None))
+        try:
+            result = await run_scheduled(resolved)
+        except Exception as exc:
+            _log("scheduled error", error=exc.__class__.__name__)
+            raise
+        _log(
+            "scheduled end",
+            status=result.get("status"),
+            attempted=result.get("attempted", 0),
+            ok=result.get("ok", 0),
+            error=result.get("error", 0),
+            reason=result.get("reason"),
+        )
+        return result
 
-            await run_queue_batch(batch, getattr(self, "env", None))
+    async def queue(self, batch=None, env=None, ctx=None):
+        resolved = handler_env(self, env)
+        _log("queue start", messages=len(list(getattr(batch, "messages", None) or [])))
+        try:
+            result = await run_queue_batch(batch, resolved)
+        except Exception as exc:
+            _log("queue error", error=exc.__class__.__name__)
+            raise
+        _log(
+            "queue end",
+            messages=result.get("messages", 0),
+            acked=result.get("acked", 0),
+            retried=result.get("retried", 0),
+            snapshots=result.get("snapshots", 0),
+        )
+        return result
