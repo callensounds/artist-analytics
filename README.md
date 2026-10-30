@@ -63,7 +63,7 @@ npx wrangler deploy -c wrangler.crawler.jsonc
 
 `wrangler.crawler.jsonc` points at the TypeScript Worker `crawler/src/index.ts` and sets `"workers_dev": false`. It is not a Python Worker. A Free-plan CPU kill leaves a Pyodide isolate failing every later invocation, so the consumer runs in JavaScript. The dashboard trigger stays Python (`uv sync`, then `uv run pywrangler deploy`, config `wrangler.jsonc`). A root `package.json` makes the dashboard's Previews check run `npm` as well; that is expected.
 
-The crawler binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. The dashboard config only produces `CRAWL_QUEUE`.
+The crawler binds the same D1 database, produces and consumes `artist-analytics-crawl` (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 10, `retry_delay` 180, dead-letter queue `artist-analytics-crawl-dlq`), and owns the `*/15 * * * *` cron. The dashboard config only produces `CRAWL_QUEUE`. MusicBrainz is paced to one request every 1.5–2 seconds on the isolate. HTTP 429 or 503 from any provider, and a dropped connection, call `message.retry` with a 120–300 second jitter (or `Retry-After` when that is longer, and never sooner than 120 seconds) and are not stored as a finished error.
 
 A queue has one consumer. Deploy the dashboard (which no longer lists a consumer) before the first crawler deploy. If the crawler deploy says the queue already has a consumer:
 
