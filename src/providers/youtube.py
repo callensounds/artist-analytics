@@ -19,13 +19,34 @@ def youtube_url(path: str, params: dict) -> str:
     return f"{API}/{path}?{urlencode(params, quote_via=quote)}"
 
 
-def _message(payload, status: int, secret: str) -> str:
-    text = f"YouTube returned HTTP {status}."
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict) and error.get("message"):
-            text = str(error["message"])
-    return scrub(text, [secret])
+def _reason_code(payload) -> str | None:
+    """Google's machine reason, never the human message (that can echo the key)."""
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    found = []
+    for key in ("details", "errors"):
+        rows = error.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("reason"):
+                found.append(str(row["reason"]).strip())
+    if error.get("status"):
+        found.append(str(error["status"]).strip())
+    for text in found:
+        if text and len(text) <= 80 and " " not in text and not text.startswith("AIza"):
+            return text
+    return None
+
+
+def youtube_error_text(payload, status: int, secret: str) -> str:
+    """HTTP status plus the API reason code. The key value is never included."""
+    reason = _reason_code(payload)
+    suffix = f" ({reason})" if reason else ""
+    return scrub(f"YouTube HTTP {status}{suffix}.", [secret])
 
 
 def redact_key(url: str, secret: str | None) -> str:
@@ -56,10 +77,7 @@ async def _get(http, path: str, params: dict, secret: str):
     except TransportError as exc:
         raise TransportError(str(exc)) from exc
     if not result.ok or not isinstance(payload, dict):
-        message = _message(payload, result.status, secret)
-        if "API key not valid" in message:
-            message += " A logged-in check of the key string is at /admin/diag."
-        raise TransportError(message)
+        raise TransportError(youtube_error_text(payload, result.status, secret))
     return payload
 
 
@@ -100,17 +118,18 @@ def choose_channel(channels: list[dict]) -> dict | None:
     return best
 
 
-def youtube_key_configured(api_key: str) -> bool:
-    """A real Data API key starts with AIza. The literal placeholder must not be sent to Google."""
-    return api_key.startswith("AIza") and api_key != "[REDACTED]"
-
-
 async def fetch_youtube(name: str, links: dict, env, http, cache) -> SourceResult:
     raw = env_string(env, "YOUTUBE_API_KEY")
     api_key = env_get(env, "YOUTUBE_API_KEY")
-    if not api_key or not youtube_key_configured(api_key):
+    # Placeholders are not sent. Any other string is sent so Google can say
+    # keyInvalid, quotaExceeded, or a referrer block instead of a local guess.
+    if not api_key:
         if raw:
-            return errored("youtube", "YouTube", "YouTube key is misconfigured")
+            return errored(
+                "youtube",
+                "YouTube",
+                "YouTube key was not sent (placeholder or non-string). No HTTP status from Google.",
+            )
         return missing_credentials(
             "youtube",
             "YouTube",

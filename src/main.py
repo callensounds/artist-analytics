@@ -14,7 +14,7 @@ from crawl import (
     status_report,
 )
 from diag import diagnose
-from history import empty_history, load_growth
+from history import empty_history, load_dashboard_history
 from http_client import HttpClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
@@ -151,7 +151,7 @@ def _live_related(bundle: dict) -> list[dict]:
 
 
 async def read_dashboard_history(name: str, env) -> dict:
-    """At most one indexed read. Migrations and writes stay on the crawl."""
+    """A few indexed reads. Migrations and writes stay on the crawl."""
     try:
         db = await open_database(env, migrate_schema=False)
     except Exception:
@@ -161,7 +161,7 @@ async def read_dashboard_history(name: str, env) -> dict:
             "Growth is stored by the crawler when D1 is bound. This page does not write history."
         )
     try:
-        return await asyncio.wait_for(load_growth(db, name), GROWTH_READ_TIMEOUT_S)
+        return await asyncio.wait_for(load_dashboard_history(db, name), GROWTH_READ_TIMEOUT_S)
     except Exception:
         return empty_history("Stored growth could not be read on this request.")
 
