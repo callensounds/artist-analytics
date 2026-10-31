@@ -23,6 +23,9 @@ RELATED_RANK_LIMIT = 5
 SIGHTINGS_PER_SOURCE = 8
 SIGHTING_CAP = 24
 GROWTH_ROW_LIMIT = 120
+RELATED_READ_LIMIT = 20
+SIGHTING_READ_LIMIT = 20
+ONE_READING = "one reading, no trend yet"
 # D1 rejects a statement with more than 100 bound parameters.
 _PARAM_BUDGET = 90
 
@@ -51,27 +54,138 @@ def audience_exact(metric: dict) -> int | None:
     return _whole_number(metric.get("value"))
 
 
+def format_span(span_ms: int) -> str:
+    """Compact duration for a delta row. Hours stay whole when the span is exact."""
+    seconds = max(0, int(span_ms // 1000))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 48 * 3600:
+        if seconds % 3600 == 0:
+            return f"{seconds // 3600}h"
+        return f"{seconds / 3600:.1f}h"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    return f"{seconds / 86400:.1f}d"
+
+
+def format_delta(change: int, span_ms: int) -> str:
+    return f"{change:+,} over {format_span(span_ms)}"
+
+
+def _epoch_ms(captured: str | None) -> int | None:
+    moment = parse_utc(captured)
+    if moment is None:
+        return None
+    return int(moment.timestamp() * 1000)
+
+
 def build_growth(rows: list[dict]) -> dict:
+    """One dataset per source and metric, with only the stored exact readings.
+
+    Points are ``{x, y}`` in epoch milliseconds. Series are not aligned onto one
+    another, so a Spotify reading at :32 and an Instagram reading at :33 do not
+    become nulls. Nothing is interpolated.
+    """
     grouped: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
-        key = (row["source"], row["metric"])
+        key = (row.get("source"), row.get("metric"))
         number = _whole_number(row.get("value"))
-        if key not in AUDIENCE or number is None:
+        captured = row.get("captured_at")
+        x = _epoch_ms(captured if isinstance(captured, str) else None)
+        if key not in AUDIENCE or number is None or x is None:
             continue
-        grouped.setdefault(key, []).append({**row, "value": number})
-    labels = sorted({row["captured_at"] for items in grouped.values() for row in items})
+        grouped.setdefault(key, []).append({"x": x, "y": number})
     datasets = []
-    for key, items in grouped.items():
-        by_time = {item["captured_at"]: item["value"] for item in items}
+    for key in AUDIENCE:
+        items = grouped.get(key)
+        if not items:
+            continue
+        items.sort(key=lambda point: point["x"])
+        points: list[dict] = []
+        for point in items:
+            if points and points[-1]["x"] == point["x"]:
+                points[-1] = point
+            else:
+                points.append(point)
+        earliest = points[0]
+        latest = points[-1]
+        if len(points) == 1:
+            delta = {
+                "latest": latest["y"],
+                "earliest": earliest["y"],
+                "change": None,
+                "span_seconds": None,
+                "latest_text": f"{latest['y']:,}",
+                "text": ONE_READING,
+            }
+        else:
+            change = latest["y"] - earliest["y"]
+            span_ms = latest["x"] - earliest["x"]
+            delta = {
+                "latest": latest["y"],
+                "earliest": earliest["y"],
+                "change": change,
+                "span_seconds": span_ms // 1000,
+                "latest_text": f"{latest['y']:,}",
+                "text": format_delta(change, span_ms),
+            }
         datasets.append(
             {
                 "label": AUDIENCE[key],
                 "platform": key[0],
+                "metric": key[1],
                 "color": SOURCE_COLORS.get(key[0], "#94a3b8"),
-                "data": [by_time.get(label) for label in labels],
+                "data": points,
+                "delta": delta,
             }
         )
-    return {"labels": labels, "datasets": datasets}
+    return {"datasets": datasets}
+
+
+def present_related(rows: list[dict]) -> list[dict]:
+    """Rows for the Fans also like list. A name links only when to_artist_id is stored."""
+    presented = []
+    for row in rows or []:
+        name = str(row.get("to_name") or "").strip()
+        if not name:
+            continue
+        artist_id = row.get("to_artist_id")
+        try:
+            linked = int(artist_id) if artist_id is not None and str(artist_id) != "" else None
+        except (TypeError, ValueError):
+            linked = None
+        presented.append(
+            {
+                "to_name": name[:120],
+                "to_spotify_id": str(row.get("to_spotify_id") or ""),
+                "to_artist_id": linked,
+                "rank": row.get("rank"),
+                "first_seen_at": str(row.get("first_seen_at") or ""),
+                "last_seen_at": str(row.get("last_seen_at") or ""),
+            }
+        )
+    return presented
+
+
+def present_sightings(rows: list[dict]) -> list[dict]:
+    presented = []
+    for row in rows or []:
+        title = str(row.get("title") or "").strip()
+        if not title:
+            continue
+        presented.append(
+            {
+                "source": str(row.get("source") or ""),
+                "title": title[:200],
+                "kind": str(row.get("kind") or ""),
+                "published_at": str(row.get("published_at") or ""),
+                "precision": str(row.get("precision") or ""),
+                "first_seen_at": str(row.get("first_seen_at") or ""),
+            }
+        )
+    return presented
 
 
 def empty_history(reason: str) -> dict:
@@ -391,69 +505,73 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
     return statements, written, discovered
 
 
-async def load_growth(db, name: str) -> dict:
-    """One indexed read of recent exact audience points. No writes."""
+ARTIST_LOOKUP_SQL = "SELECT id, name, normalized_name FROM artists WHERE normalized_name = ?"
+
+SNAPSHOT_SQL = """
+SELECT source, metric, value, captured_at
+FROM metric_snapshots
+WHERE artist_id = ? AND value IS NOT NULL
+ORDER BY captured_at DESC, id DESC
+LIMIT ?
+"""
+
+RELATED_SQL = """
+SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at, last_seen_at
+FROM related_edges
+WHERE from_artist_id = ?
+ORDER BY rank ASC, last_seen_at DESC
+LIMIT ?
+"""
+
+SIGHTING_SQL = """
+SELECT source, title, kind, published_at, precision, first_seen_at
+FROM content_sightings
+WHERE artist_id = ?
+ORDER BY first_seen_at DESC, id DESC
+LIMIT ?
+"""
+
+
+async def find_artist(db, name: str) -> dict | None:
+    """Lookup by the same normalized_name the crawler stores. Display case does not matter."""
     normalized = normalize_name(name)
     if not normalized:
-        return empty_history("No exact audience count has been stored yet.")
-    rows = await db.query(
-        """
-        SELECT s.source AS source, s.metric AS metric, s.value AS value, s.captured_at AS captured_at
-        FROM artists AS a
-        INNER JOIN metric_snapshots AS s ON s.artist_id = a.id
-        WHERE a.normalized_name = ? AND s.value IS NOT NULL
-        ORDER BY s.captured_at DESC, s.id DESC
-        LIMIT ?
-        """,
-        (normalized, GROWTH_ROW_LIMIT),
-    )
+        return None
+    return await db.query_one(ARTIST_LOOKUP_SQL, (normalized,))
+
+
+async def load_growth(db, name: str) -> dict:
+    """Audience points only. The dashboard uses load_dashboard_history, which also reads edges."""
+    history = await load_dashboard_history(db, name)
+    if not history.get("growth", {}).get("datasets"):
+        history["reason"] = history.get("reason") or "No exact audience count has been stored yet."
+    return history
+
+
+async def load_dashboard_history(db, name: str) -> dict:
+    """Indexed reads only: the artist row, recent snapshots, related edges, and sightings.
+
+    The old request path called load_growth, which selected metric_snapshots and left
+    related and sightings as empty lists. The template then showed the crawler placeholders
+    even when related_edges and content_sightings had rows.
+    """
+    artist = await find_artist(db, name)
+    if not artist:
+        return empty_history("This artist has no stored snapshots yet.")
+    artist_id = int(artist["id"])
+    rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
+    related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
+    sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
     history = empty_history("No exact audience count has been stored yet.")
-    if not rows:
-        return history
-    history["available"] = True
-    history["reason"] = None
+    history["available"] = bool(rows or related or sightings)
+    history["artist_id"] = artist_id
     history["growth"] = build_growth(rows)
+    history["related"] = present_related(related)
+    history["sightings"] = present_sightings(sightings)
+    if history["growth"]["datasets"]:
+        history["reason"] = None
     return history
 
 
 async def load_artist_history(db, name: str) -> dict:
-    """Several queries. The dashboard uses load_growth instead, so this stays off the request path."""
-    artist = await db.query_one("SELECT * FROM artists WHERE normalized_name = ?", (normalize_name(name),))
-    if not artist:
-        return empty_history("This artist has no stored snapshots yet.")
-    artist_id = int(artist["id"])
-    rows = await db.query(
-        """
-        SELECT source, metric, value, captured_at FROM metric_snapshots
-        WHERE artist_id = ? AND value IS NOT NULL
-        ORDER BY captured_at, id
-        """,
-        (artist_id,),
-    )
-    related = await db.query(
-        """
-        SELECT to_name, to_spotify_id, rank, first_seen_at, last_seen_at
-        FROM related_edges
-        WHERE from_artist_id = ? AND source = 'spotify'
-        ORDER BY rank, to_name
-        """,
-        (artist_id,),
-    )
-    sightings = await db.query(
-        """
-        SELECT source, title, kind, published_at, precision, first_seen_at
-        FROM content_sightings
-        WHERE artist_id = ?
-        ORDER BY first_seen_at DESC, id DESC
-        LIMIT 8
-        """,
-        (artist_id,),
-    )
-    history = empty_history("")
-    history["available"] = True
-    history["reason"] = None
-    history["artist_id"] = artist_id
-    history["growth"] = build_growth(rows)
-    history["related"] = related
-    history["sightings"] = sightings
-    return history
+    return await load_dashboard_history(db, name)

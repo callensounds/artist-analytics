@@ -105,6 +105,10 @@ CREATE TABLE IF NOT EXISTS related_edges (
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY (from_artist_id, to_spotify_id, source)
 );
+CREATE INDEX IF NOT EXISTS idx_related_from_artist
+    ON related_edges (from_artist_id, rank, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_sightings_artist_seen
+    ON content_sightings (artist_id, first_seen_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -152,7 +156,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([

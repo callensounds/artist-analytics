@@ -855,22 +855,73 @@ def test_apple_public_fallback_reads_a_script_slice_and_caps_album_pages():
     assert sum(item.precision == "year" for item in result.items) == 3
 
 
-def test_youtube_misconfigured_key_is_not_sent():
+def test_youtube_placeholder_is_not_sent_and_api_errors_keep_the_reason_code():
     calls = []
 
     def respond(method, url, params, data):
         calls.append(url)
-        return HttpResult(200, "{}", url, {})
+        secret = "not-a-google-key"
+        body = json.dumps(
+            {
+                "error": {
+                    "code": 400,
+                    "message": f"API key not valid. Please pass a valid API key. {secret}",
+                    "errors": [{"message": f"bad {secret}", "reason": "badRequest"}],
+                    "details": [{"reason": "API_KEY_INVALID"}],
+                }
+            }
+        )
+        return HttpResult(400, body, url, {})
 
     http = FakeHttp(respond)
     placeholder = asyncio.run(
         fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "[REDACTED]"}, http, MemoryCache({}))
     )
-    short = asyncio.run(fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "not-a-google-key"}, http, MemoryCache({})))
     assert placeholder.status == "error"
-    assert placeholder.reason == "YouTube key is misconfigured"
-    assert short.reason == "YouTube key is misconfigured"
+    assert placeholder.reason == "YouTube key was not sent (placeholder or non-string). No HTTP status from Google."
     assert calls == []
+    short = asyncio.run(fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "not-a-google-key"}, http, MemoryCache({})))
+    assert short.status == "error"
+    assert short.reason == "YouTube HTTP 400 (API_KEY_INVALID)."
+    assert "not-a-google-key" not in short.reason
+    assert calls
+
+    def quota(method, url, params, data):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": 403,
+                    "message": "The request cannot be completed because you have exceeded your quota.",
+                    "errors": [{"reason": "quotaExceeded"}],
+                }
+            }
+        )
+        return HttpResult(403, body, url, {})
+
+    limited = asyncio.run(
+        fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "AIzaExactKey123"}, FakeHttp(quota), MemoryCache({}))
+    )
+    assert limited.reason == "YouTube HTTP 403 (quotaExceeded)."
+    assert "AIzaExactKey123" not in limited.reason
+
+    def referrer(method, url, params, data):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": 403,
+                    "message": "Requests from referer are blocked.",
+                    "errors": [{"reason": "forbidden"}],
+                    "details": [{"reason": "API_KEY_HTTP_REFERRER_BLOCKED"}],
+                }
+            }
+        )
+        return HttpResult(403, body, url, {})
+
+    blocked = asyncio.run(
+        fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "AIzaExactKey123"}, FakeHttp(referrer), MemoryCache({}))
+    )
+    assert blocked.reason == "YouTube HTTP 403 (API_KEY_HTTP_REFERRER_BLOCKED)."
+    assert "AIzaExactKey123" not in blocked.reason
 
 
 def test_musicbrainz_reports_status_and_body_and_reuses_cached_relations(monkeypatch):

@@ -84,9 +84,11 @@ def test_growth_series_keeps_only_audience_counts():
             {"source": "apple", "metric": "Albums returned", "value": 4, "captured_at": "2026-10-25T06:00:00Z"},
         ]
     )
-    assert growth["labels"] == ["2026-10-25T00:00:00Z", "2026-10-25T06:00:00Z"]
-    assert growth["datasets"][0]["data"] == [10, 12]
+    points = growth["datasets"][0]["data"]
+    assert [point["y"] for point in points] == [10, 12]
+    assert points[1]["x"] - points[0]["x"] == 6 * 3600 * 1000
     assert len(growth["datasets"]) == 1
+    assert growth["datasets"][0]["delta"]["text"] == "+2 over 6h"
 
 
 def test_snapshots_repeat_only_after_an_hour_and_edges_keep_first_seen():
@@ -424,8 +426,9 @@ def test_d1_binding_stores_exact_integers_asynchronously(monkeypatch):
             }
         ]
     )
-    assert growth["datasets"][0]["data"] == [50]
-    assert type(growth["datasets"][0]["data"][0]) is int
+    assert growth["datasets"][0]["data"][0]["y"] == 50
+    assert type(growth["datasets"][0]["data"][0]["y"]) is int
+    assert growth["datasets"][0]["delta"]["text"] == "one reading, no trend yet"
 
 
 def test_known_links_survive_a_musicbrainz_error(monkeypatch):
@@ -492,7 +495,10 @@ def test_admin_requires_login_and_dashboard_shows_stored_growth(monkeypatch, tmp
     assert "Olivia Rodrigo" in page.text
     assert "growthChart" in page.text
     payload = json.loads(page.text.split('id="growth-data" type="application/json">', 1)[1].split("</script>", 1)[0])
-    assert payload["datasets"][0]["data"] == [1000]
+    assert payload["datasets"][0]["data"][0]["y"] == 1000
+    assert "one reading, no trend yet" in page.text
+    assert "Debut" in page.text
+    assert "No related artists have been stored yet." not in page.text
     assert "1.2M" not in page.text
     admin = client.get("/admin")
     assert admin.status_code == 200

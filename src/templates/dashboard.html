@@ -68,11 +68,28 @@
     {% endif %}
 </section>
 
-<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+<section id="growthChart" class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <h2 class="font-semibold mb-1">Audience growth</h2>
-    <p class="text-xs text-slate-400 mb-3">Exact counts only, captured in UTC. A rounded figure is not plotted, and one reading is not a trend.</p>
+    <p class="text-xs text-slate-400 mb-3">Exact counts only, captured in UTC. Each metric has its own scale. A line connects stored readings and does not fill hours that were not crawled. One reading is not a trend.</p>
     {% if history.growth.datasets %}
-    <div class="relative h-64"><canvas id="growthChart"></canvas></div>
+    <ul class="mb-4 space-y-1 text-sm">
+        {% for series in history.growth.datasets %}
+        <li class="flex flex-wrap items-baseline justify-between gap-2">
+            <span>{{ series.label }}</span>
+            <span class="font-mono text-emerald-300">{{ series.delta.latest_text }} · {{ series.delta.text }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    <div class="grid md:grid-cols-2 gap-4">
+        {% for series in history.growth.datasets %}
+        {% if series.data|length > 1 %}
+        <div>
+            <p class="text-xs text-slate-400 mb-1">{{ series.label }}</p>
+            <div class="relative h-40"><canvas id="growth-{{ loop.index0 }}"></canvas></div>
+        </div>
+        {% endif %}
+        {% endfor %}
+    </div>
     {% else %}
     <p class="text-slate-400 text-sm">{{ history.reason or "No exact audience count has been stored yet." }}</p>
     {% endif %}
@@ -88,7 +105,11 @@
             <li class="flex flex-wrap items-baseline justify-between gap-2">
                 <span>
                     <span class="text-slate-500 mr-2">{{ artist.rank }}</span>
+                    {% if artist.to_artist_id %}
                     <a href="/dashboard?artist={{ artist.to_name | urlencode }}" class="hover:text-emerald-300">{{ artist.to_name }}</a>
+                    {% else %}
+                    {{ artist.to_name }}
+                    {% endif %}
                 </span>
                 <span class="text-xs text-slate-500">
                     {% if artist.to_spotify_id %}
@@ -102,29 +123,42 @@
             {% endfor %}
         </ol>
         {% else %}
-        <p class="text-slate-400 text-sm">Fans also like is recorded by the crawler. This page does not parse that list.</p>
+        <p class="text-slate-400 text-sm">No related artists have been stored yet.</p>
         {% endif %}
     </section>
     <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
         <h2 class="font-semibold mb-1">First seen by this app</h2>
         <p class="text-xs text-slate-400 mb-3">When a release or post was first stored. The source time is the published column, not this clock.</p>
         {% if history.sightings %}
-        <ul class="space-y-2 text-sm">
-            {% for item in history.sightings %}
-            <li class="flex justify-between gap-3">
-                <span class="min-w-0">
-                    <span class="text-slate-500">{{ item.source }}</span>
-                    {{ item.title }}
-                </span>
-                <span class="text-right text-xs text-slate-400 shrink-0">
-                    <span class="block text-emerald-300">{{ item.published_at or "source time unavailable" }}</span>
-                    stored {{ item.first_seen_at }}
-                </span>
-            </li>
-            {% endfor %}
-        </ul>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-left text-xs text-slate-500">
+                        <th class="py-1 pr-3 font-medium">Source</th>
+                        <th class="py-1 pr-3 font-medium">Title</th>
+                        <th class="py-1 pr-3 font-medium">Kind</th>
+                        <th class="py-1 pr-3 font-medium">Published</th>
+                        <th class="py-1 font-medium">First seen</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in history.sightings %}
+                    <tr class="border-t border-slate-700/80">
+                        <td class="py-2 pr-3 text-slate-400">{{ item.source }}</td>
+                        <td class="py-2 pr-3">{{ item.title }}</td>
+                        <td class="py-2 pr-3 text-slate-400">{{ item.kind }}</td>
+                        <td class="py-2 pr-3 text-emerald-300">
+                            {{ item.published_at or "source time unavailable" }}
+                            {% if item.precision %}<span class="text-slate-500">{{ item.precision }}</span>{% endif %}
+                        </td>
+                        <td class="py-2 text-slate-400">{{ item.first_seen_at }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
         {% else %}
-        <p class="text-slate-400 text-sm">{{ history.reason or "No releases or posts have been stored yet." }}</p>
+        <p class="text-slate-400 text-sm">No releases or posts have been stored yet.</p>
         {% endif %}
     </section>
 </div>
@@ -190,33 +224,58 @@ drawChart("releaseHourChart", patterns.hour_labels, patterns.release_hours);
 drawChart("socialHourChart", patterns.hour_labels, patterns.social_hours);
 drawChart("weekdayChart", patterns.weekday_labels, patterns.weekdays);
 
-const growth = JSON.parse(document.getElementById("growth-data").textContent);
-if (growth.datasets && growth.datasets.length) {
-    const labels = growth.labels.map((stamp) => stamp.replace("T", " ").replace("Z", " UTC"));
-    new Chart(document.getElementById("growthChart"), {
-        type: "line",
-        data: {
-            labels: labels,
-            datasets: growth.datasets.map((series) => ({
-                label: series.label,
-                data: series.data,
-                borderColor: series.color,
-                backgroundColor: series.color,
-                pointRadius: 3,
-                tension: 0.15,
-                spanGaps: false
-            }))
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: "#cbd5e1" } } },
-            scales: {
-                y: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
-                x: { ticks: { color: "#94a3b8", maxRotation: 0, autoSkip: true }, grid: { display: false } }
-            }
-        }
-    });
+const growthNode = document.getElementById("growth-data");
+let growth = { datasets: [] };
+try {
+    growth = JSON.parse(growthNode ? growthNode.textContent : "{}");
+} catch (err) {
+    growth = { datasets: [] };
 }
+(growth.datasets || []).forEach(function (series, index) {
+    const canvas = document.getElementById("growth-" + index);
+    if (!canvas || !series || !Array.isArray(series.data) || series.data.length < 2 || typeof Chart !== "function") return;
+    try {
+        new Chart(canvas, {
+            type: "line",
+            data: {
+                datasets: [{
+                    label: series.label,
+                    data: series.data,
+                    borderColor: series.color,
+                    backgroundColor: series.color,
+                    pointRadius: 3,
+                    tension: 0,
+                    spanGaps: false
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                parsing: true,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } },
+                    x: {
+                        type: "linear",
+                        ticks: {
+                            color: "#94a3b8",
+                            maxRotation: 0,
+                            autoSkip: true,
+                            maxTicksLimit: 4,
+                            callback: function (value) {
+                                const date = new Date(value);
+                                if (Number.isNaN(date.getTime())) return "";
+                                return date.toISOString().slice(5, 16).replace("T", " ") + "Z";
+                            }
+                        },
+                        grid: { display: false }
+                    }
+                }
+            }
+        });
+    } catch (err) {
+        return;
+    }
+});
 </script>
 {% endblock %}

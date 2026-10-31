@@ -381,7 +381,7 @@ def test_middleware_and_env_get_never_import_js(monkeypatch):
     redacted = asyncio.run(
         fetch_youtube("Example", {}, {"YOUTUBE_API_KEY": "[REDACTED]"}, Recording(), MemoryCache({}))
     )
-    assert redacted.reason == "YouTube key is misconfigured"
+    assert redacted.reason == "YouTube key was not sent (placeholder or non-string). No HTTP status from Google."
     assert calls == []
 
     async def fake_collect(name, env=None, http=None, cache=None):
