@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Audience scores — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl sm:text-3xl font-bold">Audience scores</h1>
+    <p class="text-slate-400 text-sm mt-1">{{ formula }}</p>
+</div>
+{% if scores %}
+<p class="text-xs text-slate-500 mb-4">Top {{ scores|length }} tracked artists with at least one exact count. This page does not call providers.</p>
+<ul class="space-y-3">
+    {% for row in scores %}
+    <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700">
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <a href="/artist/{{ row.artist_id }}" class="font-semibold hover:text-emerald-300">{{ row.rank }}. {{ row.name }}</a>
+            <span class="font-mono text-emerald-300">{{ row.score_text }}</span>
+        </div>
+        <p class="mt-1 text-xs text-slate-400">
+            {% for part in row.components %}{{ part.label }} {{ part.count_text }}{% if not loop.last %} · {% endif %}{% endfor %}
+        </p>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p class="text-slate-400 text-sm">{{ reason }}</p>
+{% endif %}
+{% endblock %}

@@ -171,6 +171,23 @@ CREATE TABLE IF NOT EXISTS musicbrainz_releases (
 );
 CREATE INDEX IF NOT EXISTS idx_mb_releases_artist
     ON musicbrainz_releases (artist_id, released_at);
+CREATE TABLE IF NOT EXISTS chart_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chart_source TEXT NOT NULL,
+    territory TEXT NOT NULL,
+    chart_date TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    track_or_album_name TEXT NOT NULL,
+    apple_artist_id TEXT,
+    artist_name TEXT NOT NULL,
+    artist_id INTEGER REFERENCES artists(id),
+    collected_at TEXT NOT NULL,
+    UNIQUE (chart_source, territory, chart_date, position)
+);
+CREATE INDEX IF NOT EXISTS idx_chart_entries_artist
+    ON chart_entries (artist_id, chart_date);
+CREATE INDEX IF NOT EXISTS idx_chart_entries_source_date
+    ON chart_entries (chart_source, chart_date);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -218,7 +235,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql", "0009_itunes_charts.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
