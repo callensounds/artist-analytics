@@ -14,6 +14,7 @@ from crawl import (
     status_report,
 )
 from diag import diagnose
+from graph import load_related_graph
 from analytics import normalize_name
 from history import (
     empty_history,
@@ -314,6 +315,57 @@ async def search_page(request: Request, q: str | None = None):
         request,
         "search.html",
         {"user": user, "query": query, "matches": matches, "note": note},
+    )
+
+
+@app.get("/artist/{key}/related", response_class=HTMLResponse)
+async def related_graph_page(request: Request, key: str):
+    """Ego network from related_edges. No provider fan-out and no queue send."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    token = (key or "").strip()[:120]
+    db = await _open_read_db(request.scope.get("env"))
+    artist_id = None
+    failed = False
+    if db is not None and token.isdigit():
+        artist_id = int(token)
+    elif db is not None and token:
+        try:
+            artist = await asyncio.wait_for(find_artist(db, token), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            artist = None
+            failed = True
+        if artist is not None:
+            return RedirectResponse(f"/artist/{int(artist['id'])}/related", status_code=303)
+    graph = None
+    if db is not None and artist_id:
+        try:
+            graph = await asyncio.wait_for(load_related_graph(db, artist_id), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            failed = True
+    if graph is None:
+        if db is None or failed:
+            message = "Crawl history is not available on this request. This page does not call providers."
+        else:
+            message = "This artist is not tracked yet. This page does not look them up on Spotify."
+        return templates.TemplateResponse(
+            request,
+            "artist.html",
+            {
+                "user": user,
+                "found": False,
+                "title": "Not tracked",
+                "subtitle": "Stored artists only.",
+                "message": message,
+                "history": empty_history(message),
+            },
+            status_code=404,
+        )
+    return templates.TemplateResponse(
+        request,
+        "related.html",
+        {"user": user, "title": graph["center_name"], "graph": graph},
     )
 
 

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} related — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-6">
+    <div>
+        <p class="text-xs text-slate-500 mb-1"><a href="/artist/{{ graph.center_id }}" class="hover:text-emerald-300">{{ graph.center_name }}</a></p>
+        <h1 class="text-2xl sm:text-3xl font-bold">Related artists</h1>
+        <p class="text-slate-400 text-sm mt-1">Stored Spotify “Fans also like” edges. This page does not call Spotify.</p>
+    </div>
+    <a href="/artist/{{ graph.center_id }}" class="text-sm text-emerald-400 hover:underline">Back to {{ graph.center_name }}</a>
+</div>
+
+{% if graph.neighbors %}
+<div class="grid lg:grid-cols-5 gap-6">
+    <section class="lg:col-span-3 bg-slate-800 rounded-2xl p-4 border border-slate-700">
+        <svg viewBox="0 0 {{ graph.width }} {{ graph.height }}" class="w-full h-auto" role="img" aria-label="Related artists around {{ graph.center_name }}">
+            {% for edge in graph.edges %}
+            <line x1="{{ edge.x1 }}" y1="{{ edge.y1 }}" x2="{{ edge.x2 }}" y2="{{ edge.y2 }}" stroke="#334155" stroke-width="2"></line>
+            {% endfor %}
+            {% for node in graph.nodes %}
+            <a href="/artist/{{ node.id }}">
+                <circle cx="{{ node.x }}" cy="{{ node.y }}" r="{% if node.center %}16{% else %}10{% endif %}" fill="{% if node.center %}#34d399{% else %}#0f172a{% endif %}" stroke="#34d399" stroke-width="2"></circle>
+                <text x="{{ node.x }}" y="{{ node.label_y }}" text-anchor="{{ node.anchor }}" fill="#e2e8f0" font-size="14">{{ node.label }}</text>
+            </a>
+            {% endfor %}
+        </svg>
+    </section>
+    <section class="lg:col-span-2 bg-slate-800 rounded-2xl p-5 border border-slate-700">
+        <h2 class="font-semibold mb-3">By rank</h2>
+        <ol class="space-y-2 text-sm">
+            {% for node in graph.neighbors %}
+            <li class="flex flex-wrap items-baseline justify-between gap-2">
+                <span>
+                    <span class="text-slate-500 mr-2">{{ node.rank }}</span>
+                    <a href="/artist/{{ node.id }}" class="hover:text-emerald-300">{{ node.name }}</a>
+                </span>
+                {% if node.last_seen_at %}
+                <span class="text-xs text-slate-500">last {{ node.last_seen_at }}</span>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ol>
+    </section>
+</div>
+{% else %}
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+    <p class="text-slate-300">No related artists in the database point at another stored artist yet.</p>
+</section>
+{% endif %}
+{% endblock %}
