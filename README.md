@@ -23,7 +23,7 @@ Spotify top tracks expose popularity only. They are not plotted as posts. Follow
 
 Demo login: `artist@demo.com` / `demo123`.
 
-Accounts are in memory and reset when the worker restarts. Demo login lands on `/dashboard`. That page reads stored snapshots first. It live-fetches at most two providers, and only when that provider's newest snapshot or sighting is missing or older than six hours. `/search` and `/artist/<id>` read only artists the crawler has stored in D1. `/artist/<id>/related` draws that artist's stored related-artist edges and does not call Spotify. A name that is not in D1 is not tracked, and that request does not call providers. `/artist/<normalized-name>` redirects to the numeric id. No new migration: `artists.normalized_name` is already unique, so a prefix search can use that index.
+Accounts are in memory and reset when the worker restarts. Demo login lands on `/dashboard`. That page reads stored snapshots first. It live-fetches at most two providers, and only when that provider's newest snapshot or sighting is missing or older than six hours. `/search` and `/artist/<id>` read only artists the crawler has stored in D1. `/artist/<id>/related` draws that artist's stored related-artist edges and does not call Spotify. The Playlists card lists stored `playlist_appearances` rows only. Spotify's Web API does not publish which playlists include an artist, so the crawler does not fill that table. A name that is not in D1 is not tracked, and that request does not call providers. `/artist/<normalized-name>` redirects to the numeric id. No new migration: `artists.normalized_name` is already unique, so a prefix search can use that index.
 
 ## Local development
 
