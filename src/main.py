@@ -1,6 +1,5 @@
 import asyncio
 import html
-import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,7 +7,15 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from accounts import authenticate, list_watched, register_user, unwatch_artist, watch_artist
+from accounts import (
+    DEMO_EMAIL,
+    DEMO_PASSWORD,
+    authenticate,
+    list_watched,
+    register_user,
+    unwatch_artist,
+    watch_artist,
+)
 from crawl import (
     enqueue_search,
     known_links,
@@ -60,16 +67,27 @@ _FAVICON_SVG = (
     "</svg>"
 )
 
-# Used only when D1 is not bound. The password is a hash, same check as D1.
+# Used only when D1 is not bound. password_hash stays empty until the first
+# memory login so Worker startup never calls secrets.token_bytes.
 USERS = {
-    "artist@demo.com": {
+    DEMO_EMAIL: {
         "id": 1,
-        "email": "artist@demo.com",
-        "password_hash": hash_password("demo123"),
+        "email": DEMO_EMAIL,
+        "password_hash": "",
         "artist_name": "Demo Artist",
     }
 }
 NEXT_ID = 2
+
+
+def _memory_user(email: str) -> dict | None:
+    """Fill the demo hash on first use. Register already hashes during the request."""
+    user = USERS.get(email)
+    if user is None:
+        return None
+    if email == DEMO_EMAIL and not user.get("password_hash"):
+        user["password_hash"] = hash_password(DEMO_PASSWORD)
+    return user
 
 # Overlaps the provider fan-out. A stuck D1 read cannot stretch the page.
 GROWTH_READ_TIMEOUT_S = 1.5
@@ -253,7 +271,7 @@ async def login(request: Request, email: str = Form(...), password: str = Form(.
             request.session["auth"] = "d1"
             return RedirectResponse("/dashboard", status_code=303)
     else:
-        user = USERS.get(email)
+        user = _memory_user(email)
         if user and verify_password(password, str(user.get("password_hash") or "")):
             request.session["user_id"] = user["id"]
             request.session["auth"] = "memory"
