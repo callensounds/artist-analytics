@@ -28,7 +28,8 @@ import {
   visibleLines,
 } from "./parse";
 import { backfillAlerts, recordAlerts } from "./alerts";
-import { type SavedSource, type Store, migrate, parseUtc, saveSource, utcNow } from "./store";
+import { parseReleaseGroups } from "./releases";
+import { type SavedSource, type Store, migrate, parseUtc, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
 export const RETRY_DELAY_MIN_SECONDS = 120;
@@ -323,6 +324,15 @@ async function musicbrainz(name: string, mbid: string): Promise<{ status: string
   return { status: "ok", reason: "lookup queued", links, profile: String(chosen.name || name) };
 }
 
+async function musicbrainzReleases(mbid: string) {
+  await paceMusicBrainz();
+  const headers = { Accept: "application/json", "User-Agent": MB_USER_AGENT };
+  const url = `https://musicbrainz.org/ws/2/release-group?${new URLSearchParams({ artist: mbid, fmt: "json", limit: "100" })}`;
+  const response = await fetchJson(url, headers);
+  if (!response.ok || !response.json || typeof response.json !== "object") return [];
+  return parseReleaseGroups(response.json);
+}
+
 async function spotify(artistId: string): Promise<SavedSource> {
   const page = await fetchText(`https://open.spotify.com/artist/${artistId}`, FETCH_BYTES);
   if (page.status === 403) {
@@ -502,6 +512,10 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
       tiktok: identity.links.tiktok || null,
       markCrawled: identity.status !== "error",
     }, now, 0);
+    if (identity.status === "ok" && identity.links._mbid) {
+      const releases = await musicbrainzReleases(identity.links._mbid);
+      await saveMusicBrainzReleases(env.DB, artistId, releases, now);
+    }
     if (identity.status === "ok" || identity.status === "unavailable") {
       const fresh = await freshSources(env.DB, artistId, now);
       const blocked = await appleBlocked(env.DB, now);
