@@ -18,6 +18,24 @@ import { utcNow } from "./store";
 const WINDOW_24H_MS = 24 * 60 * 60 * 1000;
 const WINDOW_7D_MS = 7 * 24 * 60 * 60 * 1000;
 export const ALERT_WRITE_CAP = 4;
+/** Artists checked on one cron tick. Each one reads only its own recent snapshots. */
+export const BACKFILL_ARTISTS_PER_TICK = 5;
+/** Alerts inserted on one cron tick, across that artist batch. */
+export const BACKFILL_ALERTS_PER_TICK = 50;
+
+export const BACKFILL_SQL = `
+SELECT DISTINCT artist_id
+FROM metric_snapshots
+WHERE value IS NOT NULL
+  AND (
+       (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
+    OR (source = 'instagram' AND metric = 'Followers')
+    OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
+  )
+  AND artist_id NOT IN (SELECT artist_id FROM alert_backfill)
+ORDER BY artist_id
+LIMIT ?
+`;
 
 const SERIES = [
   ["spotify", "Monthly listeners"],
@@ -145,7 +163,7 @@ export function evaluateAlerts(
   return found.slice(0, ALERT_WRITE_CAP);
 }
 
-export async function recordAlerts(store: Store, artistId: number, now = new Date()): Promise<number> {
+export async function recordAlerts(store: Store, artistId: number, now = new Date(), maxAlerts = ALERT_WRITE_CAP): Promise<number> {
   const cutoff = new Date(now.getTime() - WINDOW_7D_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
   const rows = await store.all<{ source: string; metric: string; value: unknown; captured_at: string }>(
     `SELECT source, metric, value, captured_at
@@ -160,31 +178,63 @@ export async function recordAlerts(store: Store, artistId: number, now = new Dat
      LIMIT 2000`,
     [artistId, cutoff],
   );
-  const alerts = evaluateAlerts(rows, now);
-  if (!alerts.length) return 0;
-  const detected = utcNow(now);
-  await store.batch(
-    alerts.map((alert) => ({
-      sql: `INSERT INTO metric_alerts (
-              artist_id, provider, metric, window, delta, delta_pct,
-              baseline_value, latest_value, baseline_at, latest_at, detected_at, dedupe_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(dedupe_key) DO NOTHING`,
-      params: [
-        artistId,
-        alert.provider,
-        alert.metric,
-        alert.window,
-        alert.delta,
-        alert.deltaPct,
-        alert.baselineValue,
-        alert.latestValue,
-        alert.baselineAt,
-        alert.latestAt,
-        detected,
-        `${artistId}|${alert.dedupeKey}`,
-      ],
-    })),
-  );
-  return alerts.length;
+  const pending = evaluateAlerts(rows, now);
+  const alerts = pending.slice(0, Math.max(0, maxAlerts));
+  if (alerts.length) {
+    const detected = utcNow(now);
+    await store.batch(
+      alerts.map((alert) => ({
+        sql: `INSERT INTO metric_alerts (
+                artist_id, provider, metric, window, delta, delta_pct,
+                baseline_value, latest_value, baseline_at, latest_at, detected_at, dedupe_key
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(dedupe_key) DO NOTHING`,
+        params: [
+          artistId,
+          alert.provider,
+          alert.metric,
+          alert.window,
+          alert.delta,
+          alert.deltaPct,
+          alert.baselineValue,
+          alert.latestValue,
+          alert.baselineAt,
+          alert.latestAt,
+          detected,
+          `${artistId}|${alert.dedupeKey}`,
+        ],
+      })),
+    );
+  }
+  return { written: alerts.length, complete: alerts.length === pending.length };
+}
+
+export async function backfillAlerts(
+  store: Store,
+  now = new Date(),
+  limits: { artists?: number; alerts?: number } = {},
+): Promise<{ artists: number; alerts: number }> {
+  const artistCap = Math.max(0, Math.min(limits.artists ?? BACKFILL_ARTISTS_PER_TICK, 20));
+  const alertCap = Math.max(0, Math.min(limits.alerts ?? BACKFILL_ALERTS_PER_TICK, 50));
+  if (!artistCap || !alertCap) return { artists: 0, alerts: 0 };
+  const pending = await store.all<{ artist_id: number }>(BACKFILL_SQL, [artistCap]);
+  let artists = 0;
+  let alerts = 0;
+  const stamp = utcNow(now);
+  for (const row of pending) {
+    if (alerts >= alertCap) break;
+    const artistId = Number(row.artist_id);
+    const result = await recordAlerts(store, artistId, now, Math.min(ALERT_WRITE_CAP, alertCap - alerts));
+    alerts += result.written;
+    artists += 1;
+    if (!result.complete) break;
+    await store.batch([
+      {
+        sql: `INSERT INTO alert_backfill (artist_id, checked_at) VALUES (?, ?)
+              ON CONFLICT(artist_id) DO NOTHING`,
+        params: [artistId, stamp],
+      },
+    ]);
+  }
+  return { artists, alerts };
 }

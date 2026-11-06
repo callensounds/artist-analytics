@@ -140,6 +140,10 @@ CREATE TABLE IF NOT EXISTS metric_alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_metric_alerts_artist
     ON metric_alerts (artist_id, detected_at);
+CREATE TABLE IF NOT EXISTS alert_backfill (
+    artist_id INTEGER PRIMARY KEY,
+    checked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -187,7 +191,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
