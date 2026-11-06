@@ -785,6 +785,84 @@ async def load_alert_feed(db, limit: int = ALERTS_PAGE_LIMIT) -> list[dict]:
     return present_alerts(rows)
 
 
+DIRECTORY_PAGE_SIZE = 25
+
+_DIRECTORY_NAME_SQL = """
+SELECT id, name, normalized_name
+FROM artists
+WHERE tracked = 1
+ORDER BY name COLLATE NOCASE, id
+LIMIT ? OFFSET ?
+"""
+
+_DIRECTORY_LISTENER_SQL = """
+SELECT a.id, a.name, a.normalized_name, listeners.value AS monthly_listeners
+FROM artists AS a
+LEFT JOIN (
+    SELECT artist_id, value
+    FROM (
+        SELECT artist_id, value,
+               ROW_NUMBER() OVER (
+                   PARTITION BY artist_id
+                   ORDER BY captured_at DESC, id DESC
+               ) AS rn
+        FROM metric_snapshots
+        WHERE source = 'spotify' AND metric = 'Monthly listeners' AND value IS NOT NULL
+    ) AS ranked
+    WHERE rn = 1
+) AS listeners ON listeners.artist_id = a.id
+WHERE a.tracked = 1
+ORDER BY CASE WHEN listeners.value IS NULL THEN 1 ELSE 0 END, listeners.value DESC, a.name COLLATE NOCASE, a.id
+LIMIT ? OFFSET ?
+"""
+
+
+async def list_tracked_artists(db, *, page: int = 1, sort: str = "name") -> dict:
+    """One page of tracked artists and their two latest exact counts. No network."""
+    mode = "listeners" if sort == "listeners" else "name"
+    total_row = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE tracked = 1")
+    total = int((total_row or {}).get("n") or 0)
+    pages = max(1, (total + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE) if total else 1
+    try:
+        requested = int(page or 1)
+    except (TypeError, ValueError):
+        requested = 1
+    safe_page = min(max(requested, 1), pages)
+    offset = (safe_page - 1) * DIRECTORY_PAGE_SIZE
+    sql = _DIRECTORY_LISTENER_SQL if mode == "listeners" else _DIRECTORY_NAME_SQL
+    rows = await db.query(sql, (DIRECTORY_PAGE_SIZE, offset))
+    ids = [int(row["id"]) for row in rows]
+    metrics = await _latest_metrics(db, ids)
+    linked: set[int] = set()
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        edges = await db.query(
+            f"SELECT DISTINCT from_artist_id AS id FROM related_edges WHERE from_artist_id IN ({marks})",
+            tuple(ids),
+        )
+        linked = {int(row["id"]) for row in edges}
+    artists = []
+    for row in rows:
+        artist_id = int(row["id"])
+        artists.append(
+            {
+                "id": artist_id,
+                "name": row.get("name") or "",
+                "metrics": metrics.get(artist_id, []),
+                "has_related": artist_id in linked,
+            }
+        )
+    return {
+        "artists": artists,
+        "page": safe_page,
+        "pages": pages,
+        "total": total,
+        "sort": mode,
+        "has_prev": safe_page > 1,
+        "has_next": safe_page < pages,
+    }
+
+
 SEARCH_LIMIT = 15
 SHORT_SEARCH_LIMIT = 8
 METRIC_PREVIEW = 2
