@@ -255,6 +255,8 @@ def empty_history(reason: str) -> dict:
         "sightings": [],
         "playlists": [],
         "playlists_reason": PLAYLIST_UNAVAILABLE,
+        "momentum": [],
+        "momentum_reason": None,
         "artist_id": None,
     }
 
@@ -650,6 +652,20 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["playlists"] = present_playlists(playlists or [])
         history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
+    momentum = None
+    momentum_failed = False
+    try:
+        from momentum import MOMENTUM_EMPTY, load_momentum
+
+        momentum = await load_momentum(db, artist_id)
+    except Exception:
+        momentum_failed = True
+    if momentum_failed:
+        history["momentum"] = []
+        history["momentum_reason"] = "Stored momentum could not be read on this request."
+    else:
+        history["momentum"] = momentum or []
+        history["momentum_reason"] = None if history["momentum"] else MOMENTUM_EMPTY
     if history["growth"]["datasets"]:
         history["reason"] = None
     return history
