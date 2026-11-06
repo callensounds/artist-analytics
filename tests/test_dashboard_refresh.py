@@ -1,0 +1,171 @@
+"""Dashboard serves stored snapshots and live-fetches only stale providers."""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from fastapi.testclient import TestClient
+
+import main
+from crawl import reset_pool
+from dashboard_refresh import (
+    DASHBOARD_FRESH_SECONDS,
+    DASHBOARD_LIVE_CAP,
+    choose_live_providers,
+    is_fresh,
+)
+from db import SqliteDatabase, migrate, utc_now
+
+
+def test_fresh_providers_are_not_selected_and_the_cap_holds():
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    fresh = now - timedelta(hours=1)
+    stale = now - timedelta(seconds=DASHBOARD_FRESH_SECONDS)
+    clocks = {
+        "spotify": fresh,
+        "instagram": fresh,
+        "tiktok": fresh,
+        "apple": fresh,
+        "youtube": fresh,
+        "musicbrainz": fresh,
+    }
+    assert choose_live_providers(clocks, now) == []
+    assert is_fresh(fresh, now) is True
+    assert is_fresh(stale, now) is False
+    assert is_fresh(None, now) is False
+    clocks["instagram"] = stale
+    clocks["apple"] = None
+    clocks["tiktok"] = stale
+    assert choose_live_providers(clocks, now) == ["instagram", "tiktok"]
+    assert len(choose_live_providers(clocks, now, cap=1)) == 1
+    missing = {name: None for name in ("spotify", "instagram", "tiktok", "apple", "youtube", "musicbrainz")}
+    assert choose_live_providers(missing, now) == ["spotify", "instagram"]
+    assert DASHBOARD_LIVE_CAP == 2
+
+
+def _seed(database, *, spotify_at, instagram_at, apple_at, crawled_at):
+    async def run():
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (
+                name, normalized_name, origin, tracked, created_at, last_crawled_at,
+                spotify_id, instagram_handle, tiktok_handle, apple_id
+            ) VALUES ('Clairo', 'clairo', 'search', 1, ?, ?, 'sp', 'clairo', 'clairo', '99')
+            """,
+            (crawled_at, crawled_at),
+        )
+        artist = await database.query_one("SELECT id FROM artists WHERE normalized_name = 'clairo'")
+        artist_id = int(artist["id"])
+        await database.execute(
+            """
+            INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+            VALUES (?, 'spotify', 'Followers', 2000000, '2,000,000', ?),
+                   (?, 'instagram', 'Followers', 10, '10', ?),
+                   (?, 'tiktok', 'Followers', 80, '80', ?)
+            """,
+            (artist_id, spotify_at, artist_id, instagram_at, artist_id, crawled_at),
+        )
+        if apple_at:
+            await database.execute(
+                """
+                INSERT INTO content_sightings (
+                    artist_id, source, external_id, title, kind, published_at, precision, first_seen_at
+                ) VALUES (?, 'apple', 'album', 'Sling', 'release', '2021', 'year', ?)
+                """,
+                (artist_id, apple_at),
+            )
+        return artist_id
+
+    return asyncio.run(run())
+
+
+def test_dashboard_skips_live_fetch_when_snapshots_are_fresh(monkeypatch, tmp_path):
+    path = tmp_path / "fresh.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    now = datetime.now(timezone.utc) - timedelta(minutes=30)
+    stamp = utc_now(now)
+    _seed(SqliteDatabase(str(path)), spotify_at=stamp, instagram_at=stamp, apple_at=stamp, crawled_at=stamp)
+    calls = []
+
+    async def fake_collect(*args, **kwargs):
+        calls.append(kwargs.get("skip_platforms"))
+        raise AssertionError("fresh snapshots must not fetch providers")
+
+    monkeypatch.setattr(main, "collect_artist", fake_collect)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    assert page.status_code == 200
+    assert calls == []
+    assert "2,000,000" in page.text
+    assert "Stored" in page.text
+    assert "No provider was fetched" in page.text
+    assert "1.2M" not in page.text
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_dashboard_fetches_only_the_stale_provider(monkeypatch, tmp_path):
+    path = tmp_path / "stale.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    now = datetime.now(timezone.utc)
+    fresh = utc_now(now - timedelta(hours=1))
+    stale = utc_now(now - timedelta(hours=8))
+    _seed(SqliteDatabase(str(path)), spotify_at=fresh, instagram_at=stale, apple_at=fresh, crawled_at=fresh)
+    calls = []
+
+    async def fake_collect(name, env=None, http=None, cache=None, known_links=None, include_related=False, skip_platforms=None):
+        calls.append({"name": name, "skip": set(skip_platforms or []), "links": known_links, "related": include_related})
+        return {
+            "sources": [
+                {
+                    "platform": "instagram",
+                    "label": "Instagram",
+                    "status": "ok",
+                    "reason": None,
+                    "metrics": [{"label": "Followers", "available": True, "value": "12", "exact": 12}],
+                    "items": [
+                        {
+                            "title": "Post",
+                            "kind": "post",
+                            "precision": "time",
+                            "precision_label": "Exact time",
+                            "display": "2026-11-06 01:00 UTC",
+                            "weekday": "Friday",
+                            "hour_utc": 1,
+                            "sort_key": "2026-11-06T01:00:00Z",
+                        }
+                    ],
+                    "notices": [],
+                }
+            ],
+            "patterns": {
+                "hour_labels": [],
+                "weekday_labels": [],
+                "release_hours": [],
+                "social_hours": [],
+                "weekdays": [],
+            },
+            "insights": [],
+        }
+
+    monkeypatch.setattr(main, "collect_artist", fake_collect)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    assert page.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["name"] == "Clairo"
+    assert calls[0]["related"] is False
+    assert "instagram" not in calls[0]["skip"]
+    assert "spotify" in calls[0]["skip"]
+    assert "musicbrainz" in calls[0]["skip"]
+    assert "apple" in calls[0]["skip"]
+    assert "tiktok" in calls[0]["skip"]
+    assert calls[0]["links"]["spotify_id"] == "sp"
+    assert "2026-11-06 01:00 UTC" in page.text
+    assert "2,000,000" in page.text
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)

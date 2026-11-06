@@ -126,15 +126,16 @@ def test_demo_login_and_dashboard_do_not_fabricate_metrics(monkeypatch):
     assert page.status_code == 200
     assert "1.2M" not in page.text
     assert "Analytics Score" not in page.text
-    assert "Needs secret" in page.text
-    assert "YOUTUBE_API_KEY" in page.text
+    assert "does not write history" in page.text
     match = re.search(r'<script id="pattern-data" type="application/json">(.*?)</script>', page.text)
     assert json.loads(match.group(1))["release_hours"] == []
 
 
-def test_artist_query_renders_exact_timestamps(monkeypatch):
-    async def fake_collect(name, env=None, http=None, cache=None):
-        assert name == "Taylor Swift"
+def test_unknown_artist_does_not_fan_out_providers(monkeypatch):
+    calls = []
+
+    async def fake_collect(name, env=None, http=None, cache=None, **kwargs):
+        calls.append(name)
         return {
             "sources": [
                 {
@@ -182,11 +183,10 @@ def test_artist_query_renders_exact_timestamps(monkeypatch):
     client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
     page = client.get("/dashboard", params={"artist": "Taylor Swift"})
     assert page.status_code == 200
-    assert "2019-08-23 07:00 UTC" in page.text
-    assert "Exact time" in page.text
-    assert "releaseHourChart" in page.text
-    assert "07:00 UTC" in page.text
-    assert "typeof Chart" in page.text
+    assert calls == []
+    assert "does not write history" in page.text
+    assert "2019-08-23 07:00 UTC" not in page.text
+    assert "1.2M" not in page.text
 
 
 def test_diag_is_logged_in_only_and_does_not_print_a_secret(monkeypatch):

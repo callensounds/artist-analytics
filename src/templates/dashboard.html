@@ -24,12 +24,14 @@
     {% for source in sources %}
     <span class="text-xs px-3 py-1 rounded-full border
         {% if source.status == 'ok' %}border-emerald-500/60 text-emerald-300
+        {% elif source.status == 'stored' %}border-sky-500/60 text-sky-200
         {% elif source.status == 'missing_credentials' %}border-amber-500/60 text-amber-200
         {% elif source.status == 'error' %}border-red-500/60 text-red-200
         {% else %}border-slate-600 text-slate-300{% endif %}">
         {{ source.label }}
         ·
         {% if source.status == 'ok' %}Live
+        {% elif source.status == 'stored' %}Stored
         {% elif source.status == 'missing_credentials' %}Needs secret
         {% elif source.status == 'error' %}Error
         {% else %}Unavailable{% endif %}
