@@ -144,6 +144,19 @@ CREATE TABLE IF NOT EXISTS alert_backfill (
     artist_id INTEGER PRIMARY KEY,
     checked_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS musicbrainz_releases (
+    artist_id INTEGER NOT NULL,
+    mbid TEXT NOT NULL,
+    title TEXT NOT NULL,
+    release_type TEXT,
+    released_at TEXT,
+    precision TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (artist_id, mbid)
+);
+CREATE INDEX IF NOT EXISTS idx_mb_releases_artist
+    ON musicbrainz_releases (artist_id, released_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -191,7 +204,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
@@ -405,6 +418,40 @@ export async function saveSource(
   });
   await store.batch(statements);
   return { snapshots: snapshots.length, edges, discovered };
+}
+
+export async function saveMusicBrainzReleases(
+  store: Store,
+  artistId: number,
+  releases: { mbid: string; title: string; releaseType: string; releasedAt: string; precision: string }[],
+  now = new Date(),
+): Promise<void> {
+  if (!releases.length) return;
+  const stamp = utcNow(now);
+  const width = 8;
+  const per = 10;
+  for (let offset = 0; offset < releases.length; offset += per) {
+    const chunk = releases.slice(offset, offset + per);
+    const marks = chunk.map(() => "(" + new Array(width).fill("?").join(",") + ")").join(",");
+    const params: unknown[] = [];
+    for (const release of chunk) {
+      params.push(artistId, release.mbid, release.title, release.releaseType, release.releasedAt, release.precision, stamp, stamp);
+    }
+    await store.batch([
+      {
+        sql: `INSERT INTO musicbrainz_releases (
+                artist_id, mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
+              ) VALUES ${marks}
+              ON CONFLICT(artist_id, mbid) DO UPDATE SET
+                title = excluded.title,
+                release_type = excluded.release_type,
+                released_at = excluded.released_at,
+                precision = excluded.precision,
+                last_seen_at = excluded.last_seen_at`,
+        params,
+      },
+    ]);
+  }
 }
 
 function normalizeName(value: string): string {

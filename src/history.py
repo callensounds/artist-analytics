@@ -34,6 +34,8 @@ PLAYLIST_UNAVAILABLE = (
 )
 ALERT_READ_LIMIT = 20
 ALERTS_PAGE_LIMIT = 40
+RELEASE_READ_LIMIT = 50
+RELEASES_EMPTY = "No official MusicBrainz albums, EPs, or singles with a release date have been stored yet."
 ALERTS_EMPTY = (
     "No growth alerts yet. The crawler stores one when a 24h change reaches 2% "
     "or a 7d change reaches 5%, or the absolute jump is large. The same two readings are not stored twice."
@@ -197,6 +199,39 @@ def format_tenths(tenths: int | None) -> str | None:
     return f"{sign}{whole}.{frac}%"
 
 
+def present_releases(rows: list[dict]) -> list[dict]:
+    """Release-group dates at the stored precision. A year is not turned into a day."""
+    presented = []
+    for row in rows or []:
+        title = str(row.get("title") or "").strip()
+        mbid = str(row.get("mbid") or "").strip()
+        if not title or not mbid:
+            continue
+        released = str(row.get("released_at") or "")
+        precision = str(row.get("precision") or "")
+        first_seen = str(row.get("first_seen_at") or "")
+        presented.append(
+            {
+                "mbid": mbid[:64],
+                "title": title[:200],
+                "release_type": str(row.get("release_type") or ""),
+                "released_at": released,
+                "precision": precision,
+                "precision_label": PRECISION_LABELS.get(precision, precision or "Unknown"),
+                "first_seen_at": first_seen,
+                "last_seen_at": str(row.get("last_seen_at") or ""),
+                "_sort": timeline_instant(released, precision, first_seen),
+            }
+        )
+    presented.sort(
+        key=lambda item: ((item["_sort"] or datetime.min.replace(tzinfo=timezone.utc)).timestamp(), item["title"]),
+        reverse=True,
+    )
+    for item in presented:
+        item.pop("_sort", None)
+    return presented
+
+
 def present_alerts(rows: list[dict]) -> list[dict]:
     presented = []
     for row in rows or []:
@@ -318,6 +353,8 @@ def empty_history(reason: str) -> dict:
         "momentum_reason": None,
         "alerts": [],
         "alerts_reason": ALERTS_EMPTY,
+        "releases": [],
+        "releases_reason": RELEASES_EMPTY,
         "artist_id": None,
     }
 
@@ -662,6 +699,13 @@ ORDER BY last_seen_at DESC, id DESC
 LIMIT ?
 """
 
+RELEASE_SQL = """
+SELECT mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
+FROM musicbrainz_releases
+WHERE artist_id = ?
+LIMIT ?
+"""
+
 ALERT_SQL = """
 SELECT provider, metric, window, delta, delta_pct, baseline_value, latest_value,
        baseline_at, latest_at, detected_at
@@ -758,6 +802,18 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["alerts"] = present_alerts(alert_rows or [])
         history["alerts_reason"] = None if history["alerts"] else ALERTS_EMPTY
+    release_rows = None
+    releases_failed = False
+    try:
+        release_rows = await db.query(RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT))
+    except Exception:
+        releases_failed = True
+    if releases_failed:
+        history["releases"] = []
+        history["releases_reason"] = "Stored MusicBrainz releases could not be read on this request."
+    else:
+        history["releases"] = present_releases(release_rows or [])
+        history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
     if history["growth"]["datasets"]:
         history["reason"] = None
     return history
