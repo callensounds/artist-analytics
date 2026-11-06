@@ -23,7 +23,7 @@ Spotify top tracks expose popularity only. They are not plotted as posts. Follow
 
 Demo login: `artist@demo.com` / `demo123`.
 
-Accounts are in memory and reset when the worker restarts. Search any artist from the dashboard; you do not need a matching account name.
+Accounts are in memory and reset when the worker restarts. Demo login lands on `/dashboard`, which still reads live public pages. `/search` and `/artist/<id>` read only artists the crawler has stored in D1. A name that is not in D1 is not tracked, and that request does not call providers. `/artist/<normalized-name>` redirects to the numeric id. No new migration: `artists.normalized_name` is already unique, so a prefix search can use that index.
 
 ## Local development
 

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Average Analytics{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-6">
+    <div>
+        <h1 class="text-2xl sm:text-3xl font-bold break-words">{{ title }}</h1>
+        <p class="text-slate-400 text-sm mt-1">{{ subtitle }}</p>
+    </div>
+    <form method="get" action="/search" class="flex gap-2 w-full md:w-auto">
+        <label class="sr-only" for="q">Artist</label>
+        <input id="q" name="q" value="" maxlength="120"
+               class="flex-1 md:w-72 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:border-emerald-500"
+               placeholder="Search stored artists">
+        <button type="submit" class="shrink-0 bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Search</button>
+    </form>
+</div>
+
+{% if found %}
+{% include "history_cards.html" %}
+{% else %}
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
+    <p class="text-slate-300">{{ message }}</p>
+</section>
+{% endif %}
+{% endblock %}

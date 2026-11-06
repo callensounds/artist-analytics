@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Search — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h1 class="text-2xl sm:text-3xl font-bold mb-2">Search stored artists</h1>
+    <p class="text-slate-400 text-sm mb-4">Names already in the crawl database. This page does not call Spotify, MusicBrainz, or the other providers.</p>
+    <form method="get" action="/search" class="flex gap-2 w-full max-w-xl">
+        <label class="sr-only" for="q">Artist</label>
+        <input id="q" name="q" value="{{ query }}" maxlength="120"
+               class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:border-emerald-500"
+               placeholder="Artist name">
+        <button type="submit" class="shrink-0 bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Search</button>
+    </form>
+</div>
+
+{% if note %}
+<p class="text-slate-400 text-sm mb-6">{{ note }}</p>
+{% endif %}
+
+{% if query %}
+{% if matches %}
+<ul class="space-y-3">
+    {% for artist in matches %}
+    <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700">
+        <a href="/artist/{{ artist.id }}" class="text-lg font-semibold hover:text-emerald-300">{{ artist.name }}</a>
+        {% if artist.metrics %}
+        <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
+            {% for metric in artist.metrics %}
+            <div>
+                <dt class="text-slate-500 inline">{{ metric.label }}</dt>
+                <dd class="inline font-mono text-emerald-300">{{ metric.text }}</dd>
+            </div>
+            {% endfor %}
+        </dl>
+        {% else %}
+        <p class="text-sm text-slate-500 mt-1">No exact audience count stored yet.</p>
+        {% endif %}
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p class="text-slate-400 text-sm">No stored artist matches that name.</p>
+{% endif %}
+{% else %}
+<p class="text-slate-400 text-sm">Type a name to search artists the crawler has already stored.</p>
+{% endif %}
+{% endblock %}
