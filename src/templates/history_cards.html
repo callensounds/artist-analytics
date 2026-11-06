@@ -1,5 +1,24 @@
 {% if history.artist_id %}
 <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1">
+        <h2 class="font-semibold">Growth alerts</h2>
+        <a href="/alerts" class="text-xs text-emerald-400 hover:underline">All alerts</a>
+    </div>
+    <p class="text-xs text-slate-400 mb-3">Stored when a crawl sees a 24h change of at least 2% or a 7d change of at least 5%, or a large absolute jump. The same two readings are not stored again.</p>
+    {% if history.alerts %}
+    <ul class="space-y-2 text-sm">
+        {% for alert in history.alerts %}
+        <li class="flex flex-wrap items-baseline justify-between gap-2">
+            <span>{{ alert.provider }} {{ alert.metric }} · {{ alert.window }}</span>
+            <span class="font-mono text-emerald-300">{{ alert.delta_text }}{% if alert.percent %} · {{ alert.percent }}{% endif %} · {{ alert.baseline_value }} → {{ alert.latest_value }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-slate-400 text-sm">{{ history.alerts_reason or "No growth alerts yet." }}</p>
+    {% endif %}
+</section>
+<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <h2 class="font-semibold mb-1">Momentum</h2>
     <p class="text-xs text-slate-400 mb-3">Exact stored counts. Each change is the latest reading minus the earliest in that window. The span is the time between those two readings. A window with one reading is left off.</p>
     {% if history.momentum %}

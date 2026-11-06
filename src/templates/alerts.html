@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Alerts — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl sm:text-3xl font-bold">Growth alerts</h1>
+    <p class="text-slate-400 text-sm mt-1">Stored by the crawler from exact snapshot changes. This page does not call providers.</p>
+</div>
+{% if alerts %}
+<ul class="space-y-3">
+    {% for alert in alerts %}
+    <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700">
+        <a href="/artist/{{ alert.artist_id }}" class="font-semibold hover:text-emerald-300">{{ alert.artist_name }}</a>
+        <p class="mt-1 text-sm">
+            {{ alert.provider }} {{ alert.metric }} · {{ alert.window }}
+            <span class="font-mono text-emerald-300">{{ alert.delta_text }}{% if alert.percent %} · {{ alert.percent }}{% endif %}</span>
+        </p>
+        <p class="text-xs text-slate-500 mt-1">{{ alert.baseline_value }} → {{ alert.latest_value }} · {{ alert.detected_at }}</p>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p class="text-slate-400 text-sm">{{ reason }}</p>
+{% endif %}
+{% endblock %}
