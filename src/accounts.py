@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from db import utc_now
-from passwords import hash_password, verify_password
+from passwords import hash_password, supported_hash, verify_password
 
 DEMO_EMAIL = "artist@demo.com"
 DEMO_PASSWORD = "demo123"
@@ -25,7 +25,17 @@ async def ensure_demo_user(db) -> dict | None:
         (DEMO_EMAIL,),
     )
     if existing:
-        return existing
+        if supported_hash(str(existing.get("password_hash") or "")):
+            return existing
+        # A demo row that is not pbkdf2_sha256 cannot be checked. Replace only that hash.
+        await db.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(DEMO_PASSWORD), int(existing["id"])),
+        )
+        return await db.query_one(
+            "SELECT id, email, password_hash FROM users WHERE email = ?",
+            (DEMO_EMAIL,),
+        )
     await db.execute(
         "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
         (DEMO_EMAIL, hash_password(DEMO_PASSWORD), utc_now()),
