@@ -32,6 +32,12 @@ PLAYLIST_UNAVAILABLE = (
     "The Web API lists albums and top tracks, and a playlist search only matches names, not track placements. "
     "This card stays empty until a public source exists."
 )
+ALERT_READ_LIMIT = 20
+ALERTS_PAGE_LIMIT = 40
+ALERTS_EMPTY = (
+    "No growth alerts yet. The crawler stores one when a 24h change reaches 2% "
+    "or a 7d change reaches 5%, or the absolute jump is large. The same two readings are not stored twice."
+)
 ONE_READING = "one reading, no trend yet"
 # D1 rejects a statement with more than 100 bound parameters.
 _PARAM_BUDGET = 90
@@ -176,6 +182,59 @@ def present_related(rows: list[dict]) -> list[dict]:
     return presented
 
 
+def format_tenths(tenths: int | None) -> str | None:
+    """Display for a percent stored as integer tenths. 20 is +2%."""
+    if tenths is None:
+        return None
+    try:
+        number = int(tenths)
+    except (TypeError, ValueError):
+        return None
+    sign = "+" if number > 0 else ("-" if number < 0 else "")
+    whole, frac = divmod(abs(number), 10)
+    if frac == 0:
+        return f"{sign}{whole}%"
+    return f"{sign}{whole}.{frac}%"
+
+
+def present_alerts(rows: list[dict]) -> list[dict]:
+    presented = []
+    for row in rows or []:
+        delta = _whole_number(row.get("delta"))
+        if delta is None and row.get("delta") not in (0, "0"):
+            signed = row.get("delta")
+            if isinstance(signed, int) and not isinstance(signed, bool):
+                delta = signed
+            elif isinstance(signed, str) and re.fullmatch(r"-?\d+", signed.strip()):
+                delta = int(signed.strip())
+        if not isinstance(delta, int):
+            continue
+        baseline = _whole_number(row.get("baseline_value"))
+        latest = _whole_number(row.get("latest_value"))
+        if baseline is None or latest is None:
+            continue
+        pct = row.get("delta_pct")
+        tenths = int(pct) if isinstance(pct, int) and not isinstance(pct, bool) else None
+        if tenths is None and isinstance(pct, str) and re.fullmatch(r"-?\d+", pct.strip()):
+            tenths = int(pct.strip())
+        presented.append(
+            {
+                "artist_id": row.get("artist_id"),
+                "artist_name": str(row.get("artist_name") or ""),
+                "provider": str(row.get("provider") or ""),
+                "metric": str(row.get("metric") or ""),
+                "window": str(row.get("window") or ""),
+                "delta": delta,
+                "delta_text": f"{delta:+,}",
+                "percent": format_tenths(tenths),
+                "baseline_value": baseline,
+                "latest_value": latest,
+                "detected_at": str(row.get("detected_at") or ""),
+            }
+        )
+    return presented
+
+
 def present_playlists(rows: list[dict]) -> list[dict]:
     """Stored playlist rows. A missing follower count stays missing, not zero."""
     presented = []
@@ -257,6 +316,8 @@ def empty_history(reason: str) -> dict:
         "playlists_reason": PLAYLIST_UNAVAILABLE,
         "momentum": [],
         "momentum_reason": None,
+        "alerts": [],
+        "alerts_reason": ALERTS_EMPTY,
         "artist_id": None,
     }
 
@@ -601,6 +662,25 @@ ORDER BY last_seen_at DESC, id DESC
 LIMIT ?
 """
 
+ALERT_SQL = """
+SELECT provider, metric, window, delta, delta_pct, baseline_value, latest_value,
+       baseline_at, latest_at, detected_at
+FROM metric_alerts
+WHERE artist_id = ?
+ORDER BY detected_at DESC, id DESC
+LIMIT ?
+"""
+
+ALERTS_FEED_SQL = """
+SELECT artists.name AS artist_name, metric_alerts.artist_id, metric_alerts.provider,
+       metric_alerts.metric, metric_alerts.window, metric_alerts.delta, metric_alerts.delta_pct,
+       metric_alerts.baseline_value, metric_alerts.latest_value, metric_alerts.detected_at
+FROM metric_alerts
+JOIN artists ON artists.id = metric_alerts.artist_id
+ORDER BY metric_alerts.detected_at DESC, metric_alerts.id DESC
+LIMIT ?
+"""
+
 
 async def find_artist(db, name: str) -> dict | None:
     """Lookup by the same normalized_name the crawler stores. Display case does not matter."""
@@ -666,6 +746,18 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["momentum"] = momentum or []
         history["momentum_reason"] = None if history["momentum"] else MOMENTUM_EMPTY
+    alert_rows = None
+    alerts_failed = False
+    try:
+        alert_rows = await db.query(ALERT_SQL, (artist_id, ALERT_READ_LIMIT))
+    except Exception:
+        alerts_failed = True
+    if alerts_failed:
+        history["alerts"] = []
+        history["alerts_reason"] = "Stored alerts could not be read on this request."
+    else:
+        history["alerts"] = present_alerts(alert_rows or [])
+        history["alerts_reason"] = None if history["alerts"] else ALERTS_EMPTY
     if history["growth"]["datasets"]:
         history["reason"] = None
     return history
@@ -686,6 +778,11 @@ async def load_dashboard_history(db, name: str) -> dict:
 
 async def load_artist_history(db, name: str) -> dict:
     return await load_dashboard_history(db, name)
+
+
+async def load_alert_feed(db, limit: int = ALERTS_PAGE_LIMIT) -> list[dict]:
+    rows = await db.query(ALERTS_FEED_SQL, (max(1, min(int(limit), ALERTS_PAGE_LIMIT)),))
+    return present_alerts(rows)
 
 
 SEARCH_LIMIT = 15

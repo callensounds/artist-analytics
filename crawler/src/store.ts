@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS playlist_appearances (
 );
 CREATE INDEX IF NOT EXISTS idx_playlist_artist_seen
     ON playlist_appearances (artist_id, last_seen_at);
+CREATE TABLE IF NOT EXISTS metric_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artist_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    window TEXT NOT NULL,
+    delta INTEGER NOT NULL,
+    delta_pct INTEGER,
+    baseline_value INTEGER NOT NULL,
+    latest_value INTEGER NOT NULL,
+    baseline_at TEXT NOT NULL,
+    latest_at TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_metric_alerts_artist
+    ON metric_alerts (artist_id, detected_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -170,7 +187,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([

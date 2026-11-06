@@ -21,9 +21,11 @@ from graph import load_related_graph
 from analytics import normalize_name
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from history import (
+    ALERTS_EMPTY,
     empty_history,
     find_artist,
     find_artist_by_id,
+    load_alert_feed,
     load_dashboard_history,
     load_history_for_artist,
     search_artists,
@@ -319,6 +321,35 @@ async def search_page(request: Request, q: str | None = None):
         request,
         "search.html",
         {"user": user, "query": query, "matches": matches, "note": note},
+    )
+
+
+@app.get("/alerts", response_class=HTMLResponse)
+async def alerts_page(request: Request):
+    """Recent stored growth alerts. No provider fan-out."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    alerts: list[dict] = []
+    failed = False
+    if db is not None:
+        try:
+            alerts = await asyncio.wait_for(load_alert_feed(db), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            failed = True
+    if db is None:
+        reason = "Alerts are stored by the crawler when D1 is bound. This page does not call providers."
+    elif failed:
+        reason = "Stored alerts could not be read on this request."
+    elif alerts:
+        reason = ""
+    else:
+        reason = ALERTS_EMPTY
+    return templates.TemplateResponse(
+        request,
+        "alerts.html",
+        {"user": user, "alerts": alerts, "reason": reason},
     )
 
 

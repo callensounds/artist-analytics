@@ -27,6 +27,7 @@ import {
   tiktokVideos,
   visibleLines,
 } from "./parse";
+import { recordAlerts } from "./alerts";
 import { type SavedSource, type Store, migrate, parseUtc, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
@@ -533,7 +534,14 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   else saved = await youtube(String(row.name), links.youtube_channel_id, env.YOUTUBE_API_KEY || "");
   if (saved.forbidden) await blockApple(env.DB, now);
   const relatedCap = provider === "spotify" ? numberSetting(env.RELATED_AUTOTRACK_CAP, 25, 500) : 0;
-  await saveSource(env.DB, row, saved, now, relatedCap);
+  const written = await saveSource(env.DB, row, saved, now, relatedCap);
+  if (written.snapshots > 0 && (provider === "spotify" || provider === "instagram" || provider === "tiktok")) {
+    try {
+      await recordAlerts(env.DB, artistId, now);
+    } catch {
+      // The snapshot is already stored. A failed alert insert does not drop the crawl.
+    }
+  }
   return { ok: saved.status !== "error", detail: `${row.name} | ${saved.platform}=${saved.status}` };
 }
 
