@@ -7,7 +7,6 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import main
-from passwords import hash_password
 from cache import MemoryCache
 from http_client import HttpResult
 from providers.youtube import fetch_youtube
@@ -43,7 +42,7 @@ def setup_function():
     main.USERS["artist@demo.com"] = {
         "id": 1,
         "email": "artist@demo.com",
-        "password_hash": hash_password("demo123"),
+        "password_hash": "",
         "artist_name": "Demo Artist",
     }
     main.NEXT_ID = 2

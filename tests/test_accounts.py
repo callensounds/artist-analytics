@@ -1,6 +1,9 @@
 """Persistent accounts. Demo login uses the same password hash check."""
 
 import asyncio
+import subprocess
+import sys
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -9,6 +12,42 @@ from accounts import authenticate
 from crawl import reset_pool
 from db import SqliteDatabase, migrate
 from passwords import verify_password
+
+
+def test_import_does_not_draw_randomness():
+    src = Path(main.__file__).resolve().parent
+    code = (
+        "import secrets\n"
+        "def boom(n=16):\n"
+        "    raise OSError('Randomness is not allowed while a Worker is starting')\n"
+        "secrets.token_bytes = boom\n"
+        "import main\n"
+        "user = main.USERS['artist@demo.com']\n"
+        "assert not user.get('password_hash')\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=src, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_memory_demo_login_hashes_on_first_use():
+    main.USERS.clear()
+    main.USERS["artist@demo.com"] = {
+        "id": 1,
+        "email": "artist@demo.com",
+        "password_hash": "",
+        "artist_name": "Demo Artist",
+    }
+    client = TestClient(main.app)
+    logged = client.post(
+        "/login",
+        data={"email": "artist@demo.com", "password": "demo123"},
+        follow_redirects=False,
+    )
+    assert logged.status_code == 303
+    stored = main.USERS["artist@demo.com"]["password_hash"]
+    assert stored.startswith("pbkdf2_sha256$")
+    assert verify_password("demo123", stored)
+    assert "demo123" not in stored
 
 
 def test_register_login_logout_and_duplicate_email(monkeypatch, tmp_path):
