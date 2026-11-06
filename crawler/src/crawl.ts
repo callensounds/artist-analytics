@@ -27,7 +27,7 @@ import {
   tiktokVideos,
   visibleLines,
 } from "./parse";
-import { recordAlerts } from "./alerts";
+import { backfillAlerts, recordAlerts } from "./alerts";
 import { type SavedSource, type Store, migrate, parseUtc, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
@@ -565,9 +565,21 @@ function safeJson(body: string): Record<string, unknown> {
   }
 }
 
-export async function runScheduled(env: CrawlEnv): Promise<{ status: string; attempted: number }> {
-  if (!env.DB) return { status: "skipped", attempted: 0 };
-  return enqueueStale(env);
+export async function runScheduled(env: CrawlEnv, now = new Date()): Promise<{ status: string; attempted: number; backfillArtists: number; backfillAlerts: number }> {
+  if (!env.DB) return { status: "skipped", attempted: 0, backfillArtists: 0, backfillAlerts: 0 };
+  const queued = await enqueueStale(env, now);
+  let backfill = { artists: 0, alerts: 0 };
+  try {
+    backfill = await backfillAlerts(env.DB, now);
+  } catch {
+    // The queue send already happened. A backfill miss waits for the next tick.
+  }
+  return {
+    status: queued.status,
+    attempted: queued.attempted,
+    backfillArtists: backfill.artists,
+    backfillAlerts: backfill.alerts,
+  };
 }
 
 export interface QueueMessage {
