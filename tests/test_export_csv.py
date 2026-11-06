@@ -86,6 +86,17 @@ def test_csv_keeps_exact_values_and_caps_each_section():
                 "last_seen_at": "2026-11-01T00:00:00Z",
             },
         ],
+        [
+            {
+                "mbid": "rg-sling",
+                "title": "Sling",
+                "release_type": "Album",
+                "released_at": "2021-06-16",
+                "precision": "day",
+                "first_seen_at": "2026-11-01T00:00:00Z",
+                "last_seen_at": "2026-11-06T00:00:00Z",
+            }
+        ],
     )
     parsed = list(csv.DictReader(io.StringIO(text)))
     metrics = [row for row in parsed if row["section"] == "metric"]
@@ -106,6 +117,8 @@ def test_csv_keeps_exact_values_and_caps_each_section():
             "to_name": "",
             "to_spotify_id": "",
             "to_artist_id": "",
+            "mbid": "",
+            "release_type": "",
         }
     ]
     assert "1.2M" not in text
@@ -114,6 +127,12 @@ def test_csv_keeps_exact_values_and_caps_each_section():
     assert sighting["precision"] == "time"
     related = [row for row in parsed if row["section"] == "related"]
     assert related[1]["to_artist_id"] == ""
+    release = next(row for row in parsed if row["section"] == "release")
+    assert release["mbid"] == "rg-sling"
+    assert release["published_at"] == "2021-06-16"
+    assert release["precision"] == "day"
+    assert release["release_type"] == "Album"
+    assert "-01-01" not in release["published_at"]
     assert EXPORT_ROW_CAP == 5000
 
 

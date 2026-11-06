@@ -836,6 +836,45 @@ async def load_artist_history(db, name: str) -> dict:
     return await load_dashboard_history(db, name)
 
 
+TRENDING_CAP = 50
+_TRENDING_WINDOWS = {"24h", "7d"}
+_TRENDING_PROVIDERS = {"spotify", "instagram", "tiktok"}
+
+
+async def list_trending(db, *, window: str = "", provider: str = "") -> list[dict]:
+    """Recent stored alerts, largest percent first. No network."""
+    clauses: list[str] = []
+    params: list = []
+    chosen_window = window if window in _TRENDING_WINDOWS else ""
+    chosen_provider = provider if provider in _TRENDING_PROVIDERS else ""
+    if chosen_window:
+        clauses.append("metric_alerts.window = ?")
+        params.append(chosen_window)
+    if chosen_provider:
+        clauses.append("metric_alerts.provider = ?")
+        params.append(chosen_provider)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(TRENDING_CAP)
+    rows = await db.query(
+        f"""
+        SELECT artists.name AS artist_name, metric_alerts.artist_id, metric_alerts.provider,
+               metric_alerts.metric, metric_alerts.window, metric_alerts.delta, metric_alerts.delta_pct,
+               metric_alerts.baseline_value, metric_alerts.latest_value, metric_alerts.detected_at
+        FROM metric_alerts
+        JOIN artists ON artists.id = metric_alerts.artist_id
+        {where}
+        ORDER BY CASE WHEN metric_alerts.delta_pct IS NULL THEN 1 ELSE 0 END,
+                 ABS(metric_alerts.delta_pct) DESC,
+                 ABS(metric_alerts.delta) DESC,
+                 metric_alerts.detected_at DESC,
+                 metric_alerts.id DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    return present_alerts(rows)
+
+
 async def load_alert_feed(db, limit: int = ALERTS_PAGE_LIMIT) -> list[dict]:
     rows = await db.query(ALERTS_FEED_SQL, (max(1, min(int(limit), ALERTS_PAGE_LIMIT)),))
     return present_alerts(rows)

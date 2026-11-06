@@ -7,7 +7,7 @@ import io
 
 from history import _whole_number
 
-# Newest rows only. Three indexed reads, each stopped at this cap.
+# Newest rows only. Each section stops at this cap.
 EXPORT_ROW_CAP = 5000
 
 COLUMNS = (
@@ -26,6 +26,8 @@ COLUMNS = (
     "to_name",
     "to_spotify_id",
     "to_artist_id",
+    "mbid",
+    "release_type",
 )
 
 _METRIC_SQL = """
@@ -52,6 +54,14 @@ ORDER BY rank ASC, last_seen_at DESC
 LIMIT ?
 """
 
+_RELEASE_SQL = """
+SELECT mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
+FROM musicbrainz_releases
+WHERE artist_id = ?
+ORDER BY released_at DESC, mbid
+LIMIT ?
+"""
+
 
 def _blank(value) -> str:
     if value is None:
@@ -59,7 +69,13 @@ def _blank(value) -> str:
     return str(value)
 
 
-def render_export_csv(metrics: list[dict], sightings: list[dict], edges: list[dict]) -> str:
+def _row(section: str, **fields: object) -> list:
+    values = {key: _blank(value) for key, value in fields.items()}
+    values["section"] = section
+    return [values.get(column, "") for column in COLUMNS]
+
+
+def render_export_csv(metrics: list[dict], sightings: list[dict], edges: list[dict], releases: list[dict] | None = None) -> str:
     """One CSV. A metric is included only when value is an exact integer."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -69,64 +85,53 @@ def render_export_csv(metrics: list[dict], sightings: list[dict], edges: list[di
         if number is None:
             continue
         writer.writerow(
-            [
+            _row(
                 "metric",
-                _blank(row.get("captured_at")),
-                _blank(row.get("source")),
-                _blank(row.get("metric")),
-                number,
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ]
+                captured_at=row.get("captured_at"),
+                provider=row.get("source"),
+                metric=row.get("metric"),
+                value=number,
+            )
         )
     for row in sightings:
         writer.writerow(
-            [
+            _row(
                 "sighting",
-                "",
-                _blank(row.get("source")),
-                "",
-                "",
-                _blank(row.get("title")),
-                _blank(row.get("kind")),
-                _blank(row.get("published_at")),
-                _blank(row.get("precision")),
-                _blank(row.get("first_seen_at")),
-                "",
-                "",
-                "",
-                "",
-                "",
-            ]
+                provider=row.get("source"),
+                title=row.get("title"),
+                kind=row.get("kind"),
+                published_at=row.get("published_at"),
+                precision=row.get("precision"),
+                first_seen_at=row.get("first_seen_at"),
+            )
         )
     for row in edges:
         artist_id = row.get("to_artist_id")
         writer.writerow(
-            [
+            _row(
                 "related",
-                "",
-                "spotify",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                _blank(row.get("first_seen_at")),
-                _blank(row.get("last_seen_at")),
-                _blank(row.get("rank")),
-                _blank(row.get("to_name")),
-                _blank(row.get("to_spotify_id")),
-                "" if artist_id is None else _blank(artist_id),
-            ]
+                provider="spotify",
+                first_seen_at=row.get("first_seen_at"),
+                last_seen_at=row.get("last_seen_at"),
+                rank=row.get("rank"),
+                to_name=row.get("to_name"),
+                to_spotify_id=row.get("to_spotify_id"),
+                to_artist_id="" if artist_id is None else artist_id,
+            )
+        )
+    for row in releases or []:
+        writer.writerow(
+            _row(
+                "release",
+                provider="musicbrainz",
+                title=row.get("title"),
+                published_at=row.get("released_at"),
+                precision=row.get("precision"),
+                first_seen_at=row.get("first_seen_at"),
+                last_seen_at=row.get("last_seen_at"),
+                mbid=row.get("mbid"),
+                release_type=row.get("release_type"),
+            )
         )
     return buffer.getvalue()
 
@@ -136,4 +141,5 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
     metrics = await db.query(_METRIC_SQL, (artist_id, cap))
     sightings = await db.query(_SIGHTING_SQL, (artist_id, cap))
     edges = await db.query(_EDGE_SQL, (artist_id, cap))
-    return {"metrics": metrics, "sightings": sightings, "edges": edges}
+    releases = await db.query(_RELEASE_SQL, (artist_id, cap))
+    return {"metrics": metrics, "sightings": sightings, "edges": edges, "releases": releases}
