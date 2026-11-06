@@ -341,6 +341,18 @@ describe("crawler messages", () => {
   });
 });
 
+describe("playlist schema", () => {
+  it("creates an empty playlist_appearances table", async () => {
+    const db = new DatabaseSync(":memory:");
+    await migrate(sqliteStore(db));
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'playlist_appearances'").get();
+    expect(table).toEqual({ name: "playlist_appearances" });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 0 });
+    const version = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0004_playlist_appearances.sql");
+    expect(version).toBeTruthy();
+  });
+});
+
 function queueMessage(body: unknown) {
   return {
     body,

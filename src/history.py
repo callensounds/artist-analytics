@@ -25,6 +25,13 @@ SIGHTING_CAP = 24
 GROWTH_ROW_LIMIT = 120
 RELATED_READ_LIMIT = 20
 SIGHTING_READ_LIMIT = 20
+PLAYLIST_READ_LIMIT = 20
+# Spotify publishes no playlist-appearance list. Search-by-name is not placement.
+PLAYLIST_UNAVAILABLE = (
+    "Spotify does not publish which playlists include an artist. "
+    "The Web API lists albums and top tracks, and a playlist search only matches names, not track placements. "
+    "This card stays empty until a public source exists."
+)
 ONE_READING = "one reading, no trend yet"
 # D1 rejects a statement with more than 100 bound parameters.
 _PARAM_BUDGET = 90
@@ -169,6 +176,31 @@ def present_related(rows: list[dict]) -> list[dict]:
     return presented
 
 
+def present_playlists(rows: list[dict]) -> list[dict]:
+    """Stored playlist rows. A missing follower count stays missing, not zero."""
+    presented = []
+    for row in rows or []:
+        name = str(row.get("playlist_name") or "").strip()
+        playlist_id = str(row.get("playlist_id") or "").strip()
+        if not name or not playlist_id:
+            continue
+        followers = _whole_number(row.get("follower_count"))
+        position = _whole_number(row.get("position"))
+        presented.append(
+            {
+                "playlist_id": playlist_id[:80],
+                "name": name[:200],
+                "owner_name": str(row.get("owner_name") or "").strip()[:120],
+                "follower_count": followers,
+                "follower_text": f"{followers:,}" if followers is not None else None,
+                "position": position,
+                "first_seen_at": str(row.get("first_seen_at") or ""),
+                "last_seen_at": str(row.get("last_seen_at") or ""),
+            }
+        )
+    return presented
+
+
 def present_sightings(rows: list[dict]) -> list[dict]:
     presented = []
     for row in rows or []:
@@ -195,6 +227,8 @@ def empty_history(reason: str) -> dict:
         "growth": {"labels": [], "datasets": []},
         "related": [],
         "sightings": [],
+        "playlists": [],
+        "playlists_reason": PLAYLIST_UNAVAILABLE,
         "artist_id": None,
     }
 
@@ -531,6 +565,14 @@ ORDER BY first_seen_at DESC, id DESC
 LIMIT ?
 """
 
+PLAYLIST_SQL = """
+SELECT playlist_id, playlist_name, owner_name, follower_count, position, first_seen_at, last_seen_at
+FROM playlist_appearances
+WHERE artist_id = ?
+ORDER BY last_seen_at DESC, id DESC
+LIMIT ?
+"""
+
 
 async def find_artist(db, name: str) -> dict | None:
     """Lookup by the same normalized_name the crawler stores. Display case does not matter."""
@@ -563,6 +605,12 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
     related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
     sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
+    playlists = None
+    playlists_failed = False
+    try:
+        playlists = await db.query(PLAYLIST_SQL, (artist_id, PLAYLIST_READ_LIMIT))
+    except Exception:
+        playlists_failed = True
     history = empty_history("No exact audience count has been stored yet.")
     history["available"] = bool(rows or related or sightings)
     history["artist_id"] = artist_id
@@ -570,6 +618,12 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     history["growth"] = build_growth(rows)
     history["related"] = present_related(related)
     history["sightings"] = present_sightings(sightings)
+    if playlists_failed:
+        history["playlists"] = []
+        history["playlists_reason"] = "Stored playlists could not be read on this request."
+    else:
+        history["playlists"] = present_playlists(playlists or [])
+        history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
     if history["growth"]["datasets"]:
         history["reason"] = None
     return history

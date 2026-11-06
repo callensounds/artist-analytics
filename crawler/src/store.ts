@@ -109,6 +109,20 @@ CREATE INDEX IF NOT EXISTS idx_related_from_artist
     ON related_edges (from_artist_id, rank, last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_sightings_artist_seen
     ON content_sightings (artist_id, first_seen_at);
+CREATE TABLE IF NOT EXISTS playlist_appearances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artist_id INTEGER NOT NULL,
+    playlist_id TEXT NOT NULL,
+    playlist_name TEXT NOT NULL,
+    owner_name TEXT,
+    follower_count INTEGER,
+    position INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE (artist_id, playlist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_playlist_artist_seen
+    ON playlist_appearances (artist_id, last_seen_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -156,7 +170,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
