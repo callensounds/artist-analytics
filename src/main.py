@@ -7,6 +7,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from charts import CHARTS_PAGE_EMPTY, load_chart_board
 from accounts import (
     DEMO_EMAIL,
     DEMO_PASSWORD,
@@ -44,6 +45,7 @@ from http_client import HttpClient
 from passwords import hash_password, verify_password
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware, env_get
+from scores import SCORE_FORMULA, SCORE_RANK_EMPTY, rank_scores
 
 try:
     from workers import asgi
@@ -559,6 +561,64 @@ async def alerts_page(request: Request):
         request,
         "alerts.html",
         {"user": user, "alerts": alerts, "reason": reason},
+    )
+
+
+@app.get("/charts", response_class=HTMLResponse)
+async def charts_page(request: Request):
+    """Latest stored US iTunes charts. No feed fetch on this request."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    board = {"songs": [], "albums": [], "songs_date": "", "albums_date": ""}
+    failed = False
+    if db is not None:
+        try:
+            board = await asyncio.wait_for(load_chart_board(db), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            failed = True
+    if db is None:
+        reason = "Charts are stored by the crawler when D1 is bound. This page does not fetch Apple or Spotify."
+    elif failed:
+        reason = "Stored chart positions could not be read on this request."
+    elif board["songs"] or board["albums"]:
+        reason = ""
+    else:
+        reason = CHARTS_PAGE_EMPTY
+    return templates.TemplateResponse(
+        request,
+        "charts.html",
+        {"user": user, "reason": reason, **board},
+    )
+
+
+@app.get("/scores", response_class=HTMLResponse)
+async def scores_page(request: Request):
+    """Rank tracked artists by the transparent audience score. No provider calls."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    ranked: list[dict] = []
+    failed = False
+    if db is not None:
+        try:
+            ranked = await asyncio.wait_for(rank_scores(db), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            failed = True
+    if db is None:
+        reason = "Scores are computed from counts the crawler stored. This page does not call providers."
+    elif failed:
+        reason = "Stored audience counts could not be read on this request."
+    elif ranked:
+        reason = ""
+    else:
+        reason = SCORE_RANK_EMPTY
+    return templates.TemplateResponse(
+        request,
+        "scores.html",
+        {"user": user, "scores": ranked, "reason": reason, "formula": SCORE_FORMULA},
     )
 
 

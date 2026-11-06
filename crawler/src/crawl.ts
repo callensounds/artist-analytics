@@ -29,6 +29,7 @@ import {
 } from "./parse";
 import { backfillAlerts, recordAlerts } from "./alerts";
 import { parseReleaseGroups } from "./releases";
+import { ingestItunesCharts } from "./charts";
 import { type SavedSource, type Store, migrate, parseUtc, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
@@ -579,8 +580,9 @@ function safeJson(body: string): Record<string, unknown> {
   }
 }
 
-export async function runScheduled(env: CrawlEnv, now = new Date()): Promise<{ status: string; attempted: number; backfillArtists: number; backfillAlerts: number }> {
-  if (!env.DB) return { status: "skipped", attempted: 0, backfillArtists: 0, backfillAlerts: 0 };
+export async function runScheduled(env: CrawlEnv, now = new Date()): Promise<{ status: string; attempted: number; backfillArtists: number; backfillAlerts: number; charts: { status: string; written: number; linked: number; errors: string[] } }> {
+  const skippedCharts = { status: "skipped", written: 0, linked: 0, errors: [] as string[] };
+  if (!env.DB) return { status: "skipped", attempted: 0, backfillArtists: 0, backfillAlerts: 0, charts: skippedCharts };
   const queued = await enqueueStale(env, now);
   let backfill = { artists: 0, alerts: 0 };
   try {
@@ -588,11 +590,22 @@ export async function runScheduled(env: CrawlEnv, now = new Date()): Promise<{ s
   } catch {
     // The queue send already happened. A backfill miss waits for the next tick.
   }
+  let charts = skippedCharts;
+  try {
+    charts = await ingestItunesCharts(env.DB, now);
+  } catch (error) {
+    console.log(JSON.stringify({
+      message: "chart ingest failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    charts = { status: "error", written: 0, linked: 0, errors: ["ingest failed"] };
+  }
   return {
     status: queued.status,
     attempted: queued.attempted,
     backfillArtists: backfill.artists,
     backfillAlerts: backfill.alerts,
+    charts,
   };
 }
 

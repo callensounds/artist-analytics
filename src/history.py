@@ -6,7 +6,9 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from analytics import PRECISION_LABELS, SOURCE_COLORS, normalize_name
+from charts import CHARTS_EMPTY, load_artist_charts
 from db import parse_utc, utc_now
+from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
 AUDIENCE = {
@@ -355,6 +357,12 @@ def empty_history(reason: str) -> dict:
         "alerts_reason": ALERTS_EMPTY,
         "releases": [],
         "releases_reason": RELEASES_EMPTY,
+        "charts": [],
+        "charts_reason": CHARTS_EMPTY,
+        "score_text": None,
+        "score_components": [],
+        "score_formula": SCORE_FORMULA,
+        "score_reason": SCORE_EMPTY,
         "artist_id": None,
     }
 
@@ -814,6 +822,34 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["releases"] = present_releases(release_rows or [])
         history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
+    chart_rows = None
+    charts_failed = False
+    try:
+        chart_rows = await load_artist_charts(db, artist_id)
+    except Exception:
+        charts_failed = True
+    if charts_failed:
+        history["charts"] = []
+        history["charts_reason"] = "Stored chart positions could not be read on this request."
+    else:
+        history["charts"] = chart_rows or []
+        history["charts_reason"] = None if history["charts"] else CHARTS_EMPTY
+    score = None
+    score_failed = False
+    try:
+        score = await load_artist_score(db, artist_id)
+    except Exception:
+        score_failed = True
+    if score_failed or score is None:
+        history["score_text"] = None
+        history["score_components"] = []
+        history["score_formula"] = SCORE_FORMULA
+        history["score_reason"] = "Stored audience counts could not be read on this request." if score_failed else SCORE_EMPTY
+    else:
+        history["score_text"] = score["score_text"]
+        history["score_components"] = score["components"]
+        history["score_formula"] = score["formula"]
+        history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
     if history["growth"]["datasets"]:
         history["reason"] = None
     return history
@@ -936,15 +972,23 @@ async def list_tracked_artists(db, *, page: int = 1, sort: str = "name") -> dict
             tuple(ids),
         )
         linked = {int(row["id"]) for row in edges}
+    scores: dict[int, dict] = {}
+    if ids:
+        try:
+            scores = await load_scores(db, ids)
+        except Exception:
+            scores = {}
     artists = []
     for row in rows:
         artist_id = int(row["id"])
+        score = scores.get(artist_id) or {}
         artists.append(
             {
                 "id": artist_id,
                 "name": row.get("name") or "",
                 "metrics": metrics.get(artist_id, []),
                 "has_related": artist_id in linked,
+                "score_text": score.get("score_text"),
             }
         )
     return {
