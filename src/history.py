@@ -5,7 +5,15 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
-from analytics import PRECISION_LABELS, SOURCE_COLORS, normalize_name
+from analytics import (
+    PRECISION_LABELS,
+    SOURCE_COLORS,
+    build_posting_patterns,
+    build_release_calendar,
+    empty_posting_patterns,
+    empty_release_calendar,
+    normalize_name,
+)
 from charts import CHARTS_EMPTY, load_artist_charts
 from db import parse_utc, utc_now
 from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
@@ -37,7 +45,11 @@ PLAYLIST_UNAVAILABLE = (
 ALERT_READ_LIMIT = 20
 ALERTS_PAGE_LIMIT = 40
 RELEASE_READ_LIMIT = 50
+EXACT_TIME_READ_LIMIT = 80
+RELEASE_SIGHTING_READ_LIMIT = 60
 RELEASES_EMPTY = "No official MusicBrainz albums, EPs, or singles with a release date have been stored yet."
+POSTING_READ_ERROR = "Stored timestamps could not be read on this request."
+CALENDAR_READ_ERROR = "Stored releases could not be read on this request."
 ALERTS_EMPTY = (
     "No growth alerts yet. The crawler stores one when a 24h change reaches 2% "
     "or a 7d change reaches 5%, or the absolute jump is large. The same two readings are not stored twice."
@@ -363,6 +375,8 @@ def empty_history(reason: str) -> dict:
         "score_components": [],
         "score_formula": SCORE_FORMULA,
         "score_reason": SCORE_EMPTY,
+        "posting": empty_posting_patterns(),
+        "calendar": empty_release_calendar(),
         "artist_id": None,
     }
 
@@ -714,6 +728,24 @@ WHERE artist_id = ?
 LIMIT ?
 """
 
+# published_at is the source clock. first_seen_at is when this app stored the row.
+EXACT_TIME_SQL = """
+SELECT source, published_at, precision
+FROM content_sightings
+WHERE artist_id = ? AND precision = 'time'
+  AND source IN ('instagram', 'tiktok', 'youtube', 'apple')
+ORDER BY published_at DESC, id DESC
+LIMIT ?
+"""
+
+RELEASE_SIGHTING_SQL = """
+SELECT source, title, kind, published_at, precision
+FROM content_sightings
+WHERE artist_id = ? AND source IN ('apple', 'spotify')
+ORDER BY published_at DESC, id DESC
+LIMIT ?
+"""
+
 ALERT_SQL = """
 SELECT provider, metric, window, delta, delta_pct, baseline_value, latest_value,
        baseline_at, latest_at, detected_at
@@ -822,6 +854,43 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["releases"] = present_releases(release_rows or [])
         history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
+    posting_rows = None
+    posting_failed = False
+    try:
+        posting_rows = await db.query(EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT))
+    except Exception:
+        posting_failed = True
+    if posting_failed:
+        history["posting"] = empty_posting_patterns(POSTING_READ_ERROR)
+    else:
+        history["posting"] = build_posting_patterns(posting_rows or [])
+    release_sightings = None
+    release_sightings_failed = False
+    try:
+        release_sightings = await db.query(RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT))
+    except Exception:
+        release_sightings_failed = True
+    calendar_rows = [
+        {
+            "title": release.get("title"),
+            "source": "musicbrainz",
+            "released_at": release.get("released_at"),
+            "precision": release.get("precision"),
+            "kind": release.get("release_type"),
+            "mbid": release.get("mbid"),
+        }
+        for release in history["releases"]
+    ]
+    if not release_sightings_failed:
+        calendar_rows.extend(release_sightings or [])
+    history["calendar"] = build_release_calendar(calendar_rows)
+    if not history["calendar"]["available"] and (releases_failed or release_sightings_failed):
+        if releases_failed and release_sightings_failed:
+            history["calendar"] = empty_release_calendar(CALENDAR_READ_ERROR)
+        elif releases_failed:
+            history["calendar"]["reason"] = "Stored MusicBrainz releases could not be read on this request."
+        else:
+            history["calendar"]["reason"] = "Stored Apple and Spotify releases could not be read on this request."
     chart_rows = None
     charts_failed = False
     try:

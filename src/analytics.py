@@ -14,6 +14,47 @@ WEEKDAYS = [
     "Saturday",
     "Sunday",
 ]
+WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTH_NAMES = [
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+]
+# Exact clock only. A day, month, or year is not a posting hour.
+POSTING_SOURCES = ("instagram", "tiktok", "youtube", "apple")
+POSTING_LABELS = {
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "apple": "Apple Music",
+}
+POSTING_MIN_EXACT = 3
+CALENDAR_SOURCES = ("musicbrainz", "apple", "spotify")
+CALENDAR_LABELS = {
+    "musicbrainz": "MusicBrainz",
+    "apple": "Apple Music",
+    "spotify": "Spotify",
+}
+CALENDAR_MONTH_CAP = 12
+CALENDAR_CELL_CAP = 3
+POSTING_NONE = (
+    "No exact UTC timestamp is stored for Instagram, TikTok, YouTube, or Apple. "
+    "Year, month, and day-only dates are excluded, and no hour is guessed."
+)
+CALENDAR_EMPTY = (
+    "No MusicBrainz, Apple, or Spotify release date is stored yet. "
+    "Year-only dates are not placed on a day."
+)
 PRECISION_RANK = {"unknown": 0, "year": 1, "month": 2, "day": 3, "time": 4}
 PRECISION_LABELS = {
     "time": "Exact time",
@@ -326,6 +367,308 @@ def build_insights(sources: list[dict]) -> list[str]:
             "No day-level dates or exact timestamps were returned for this artist yet."
         )
     return insights[:8]
+
+
+def _posting_few(exact: int, minimum: int) -> str:
+    noun = "timestamp" if exact == 1 else "timestamps"
+    return (
+        f"{exact} exact UTC {noun} stored. "
+        f"Hour and weekday patterns need at least {minimum}. "
+        "Year, month, and day-only dates are excluded, and the missing hours are not filled in."
+    )
+
+
+def _bar_heights(counts: list[int]) -> list[int]:
+    top = max(counts) if counts else 0
+    heights = []
+    for count in counts:
+        if top <= 0 or count <= 0:
+            heights.append(0)
+        else:
+            heights.append(max(12, int(round(100 * count / top))))
+    return heights
+
+
+def _row_text(row: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def stated_precision(raw: str, stated: str | None) -> str:
+    """Keep the coarser of the stored precision and what the string actually contains."""
+    parsed = classify_date(raw)
+    if parsed == "unknown":
+        return "unknown"
+    key = (stated or "").strip().lower()
+    if key not in PRECISION_RANK or key == "unknown":
+        return parsed
+    if PRECISION_RANK[key] < PRECISION_RANK[parsed]:
+        return key
+    if PRECISION_RANK[parsed] < PRECISION_RANK[key]:
+        return parsed
+    return key
+
+
+def build_posting_patterns(rows: list[dict] | None, *, minimum: int = POSTING_MIN_EXACT) -> dict:
+    """UTC hour and weekday counts from Exact time rows only.
+
+    Instagram, TikTok, YouTube, and Apple releaseDate qualify. A year, month, or
+    day-only value is excluded. A date with no clock is not turned into 00:00.
+    Below `minimum` exact timestamps the buckets stay empty so a sample of one
+    is not drawn as a pattern.
+    """
+    floor = minimum if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0 else POSTING_MIN_EXACT
+    hours = empty_hours()
+    days = empty_weekdays()
+    per_source = {source: 0 for source in POSTING_SOURCES}
+    exact = 0
+    excluded = 0
+    allowed = set(POSTING_SOURCES)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("source") or "").strip().lower()
+        if source not in allowed:
+            continue
+        precision = str(row.get("precision") or "").strip().lower()
+        published = _row_text(row, ("published_at", "when", "released_at"))
+        if precision != "time" or classify_date(published) != "time":
+            excluded += 1
+            continue
+        moment = parse_utc(published)
+        if moment is None:
+            excluded += 1
+            continue
+        moment = moment.astimezone(timezone.utc)
+        hours[moment.hour] += 1
+        days[moment.weekday()] += 1
+        per_source[source] += 1
+        exact += 1
+    available = exact >= floor
+    public_hours = hours if available else empty_hours()
+    public_days = days if available else empty_weekdays()
+    hour_heights = _bar_heights(public_hours)
+    day_heights = _bar_heights(public_days)
+    hour_bars = [
+        {"label": f"{hour:02d}:00 UTC", "count": public_hours[hour], "height": hour_heights[hour]}
+        for hour in range(24)
+    ]
+    weekday_bars = [
+        {
+            "label": WEEKDAYS[index],
+            "short": WEEKDAY_SHORT[index],
+            "count": public_days[index],
+            "height": day_heights[index],
+        }
+        for index in range(7)
+    ]
+    nonzero_hours = [bar for bar in hour_bars if bar["count"] > 0]
+    sources = [
+        {"source": source, "label": POSTING_LABELS[source], "count": per_source[source]}
+        for source in POSTING_SOURCES
+        if available and per_source[source] > 0
+    ]
+    hour_peak = peak(public_hours, [bar["label"] for bar in hour_bars]) if available else None
+    day_peak = peak(public_days, WEEKDAYS) if available else None
+    summary_parts = []
+    if hour_peak:
+        summary_parts.append(
+            f"Most common hour is {hour_peak['label']} "
+            f"({hour_peak['count']} of {hour_peak['total']} exact timestamps)."
+        )
+    if day_peak:
+        summary_parts.append(
+            f"Most common weekday is {day_peak['label']} "
+            f"({day_peak['count']} of {day_peak['total']} exact timestamps)."
+        )
+    if available:
+        reason = None
+    elif exact == 0:
+        reason = POSTING_NONE
+    else:
+        reason = _posting_few(exact, floor)
+    return {
+        "available": available,
+        "exact_count": exact,
+        "excluded_count": excluded,
+        "minimum": floor,
+        "timezone": "UTC",
+        "reason": reason,
+        "summary": " ".join(summary_parts),
+        "hour_labels": hour_labels(),
+        "weekday_labels": WEEKDAYS,
+        "hours": public_hours,
+        "weekdays": public_days,
+        "hour_bars": hour_bars,
+        "weekday_bars": weekday_bars,
+        "nonzero_hours": nonzero_hours,
+        "sources": sources,
+    }
+
+
+def empty_posting_patterns(reason: str | None = None) -> dict:
+    result = build_posting_patterns([])
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def _valid_day(year: int, month: int, day: int) -> bool:
+    if year < 1 or year > 9999 or not 1 <= month <= 12:
+        return False
+    try:
+        datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return True
+
+
+def _calendar_place(raw: str, precision: str):
+    """A day placement, a month mark, or a year. Never a guessed day."""
+    if precision == "time":
+        moment = parse_utc(raw)
+        if moment is None:
+            return None
+        moment = moment.astimezone(timezone.utc)
+        return ("day", moment.year, moment.month, moment.day, moment)
+    parts = calendar_parts(raw)
+    if precision == "day" and len(parts) >= 3 and _valid_day(parts[0], parts[1], parts[2]):
+        return ("day", parts[0], parts[1], parts[2], None)
+    if precision == "month" and len(parts) >= 2 and 1 <= parts[1] <= 12 and 1 <= parts[0] <= 9999:
+        return ("month", parts[0], parts[1])
+    if precision == "year" and parts and 1 <= parts[0] <= 9999:
+        return ("year", parts[0])
+    return None
+
+
+def _calendar_item(row: dict, precision: str, moment: datetime | None) -> dict:
+    source = str(row.get("source") or "").strip().lower()
+    item = {
+        "title": str(row.get("title") or "").strip()[:200],
+        "source": source,
+        "source_label": CALENDAR_LABELS.get(source, source),
+        "kind": _row_text(row, ("kind", "release_type"))[:80],
+        "precision": precision,
+        "precision_label": PRECISION_LABELS.get(precision, precision or "Unknown"),
+        "clock": moment.strftime("%H:%M UTC") if precision == "time" and moment is not None else "",
+    }
+    mbid = str(row.get("mbid") or "").strip()
+    if mbid:
+        item["mbid"] = mbid[:64]
+    return item
+
+
+def build_release_calendar(rows: list[dict] | None, *, month_cap: int = CALENDAR_MONTH_CAP) -> dict:
+    """Month grids for MusicBrainz, Apple, and Spotify releases.
+
+    Day precision and exact UTC times land on that calendar day. A month-only
+    date marks the month and does not pick a day. A year-only date, including a
+    Spotify year, stays off the day cells.
+    """
+    cap = month_cap if isinstance(month_cap, int) and not isinstance(month_cap, bool) and month_cap > 0 else CALENDAR_MONTH_CAP
+    grouped: dict[tuple[int, int], dict] = {}
+    year_only: list[dict] = []
+    seen: set[tuple] = set()
+    day_count = 0
+    month_marks = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        source = str(row.get("source") or "").strip().lower()
+        if not title or source not in CALENDAR_LABELS:
+            continue
+        raw = _row_text(row, ("when", "released_at", "published_at"))
+        precision = stated_precision(raw, row.get("precision"))
+        place = _calendar_place(raw, precision)
+        if place is None:
+            continue
+        if place[0] == "day":
+            place_key = ("day", place[1], place[2], place[3])
+        else:
+            place_key = place
+        dedupe = (source, title.casefold(), precision, place_key)
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        moment = place[4] if place[0] == "day" else None
+        item = _calendar_item(row, precision, moment)
+        if place[0] == "year":
+            item["year"] = f"{place[1]:04d}"
+            year_only.append(item)
+            continue
+        bucket = grouped.setdefault((place[1], place[2]), {"days": {}, "month_only": []})
+        if place[0] == "month":
+            bucket["month_only"].append(item)
+            month_marks += 1
+            continue
+        bucket["days"].setdefault(place[3], []).append(item)
+        day_count += 1
+    month_keys = sorted(grouped, reverse=True)
+    omitted = max(0, len(month_keys) - cap)
+    months = []
+    for year, month in month_keys[:cap]:
+        bucket = grouped[(year, month)]
+        days = bucket["days"]
+        show_grid = bool(days)
+        cells = []
+        if show_grid:
+            first = datetime(year, month, 1, tzinfo=timezone.utc)
+            if month == 12:
+                nxt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                nxt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            count = (nxt - first).days
+            cells.extend({"in_month": False, "day": None, "items": [], "more": 0} for _ in range(first.weekday()))
+            for day in range(1, count + 1):
+                items = sorted(days.get(day) or [], key=lambda item: (item["source"], item["title"].casefold()))
+                shown = items[:CALENDAR_CELL_CAP]
+                cells.append(
+                    {
+                        "in_month": True,
+                        "day": day,
+                        "items": shown,
+                        "more": max(0, len(items) - len(shown)),
+                    }
+                )
+            while len(cells) % 7:
+                cells.append({"in_month": False, "day": None, "items": [], "more": 0})
+        month_only = sorted(bucket["month_only"], key=lambda item: item["title"].casefold())
+        months.append(
+            {
+                "key": f"{year:04d}-{month:02d}",
+                "label": f"{MONTH_NAMES[month]} {year}",
+                "show_grid": show_grid,
+                "weekdays": WEEKDAY_SHORT,
+                "cells": cells,
+                "month_only": month_only,
+            }
+        )
+    year_only.sort(key=lambda item: item["title"].casefold())
+    year_only.sort(key=lambda item: item["year"], reverse=True)
+    available = bool(months or year_only)
+    return {
+        "available": available,
+        "reason": None if available else CALENDAR_EMPTY,
+        "months": months,
+        "year_only": year_only,
+        "omitted_months": omitted,
+        "day_count": day_count,
+        "month_count": month_marks,
+    }
+
+
+def empty_release_calendar(reason: str | None = None) -> dict:
+    result = build_release_calendar([])
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 def scrub(text: str, secrets: list[str]) -> str:

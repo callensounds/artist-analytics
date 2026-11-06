@@ -1,0 +1,107 @@
+<section id="posting-patterns" class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-1">Posting times</h2>
+    <p class="text-xs text-slate-400 mb-3">UTC hours and weekdays from the latest stored exact timestamps: Instagram, TikTok, YouTube, and Apple releaseDate. Year, month, and day-only rows are excluded. Apple’s US storefront time is often midnight Pacific, so a spike at 07:00 or 08:00 UTC is that convention. First seen is this app’s clock and is not used here.</p>
+    {% if history.posting.available %}
+    <p class="text-sm text-slate-300">{{ history.posting.summary }}</p>
+    <p class="text-xs text-slate-500 mt-1">{{ history.posting.exact_count }} exact timestamps · buckets are UTC</p>
+    {% if history.posting.sources %}
+    <p class="text-xs text-slate-400 mt-1">
+        {% for row in history.posting.sources %}{{ row.label }} {{ row.count }}{% if not loop.last %} · {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+    <h3 class="text-sm font-medium mt-4 mb-2">Hour of day (UTC)</h3>
+    <div class="flex items-end gap-px h-24 border-b border-slate-700" role="img" aria-label="Exact timestamps by UTC hour">
+        {% for bar in history.posting.hour_bars %}
+        <div class="flex-1 rounded-sm {% if bar.count %}bg-emerald-400/80{% endif %}" style="height: {{ bar.height }}%" title="{{ bar.label }} · {{ bar.count }}"></div>
+        {% endfor %}
+    </div>
+    <div class="flex justify-between text-xs text-slate-500 mt-1">
+        <span>00</span><span>06</span><span>12</span><span>18</span><span>23</span>
+    </div>
+    {% if history.posting.nonzero_hours %}
+    <ul class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm">
+        {% for bar in history.posting.nonzero_hours %}
+        <li class="font-mono text-emerald-300">{{ bar.label }} · {{ bar.count }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    <h3 class="text-sm font-medium mt-4 mb-2">Weekday (UTC)</h3>
+    <p class="text-xs text-slate-500 mb-2">Counted from the same exact timestamps. A weekday with no row stays at 0.</p>
+    <ul class="grid grid-cols-7 gap-2 text-center text-xs">
+        {% for bar in history.posting.weekday_bars %}
+        <li class="bg-slate-900/50 rounded-lg py-2">
+            <div class="text-slate-500">{{ bar.short }}</div>
+            <div class="font-mono text-emerald-300 mt-1">{{ bar.count }}</div>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-slate-400 text-sm">{{ history.posting.reason }}</p>
+    {% endif %}
+</section>
+
+<section id="release-calendar" class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+    <h2 class="font-semibold mb-1">Release calendar</h2>
+    <p class="text-xs text-slate-400 mb-3">MusicBrainz and Apple dates land on a UTC day only when that day was published. A month-only date marks the month and is not given a day. Year-only dates, including Spotify years, stay off the day cells.</p>
+    {% if history.calendar.available %}
+    {% if history.calendar.months %}
+    <div class="grid lg:grid-cols-2 gap-4">
+        {% for month in history.calendar.months %}
+        <div class="bg-slate-900/50 rounded-xl p-3">
+            <h3 class="text-sm font-medium mb-2">{{ month.label }}</h3>
+            {% if month.month_only %}
+            <p class="text-xs text-slate-400 mb-2">Month only, no day published:</p>
+            <ul class="mb-2 space-y-1 text-sm">
+                {% for item in month.month_only %}
+                <li>{{ item.title }} <span class="text-slate-500">· {{ item.source_label }}</span></li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+            {% if month.show_grid %}
+            <div class="grid grid-cols-7 gap-1 text-center text-xs">
+                {% for label in month.weekdays %}
+                <div class="text-slate-500 py-1">{{ label }}</div>
+                {% endfor %}
+                {% for cell in month.cells %}
+                <div class="min-h-16 rounded-md p-1 text-left {% if cell.in_month and cell['items'] %}border border-emerald-500/60 bg-slate-800{% elif cell.in_month %}border border-slate-700{% endif %}">
+                    {% if cell.in_month %}
+                    <div class="{% if cell['items'] %}text-emerald-300 font-medium{% else %}text-slate-500{% endif %}">{{ cell.day }}</div>
+                    {% for item in cell['items'] %}
+                    <div class="truncate text-slate-300" title="{{ item.source_label }}{% if item.clock %} · {{ item.clock }}{% endif %} · {{ item.precision_label }}">
+                        {% if item.mbid %}
+                        <a href="https://musicbrainz.org/release-group/{{ item.mbid }}" class="hover:text-emerald-300">{{ item.title }}</a>
+                        {% else %}
+                        {{ item.title }}
+                        {% endif %}
+                    </div>
+                    {% if item.clock %}<div class="text-slate-500">{{ item.clock }}</div>{% endif %}
+                    {% endfor %}
+                    {% if cell.more %}<div class="text-slate-500">+{{ cell.more }}</div>{% endif %}
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% if history.calendar.omitted_months %}
+    <p class="text-xs text-slate-500 mt-3">{{ history.calendar.omitted_months }} older months with a stored release are not shown.</p>
+    {% endif %}
+    {% endif %}
+    {% if history.calendar.year_only %}
+    <h3 class="text-sm font-medium mt-4 mb-2">Year only</h3>
+    <p class="text-xs text-slate-400 mb-2">No month or day was published, so these stay off the grid.</p>
+    <ul class="space-y-1 text-sm">
+        {% for item in history.calendar.year_only %}
+        <li class="flex flex-wrap items-baseline justify-between gap-2">
+            <span>{{ item.title }}</span>
+            <span class="font-mono text-slate-400">{{ item.year }} · {{ item.source_label }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    {% else %}
+    <p class="text-slate-400 text-sm">{{ history.calendar.reason }}</p>
+    {% endif %}
+</section>

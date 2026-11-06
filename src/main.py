@@ -726,9 +726,11 @@ async def related_graph_page(request: Request, key: str):
     )
 
 
-@app.get("/artist/{key}", response_class=HTMLResponse)
-async def artist_page(request: Request, key: str):
-    """Stored history for one artist. No provider fan-out and no queue send."""
+async def _load_stored_artist(request: Request, key: str, redirect_suffix: str = ""):
+    """Artist row plus stored history, or a Response when the page should stop.
+
+    Name lookups redirect to the id. This does not call providers.
+    """
     user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
@@ -746,7 +748,7 @@ async def artist_page(request: Request, key: str):
         except Exception:
             artist = None
         if artist is not None:
-            return RedirectResponse(f"/artist/{int(artist['id'])}", status_code=303)
+            return RedirectResponse(f"/artist/{int(artist['id'])}{redirect_suffix}", status_code=303)
     if artist is None:
         if db is None:
             message = "Crawl history is not available on this request. This page does not call providers."
@@ -769,6 +771,36 @@ async def artist_page(request: Request, key: str):
         history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
     except Exception:
         history = empty_history("Stored history could not be read on this request.")
+    return user, artist, history
+
+
+@app.get("/artist/{key}/calendar", response_class=HTMLResponse)
+async def artist_calendar(request: Request, key: str):
+    """Stored release calendar and posting hours. No provider fan-out."""
+    loaded = await _load_stored_artist(request, key, "/calendar")
+    if not isinstance(loaded, tuple):
+        return loaded
+    user, artist, history = loaded
+    return templates.TemplateResponse(
+        request,
+        "calendar.html",
+        {
+            "user": user,
+            "title": artist.get("name") or "Artist",
+            "artist_id": int(artist["id"]),
+            "subtitle": "Stored dates only. This page does not fetch providers.",
+            "history": history,
+        },
+    )
+
+
+@app.get("/artist/{key}", response_class=HTMLResponse)
+async def artist_page(request: Request, key: str):
+    """Stored history for one artist. No provider fan-out and no queue send."""
+    loaded = await _load_stored_artist(request, key)
+    if not isinstance(loaded, tuple):
+        return loaded
+    user, artist, history = loaded
     crawled = artist.get("last_crawled_at")
     subtitle = "Stored crawl history. This page does not fetch providers."
     if crawled:
