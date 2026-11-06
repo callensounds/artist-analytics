@@ -8,6 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from accounts import authenticate, list_watched, register_user, unwatch_artist, watch_artist
 from crawl import (
     enqueue_search,
     known_links,
@@ -33,6 +34,7 @@ from history import (
     search_artists,
 )
 from http_client import HttpClient
+from passwords import hash_password, verify_password
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware, env_get
 
@@ -58,12 +60,12 @@ _FAVICON_SVG = (
     "</svg>"
 )
 
-# Demo login stays available even when accounts are only in memory.
+# Used only when D1 is not bound. The password is a hash, same check as D1.
 USERS = {
     "artist@demo.com": {
         "id": 1,
         "email": "artist@demo.com",
-        "password": "demo123",
+        "password_hash": hash_password("demo123"),
         "artist_name": "Demo Artist",
     }
 }
@@ -187,10 +189,23 @@ async def read_dashboard_history(name: str, env) -> dict:
         return empty_history("Stored growth could not be read on this request.")
 
 
-def get_current_user(request: Request):
+async def get_current_user(request: Request):
     user_id = request.session.get("user_id")
     if not user_id:
         return None
+    if request.session.get("auth") == "d1":
+        db = await _open_read_db(request.scope.get("env"))
+        if db is None:
+            return None
+        row = None
+        try:
+            row = await db.query_one("SELECT id, email FROM users WHERE id = ?", (int(user_id),))
+        except Exception:
+            return None
+        if not row:
+            return None
+        email = str(row["email"])
+        return {"id": int(row["id"]), "email": email, "artist_name": "Demo Artist" if email == "artist@demo.com" else email}
     for user in USERS.values():
         if user["id"] == user_id:
             return user
@@ -218,7 +233,7 @@ async def landing(request: Request):
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"user": get_current_user(request)},
+        {"user": await get_current_user(request)},
     )
 
 
@@ -229,10 +244,20 @@ async def login_page(request: Request):
 
 @app.post("/login")
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
-    user = USERS.get(email.strip().lower())
-    if user and secrets.compare_digest(user["password"], password):
-        request.session["user_id"] = user["id"]
-        return RedirectResponse("/dashboard", status_code=303)
+    email = email.strip().lower()
+    db = await _open_read_db(request.scope.get("env"))
+    if db is not None:
+        user = await authenticate(db, email, password)
+        if user:
+            request.session["user_id"] = user["id"]
+            request.session["auth"] = "d1"
+            return RedirectResponse("/dashboard", status_code=303)
+    else:
+        user = USERS.get(email)
+        if user and verify_password(password, str(user.get("password_hash") or "")):
+            request.session["user_id"] = user["id"]
+            request.session["auth"] = "memory"
+            return RedirectResponse("/dashboard", status_code=303)
     return templates.TemplateResponse(
         request,
         "login.html",
@@ -256,13 +281,6 @@ async def register(
     global NEXT_ID
     email = email.strip().lower()
     artist_name = artist_name.strip()
-    if email in USERS:
-        return templates.TemplateResponse(
-            request,
-            "register.html",
-            {"error": "Email already registered"},
-            status_code=400,
-        )
     if len(password) < 6:
         return templates.TemplateResponse(
             request,
@@ -277,15 +295,92 @@ async def register(
             {"error": "Enter an artist name up to 120 characters"},
             status_code=400,
         )
+    db = await _open_read_db(request.scope.get("env"))
+    if db is not None:
+        created = await register_user(db, email, password)
+        if created is None:
+            return templates.TemplateResponse(
+                request,
+                "register.html",
+                {"error": "Email already registered"},
+                status_code=400,
+            )
+        request.session["user_id"] = created["id"]
+        request.session["auth"] = "d1"
+        return RedirectResponse("/dashboard", status_code=303)
+    if any(user.get("email") == email for user in USERS.values()):
+        return templates.TemplateResponse(
+            request,
+            "register.html",
+            {"error": "Email already registered"},
+            status_code=400,
+        )
     USERS[email] = {
         "id": NEXT_ID,
         "email": email,
-        "password": password,
+        "password_hash": hash_password(password),
         "artist_name": artist_name,
     }
     request.session["user_id"] = NEXT_ID
+    request.session["auth"] = "memory"
     NEXT_ID += 1
     return RedirectResponse("/dashboard", status_code=303)
+
+
+@app.get("/watch", response_class=HTMLResponse)
+async def watch_page(request: Request):
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    artists = []
+    note = None
+    if request.session.get("auth") != "d1":
+        note = "A watchlist is stored when D1 is bound. This page does not call providers."
+    else:
+        db = await _open_read_db(request.scope.get("env"))
+        failed = False
+        if db is not None:
+            try:
+                artists = await asyncio.wait_for(list_watched(db, int(user["id"])), GROWTH_READ_TIMEOUT_S)
+            except Exception:
+                failed = True
+        if db is None or failed:
+            note = "The watchlist could not be read on this request."
+        elif not artists:
+            note = "You are not watching any artists yet."
+    return templates.TemplateResponse(
+        request,
+        "watch.html",
+        {"user": user, "artists": artists, "note": note},
+    )
+
+
+@app.post("/watch/{artist_id}")
+async def watch_post(request: Request, artist_id: int):
+    user = await _require_user(request)
+    if not user or request.session.get("auth") != "d1":
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is not None and artist_id > 0:
+        try:
+            await watch_artist(db, int(user["id"]), artist_id)
+        except Exception:
+            pass
+    return RedirectResponse("/watch", status_code=303)
+
+
+@app.post("/unwatch/{artist_id}")
+async def unwatch_post(request: Request, artist_id: int):
+    user = await _require_user(request)
+    if not user or request.session.get("auth") != "d1":
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is not None and artist_id > 0:
+        try:
+            await unwatch_artist(db, int(user["id"]), artist_id)
+        except Exception:
+            pass
+    return RedirectResponse("/watch", status_code=303)
 
 
 @app.get("/logout")
@@ -294,8 +389,8 @@ async def logout(request: Request):
     return RedirectResponse("/", status_code=303)
 
 
-def _require_user(request: Request):
-    user = get_current_user(request)
+async def _require_user(request: Request):
+    user = await get_current_user(request)
     if not user:
         return None
     return user
@@ -303,7 +398,7 @@ def _require_user(request: Request):
 
 @app.get("/search", response_class=HTMLResponse)
 async def search_page(request: Request, q: str | None = None):
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     query = (q or "").strip()[:120]
@@ -329,7 +424,7 @@ async def search_page(request: Request, q: str | None = None):
 @app.get("/artists", response_class=HTMLResponse)
 async def artists_page(request: Request, page: int = 1, sort: str | None = None):
     """Tracked artists already in D1. No provider fan-out."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     db = await _open_read_db(request.scope.get("env"))
@@ -381,7 +476,7 @@ async def artists_page(request: Request, page: int = 1, sort: str | None = None)
 @app.get("/trending", response_class=HTMLResponse)
 async def trending_page(request: Request, window: str | None = None, provider: str | None = None):
     """Stored growth alerts ranked by percent, then absolute change. No provider fan-out."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     chosen_window = window if window in {"24h", "7d"} else ""
@@ -423,7 +518,7 @@ async def trending_page(request: Request, window: str | None = None, provider: s
 @app.get("/alerts", response_class=HTMLResponse)
 async def alerts_page(request: Request):
     """Recent stored growth alerts. No provider fan-out."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     db = await _open_read_db(request.scope.get("env"))
@@ -452,7 +547,7 @@ async def alerts_page(request: Request):
 @app.get("/artist/{key}/export.csv")
 async def export_artist_csv(request: Request, key: str):
     """Stored snapshots, sightings, and related edges. No provider fan-out."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     token = (key or "").strip()[:120]
@@ -505,7 +600,7 @@ async def export_artist_csv(request: Request, key: str):
 @app.get("/artist/{key}/related", response_class=HTMLResponse)
 async def related_graph_page(request: Request, key: str):
     """Ego network from related_edges. No provider fan-out and no queue send."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     token = (key or "").strip()[:120]
@@ -556,7 +651,7 @@ async def related_graph_page(request: Request, key: str):
 @app.get("/artist/{key}", response_class=HTMLResponse)
 async def artist_page(request: Request, key: str):
     """Stored history for one artist. No provider fan-out and no queue send."""
-    user = _require_user(request)
+    user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     token = (key or "").strip()[:120]
@@ -610,13 +705,14 @@ async def artist_page(request: Request, key: str):
             "subtitle": subtitle,
             "message": "",
             "history": history,
+            "can_watch": request.session.get("auth") == "d1",
         },
     )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, artist: str | None = None):
-    user = get_current_user(request)
+    user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     query = (artist or "").strip() or user["artist_name"]
@@ -711,7 +807,7 @@ async def dashboard(request: Request, artist: str | None = None):
 
 @app.get("/admin/diag", response_class=HTMLResponse)
 async def admin_diag(request: Request):
-    user = get_current_user(request)
+    user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     try:
@@ -733,7 +829,7 @@ async def admin_diag(request: Request):
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(request: Request):
-    user = get_current_user(request)
+    user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     report = await status_report(request.scope.get("env"))
@@ -746,7 +842,7 @@ async def admin_page(request: Request):
 
 @app.post("/admin/crawl")
 async def admin_crawl(request: Request):
-    user = get_current_user(request)
+    user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     try:

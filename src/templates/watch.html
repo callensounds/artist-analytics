@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Watching — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl sm:text-3xl font-bold">Watching</h1>
+    <p class="text-slate-400 text-sm mt-1">Artists you saved. This page does not call providers.</p>
+</div>
+{% if artists %}
+<ul class="space-y-3">
+    {% for artist in artists %}
+    <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-3">
+        <a href="/artist/{{ artist.id }}" class="text-lg font-semibold hover:text-emerald-300">{{ artist.name }}</a>
+        <form method="post" action="/unwatch/{{ artist.id }}">
+            <button type="submit" class="text-sm text-slate-400 hover:text-white">Remove</button>
+        </form>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<p class="text-slate-400 text-sm">{{ note or "You are not watching any artists yet." }}</p>
+{% endif %}
+{% endblock %}

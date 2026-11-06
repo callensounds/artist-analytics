@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import main
+from passwords import hash_password
 from cache import MemoryCache
 from http_client import HttpResult
 from providers.youtube import fetch_youtube
@@ -42,7 +43,7 @@ def setup_function():
     main.USERS["artist@demo.com"] = {
         "id": 1,
         "email": "artist@demo.com",
-        "password": "demo123",
+        "password_hash": hash_password("demo123"),
         "artist_name": "Demo Artist",
     }
     main.NEXT_ID = 2
@@ -290,6 +291,7 @@ def test_bad_login_and_short_password():
     )
     assert created.status_code == 303
     assert "new@example.com" in main.USERS
+    assert "secret1" not in main.USERS["new@example.com"]["password_hash"]
 
 
 def test_middleware_and_env_get_never_import_js(monkeypatch):
