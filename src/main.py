@@ -26,6 +26,7 @@ from history import (
     find_artist,
     find_artist_by_id,
     load_alert_feed,
+    list_tracked_artists,
     load_dashboard_history,
     load_history_for_artist,
     search_artists,
@@ -321,6 +322,58 @@ async def search_page(request: Request, q: str | None = None):
         request,
         "search.html",
         {"user": user, "query": query, "matches": matches, "note": note},
+    )
+
+
+@app.get("/artists", response_class=HTMLResponse)
+async def artists_page(request: Request, page: int = 1, sort: str | None = None):
+    """Tracked artists already in D1. No provider fan-out."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is None:
+        return templates.TemplateResponse(
+            request,
+            "artists.html",
+            {
+                "user": user,
+                "artists": [],
+                "page": 1,
+                "pages": 1,
+                "total": 0,
+                "sort": "listeners" if sort == "listeners" else "name",
+                "has_prev": False,
+                "has_next": False,
+                "note": "The artist directory is stored by the crawler when D1 is bound. This page does not call providers.",
+            },
+        )
+    listing = None
+    failed = False
+    try:
+        listing = await asyncio.wait_for(
+            list_tracked_artists(db, page=page, sort=sort or "name"),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception:
+        failed = True
+    if failed or listing is None:
+        listing = {
+            "artists": [],
+            "page": 1,
+            "pages": 1,
+            "total": 0,
+            "sort": "listeners" if sort == "listeners" else "name",
+            "has_prev": False,
+            "has_next": False,
+        }
+        note = "The artist directory could not be read on this request."
+    else:
+        note = None
+    return templates.TemplateResponse(
+        request,
+        "artists.html",
+        {"user": user, "note": note, **listing},
     )
 
 

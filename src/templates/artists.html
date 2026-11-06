@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Tracked artists — Average Analytics{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-4 md:flex-row md:items-end md:justify-between mb-6">
+    <div>
+        <h1 class="text-2xl sm:text-3xl font-bold">Tracked artists</h1>
+        <p class="text-slate-400 text-sm mt-1">Artists already in the crawl database. This page does not call providers.</p>
+    </div>
+    <div class="flex gap-2 text-sm">
+        <a href="/artists?sort=name" class="px-3 py-1 rounded-lg border {% if sort == 'name' %}border-emerald-500 text-emerald-300{% else %}border-slate-600 text-slate-300{% endif %}">Name</a>
+        <a href="/artists?sort=listeners" class="px-3 py-1 rounded-lg border {% if sort == 'listeners' %}border-emerald-500 text-emerald-300{% else %}border-slate-600 text-slate-300{% endif %}">Monthly listeners</a>
+    </div>
+</div>
+
+{% if note %}
+<p class="text-slate-400 text-sm">{{ note }}</p>
+{% elif artists %}
+<p class="text-xs text-slate-500 mb-4">{{ total }} tracked · page {{ page }} of {{ pages }}</p>
+<ul class="space-y-3">
+    {% for artist in artists %}
+    <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700">
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <a href="/artist/{{ artist.id }}" class="text-lg font-semibold hover:text-emerald-300">{{ artist.name }}</a>
+            {% if artist.has_related %}
+            <a href="/artist/{{ artist.id }}/related" class="text-xs text-emerald-400 hover:underline">Related graph</a>
+            {% endif %}
+        </div>
+        {% if artist.metrics %}
+        <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
+            {% for metric in artist.metrics %}
+            <div>
+                <dt class="text-slate-500 inline">{{ metric.label }}</dt>
+                <dd class="inline font-mono text-emerald-300">{{ metric.text }}</dd>
+            </div>
+            {% endfor %}
+        </dl>
+        {% else %}
+        <p class="text-sm text-slate-500 mt-1">No exact audience count stored yet.</p>
+        {% endif %}
+    </li>
+    {% endfor %}
+</ul>
+<div class="mt-6 flex gap-4 text-sm">
+    {% if has_prev %}
+    <a href="/artists?sort={{ sort }}&page={{ page - 1 }}" class="text-emerald-400 hover:underline">Previous</a>
+    {% endif %}
+    {% if has_next %}
+    <a href="/artists?sort={{ sort }}&page={{ page + 1 }}" class="text-emerald-400 hover:underline">Next</a>
+    {% endif %}
+</div>
+{% else %}
+<p class="text-slate-400 text-sm">No tracked artists yet.</p>
+{% endif %}
+{% endblock %}
