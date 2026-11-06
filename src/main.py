@@ -14,7 +14,15 @@ from crawl import (
     status_report,
 )
 from diag import diagnose
-from history import empty_history, load_dashboard_history
+from analytics import normalize_name
+from history import (
+    empty_history,
+    find_artist,
+    find_artist_by_id,
+    load_dashboard_history,
+    load_history_for_artist,
+    search_artists,
+)
 from http_client import HttpClient
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
@@ -150,12 +158,16 @@ def _live_related(bundle: dict) -> list[dict]:
     return []
 
 
+async def _open_read_db(env):
+    try:
+        return await open_database(env, migrate_schema=False)
+    except Exception:
+        return None
+
+
 async def read_dashboard_history(name: str, env) -> dict:
     """A few indexed reads. Migrations and writes stay on the crawl."""
-    try:
-        db = await open_database(env, migrate_schema=False)
-    except Exception:
-        db = None
+    db = await _open_read_db(env)
     if db is None:
         return empty_history(
             "Growth is stored by the crawler when D1 is bound. This page does not write history."
@@ -271,6 +283,99 @@ async def register(
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/", status_code=303)
+
+
+def _require_user(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return None
+    return user
+
+
+@app.get("/search", response_class=HTMLResponse)
+async def search_page(request: Request, q: str | None = None):
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    query = (q or "").strip()[:120]
+    matches: list[dict] = []
+    note = None
+    if normalize_name(query):
+        db = await _open_read_db(request.scope.get("env"))
+        if db is None:
+            note = "Search needs the crawl database. This page does not call providers."
+        else:
+            try:
+                matches = await asyncio.wait_for(search_artists(db, query), GROWTH_READ_TIMEOUT_S)
+            except Exception:
+                matches = []
+                note = "Search could not be read on this request."
+    return templates.TemplateResponse(
+        request,
+        "search.html",
+        {"user": user, "query": query, "matches": matches, "note": note},
+    )
+
+
+@app.get("/artist/{key}", response_class=HTMLResponse)
+async def artist_page(request: Request, key: str):
+    """Stored history for one artist. No provider fan-out and no queue send."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    token = (key or "").strip()[:120]
+    db = await _open_read_db(request.scope.get("env"))
+    artist = None
+    if db is not None and token.isdigit():
+        try:
+            artist = await asyncio.wait_for(find_artist_by_id(db, int(token)), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            artist = None
+    elif db is not None and token:
+        try:
+            artist = await asyncio.wait_for(find_artist(db, token), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            artist = None
+        if artist is not None:
+            return RedirectResponse(f"/artist/{int(artist['id'])}", status_code=303)
+    if artist is None:
+        if db is None:
+            message = "Crawl history is not available on this request. This page does not call providers."
+        else:
+            message = "This artist is not tracked yet. This page does not look them up on Spotify, MusicBrainz, or the other providers."
+        return templates.TemplateResponse(
+            request,
+            "artist.html",
+            {
+                "user": user,
+                "found": False,
+                "title": "Not tracked",
+                "subtitle": "Stored artists only.",
+                "message": message,
+                "history": empty_history(message),
+            },
+            status_code=404,
+        )
+    try:
+        history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
+    except Exception:
+        history = empty_history("Stored history could not be read on this request.")
+    crawled = artist.get("last_crawled_at")
+    subtitle = "Stored crawl history. This page does not fetch providers."
+    if crawled:
+        subtitle = f"Last crawled {crawled}. " + subtitle
+    return templates.TemplateResponse(
+        request,
+        "artist.html",
+        {
+            "user": user,
+            "found": True,
+            "title": artist.get("name") or "Artist",
+            "subtitle": subtitle,
+            "message": "",
+            "history": history,
+        },
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

@@ -548,6 +548,33 @@ async def load_growth(db, name: str) -> dict:
     return history
 
 
+async def find_artist_by_id(db, artist_id: int) -> dict | None:
+    if not isinstance(artist_id, int) or isinstance(artist_id, bool) or artist_id < 1:
+        return None
+    return await db.query_one(
+        "SELECT id, name, normalized_name, tracked, last_crawled_at FROM artists WHERE id = ?",
+        (artist_id,),
+    )
+
+
+async def load_history_for_artist(db, artist: dict) -> dict:
+    """Snapshots, related edges, and sightings for one known artists row. No network."""
+    artist_id = int(artist["id"])
+    rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
+    related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
+    sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
+    history = empty_history("No exact audience count has been stored yet.")
+    history["available"] = bool(rows or related or sightings)
+    history["artist_id"] = artist_id
+    history["name"] = artist.get("name")
+    history["growth"] = build_growth(rows)
+    history["related"] = present_related(related)
+    history["sightings"] = present_sightings(sightings)
+    if history["growth"]["datasets"]:
+        history["reason"] = None
+    return history
+
+
 async def load_dashboard_history(db, name: str) -> dict:
     """Indexed reads only: the artist row, recent snapshots, related edges, and sightings.
 
@@ -558,20 +585,131 @@ async def load_dashboard_history(db, name: str) -> dict:
     artist = await find_artist(db, name)
     if not artist:
         return empty_history("This artist has no stored snapshots yet.")
-    artist_id = int(artist["id"])
-    rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
-    related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
-    sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
-    history = empty_history("No exact audience count has been stored yet.")
-    history["available"] = bool(rows or related or sightings)
-    history["artist_id"] = artist_id
-    history["growth"] = build_growth(rows)
-    history["related"] = present_related(related)
-    history["sightings"] = present_sightings(sightings)
-    if history["growth"]["datasets"]:
-        history["reason"] = None
-    return history
+    return await load_history_for_artist(db, artist)
 
 
 async def load_artist_history(db, name: str) -> dict:
     return await load_dashboard_history(db, name)
+
+
+SEARCH_LIMIT = 15
+SHORT_SEARCH_LIMIT = 8
+METRIC_PREVIEW = 2
+# One character is a prefix scan on the unique normalized_name index.
+# A leading-wildcard substring waits until the query is at least this long.
+SUBSTRING_MIN = 2
+
+_SEARCH_PREFIX_SQL = """
+SELECT id, name, normalized_name, tracked
+FROM artists
+WHERE tracked = 1 AND normalized_name LIKE ? ESCAPE '\\'
+ORDER BY
+    CASE WHEN normalized_name = ? THEN 0 ELSE 1 END,
+    length(normalized_name),
+    name
+LIMIT ?
+"""
+
+_SEARCH_SUBSTR_SQL = """
+SELECT id, name, normalized_name, tracked
+FROM artists
+WHERE tracked = 1
+  AND normalized_name LIKE ? ESCAPE '\\'
+  AND normalized_name NOT LIKE ? ESCAPE '\\'
+ORDER BY instr(normalized_name, ?), length(normalized_name), name
+LIMIT ?
+"""
+
+
+def _like_literal(fragment: str) -> str:
+    return fragment.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _preview_metrics(rows: list[dict]) -> list[dict]:
+    """Up to two latest exact audience counts. Rounded text is not a metric."""
+    newest: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row.get("source"), row.get("metric"))
+        number = _whole_number(row.get("value"))
+        if key not in AUDIENCE or number is None:
+            continue
+        current = newest.get(key)
+        captured = str(row.get("captured_at") or "")
+        if current is None or captured > str(current.get("captured_at") or ""):
+            newest[key] = {"value": number, "captured_at": captured}
+    preview = []
+    for key, label in AUDIENCE.items():
+        item = newest.get(key)
+        if item is None:
+            continue
+        preview.append(
+            {
+                "label": label,
+                "value": item["value"],
+                "text": f"{item['value']:,}",
+                "captured_at": item["captured_at"],
+            }
+        )
+        if len(preview) >= METRIC_PREVIEW:
+            break
+    return preview
+
+
+async def _latest_metrics(db, artist_ids: list[int]) -> dict[int, list[dict]]:
+    if not artist_ids:
+        return {}
+    marks = ",".join("?" for _ in artist_ids)
+    rows = await db.query(
+        f"""
+        SELECT artist_id, source, metric, value, captured_at
+        FROM (
+            SELECT artist_id, source, metric, value, captured_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY artist_id, source, metric
+                       ORDER BY captured_at DESC, id DESC
+                   ) AS rn
+            FROM metric_snapshots
+            WHERE artist_id IN ({marks}) AND value IS NOT NULL
+        ) AS ranked
+        WHERE rn = 1
+        """,
+        tuple(artist_ids),
+    )
+    grouped: dict[int, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["artist_id"]), []).append(row)
+    return {artist_id: _preview_metrics(items) for artist_id, items in grouped.items()}
+
+
+async def search_artists(db, query: str) -> list[dict]:
+    """Prefix match on normalized_name, then a bounded substring match.
+
+    An empty or one-symbol query does not scan the table. A single character
+    is prefix-only. Two or more characters may add a substring pass, still limited.
+    """
+    needle = normalize_name(query)[:80]
+    if not needle:
+        return []
+    literal = _like_literal(needle)
+    limit = SHORT_SEARCH_LIMIT if len(needle) < SUBSTRING_MIN else SEARCH_LIMIT
+    rows = await db.query(_SEARCH_PREFIX_SQL, (literal + "%", needle, limit))
+    if len(needle) >= SUBSTRING_MIN and len(rows) < limit:
+        extra = await db.query(
+            _SEARCH_SUBSTR_SQL,
+            ("%" + literal + "%", literal + "%", needle, limit - len(rows)),
+        )
+        rows = list(rows) + list(extra)
+    metrics = await _latest_metrics(db, [int(row["id"]) for row in rows])
+    results = []
+    for row in rows:
+        artist_id = int(row["id"])
+        results.append(
+            {
+                "id": artist_id,
+                "name": row.get("name") or "",
+                "normalized_name": row.get("normalized_name") or "",
+                "tracked": row.get("tracked"),
+                "metrics": metrics.get(artist_id, []),
+            }
+        )
+    return results

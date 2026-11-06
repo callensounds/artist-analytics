@@ -338,7 +338,7 @@ def test_template_shows_stored_rows_and_placeholders_when_empty():
 
     filled = _render(asyncio.run(seed()))
     assert "Snail Mail" in filled
-    assert "/dashboard?artist=Snail%20Mail" in filled
+    assert "/artist/2" in filled
     assert "first 2026-10-31T00:00:00Z" in filled
     assert "last 2026-10-31T06:00:00Z" in filled
     assert ">Charm<" in filled
@@ -426,7 +426,7 @@ def test_dashboard_request_reads_d1_when_the_live_parse_is_empty(monkeypatch, tm
     elapsed = time.perf_counter() - started
     assert page.status_code == 200
     assert "Snail Mail" in page.text
-    assert "/dashboard?artist=Snail%20Mail" in page.text
+    assert "/artist/2" in page.text
     assert "Charm" in page.text
     assert "+63,093 over 6h" in page.text
     assert "does not parse that list" not in page.text
