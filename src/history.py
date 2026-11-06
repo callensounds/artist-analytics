@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
-from analytics import SOURCE_COLORS, normalize_name
+from analytics import PRECISION_LABELS, SOURCE_COLORS, normalize_name
 from db import parse_utc, utc_now
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
@@ -201,22 +201,48 @@ def present_playlists(rows: list[dict]) -> list[dict]:
     return presented
 
 
+def timeline_instant(published: str | None, precision: str | None, first_seen: str | None) -> datetime | None:
+    """Sort key. A year or a day stays at that precision and is not given a fake clock time."""
+    text = (published or "").strip()
+    kind = (precision or "").strip()
+    if kind == "time":
+        moment = parse_utc(text)
+        if moment is not None:
+            return moment
+    elif kind == "day" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    elif kind == "month" and re.fullmatch(r"\d{4}-\d{2}", text):
+        return datetime.strptime(text + "-01", "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    elif kind == "year" and re.fullmatch(r"\d{4}", text):
+        return datetime(int(text), 1, 1, tzinfo=timezone.utc)
+    return parse_utc(first_seen)
+
+
 def present_sightings(rows: list[dict]) -> list[dict]:
+    """Timeline order: source published time when it is usable, otherwise first seen."""
     presented = []
     for row in rows or []:
         title = str(row.get("title") or "").strip()
         if not title:
             continue
+        published = str(row.get("published_at") or "")
+        precision = str(row.get("precision") or "")
+        first_seen = str(row.get("first_seen_at") or "")
         presented.append(
             {
                 "source": str(row.get("source") or ""),
                 "title": title[:200],
                 "kind": str(row.get("kind") or ""),
-                "published_at": str(row.get("published_at") or ""),
-                "precision": str(row.get("precision") or ""),
-                "first_seen_at": str(row.get("first_seen_at") or ""),
+                "published_at": published,
+                "precision": precision,
+                "precision_label": PRECISION_LABELS.get(precision, precision or "Unknown"),
+                "first_seen_at": first_seen,
+                "_sort": timeline_instant(published, precision, first_seen),
             }
         )
+    presented.sort(key=lambda item: ((item["_sort"] or datetime.min.replace(tzinfo=timezone.utc)).timestamp(), item["first_seen_at"]), reverse=True)
+    for item in presented:
+        item.pop("_sort", None)
     return presented
 
 
@@ -561,7 +587,7 @@ SIGHTING_SQL = """
 SELECT source, title, kind, published_at, precision, first_seen_at
 FROM content_sightings
 WHERE artist_id = ?
-ORDER BY first_seen_at DESC, id DESC
+ORDER BY COALESCE(NULLIF(published_at, ''), first_seen_at) DESC, id DESC
 LIMIT ?
 """
 

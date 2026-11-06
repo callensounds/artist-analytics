@@ -16,6 +16,7 @@ from crawl import (
     status_report,
 )
 from diag import diagnose
+from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
 from analytics import normalize_name
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
@@ -318,6 +319,59 @@ async def search_page(request: Request, q: str | None = None):
         request,
         "search.html",
         {"user": user, "query": query, "matches": matches, "note": note},
+    )
+
+
+@app.get("/artist/{key}/export.csv")
+async def export_artist_csv(request: Request, key: str):
+    """Stored snapshots, sightings, and related edges. No provider fan-out."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    token = (key or "").strip()[:120]
+    db = await _open_read_db(request.scope.get("env"))
+    artist_id = None
+    failed = False
+    if db is not None and token.isdigit():
+        artist_id = int(token)
+    elif db is not None and token:
+        try:
+            artist = await asyncio.wait_for(find_artist(db, token), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            artist = None
+            failed = True
+        if artist is not None:
+            return RedirectResponse(f"/artist/{int(artist['id'])}/export.csv", status_code=303)
+    artist = None
+    if db is not None and artist_id and not failed:
+        try:
+            artist = await asyncio.wait_for(find_artist_by_id(db, artist_id), GROWTH_READ_TIMEOUT_S)
+        except Exception:
+            artist = None
+            failed = True
+    if artist is None:
+        if db is None or failed:
+            text = "Stored history could not be read on this request.\n"
+        else:
+            text = "This artist is not tracked.\n"
+        return Response(text, status_code=404, media_type="text/plain; charset=utf-8")
+    rows = None
+    try:
+        rows = await asyncio.wait_for(load_export_rows(db, int(artist["id"])), GROWTH_READ_TIMEOUT_S)
+    except Exception:
+        rows = None
+    if rows is None:
+        return Response(
+            "Stored history could not be read on this request.\n",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+    body = render_export_csv(rows["metrics"], rows["sightings"], rows["edges"])
+    filename = f"artist-{int(artist['id'])}.csv"
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
