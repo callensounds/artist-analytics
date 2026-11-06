@@ -62,30 +62,29 @@
         {% endif %}
     </section>
     <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <h2 class="font-semibold mb-1">First seen by this app</h2>
-        <p class="text-xs text-slate-400 mb-3">When a release or post was first stored. The source time is the published column, not this clock.</p>
+        <h2 class="font-semibold mb-1">Timeline</h2>
+        <p class="text-xs text-slate-400 mb-3">Releases and posts ordered by the source time when one is stored, otherwise by when this app first stored them. A year or a day is not shown as a clock time. First seen is this app’s clock.</p>
         {% if history.sightings %}
         <div class="overflow-x-auto">
             <table class="w-full text-sm">
                 <thead>
                     <tr class="text-left text-xs text-slate-500">
+                        <th class="py-1 pr-3 font-medium">When</th>
+                        <th class="py-1 pr-3 font-medium">Precision</th>
                         <th class="py-1 pr-3 font-medium">Source</th>
                         <th class="py-1 pr-3 font-medium">Title</th>
                         <th class="py-1 pr-3 font-medium">Kind</th>
-                        <th class="py-1 pr-3 font-medium">Published</th>
                         <th class="py-1 font-medium">First seen</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for item in history.sightings %}
                     <tr class="border-t border-slate-700/80">
+                        <td class="py-2 pr-3 font-mono text-emerald-300">{{ item.published_at or "source time unavailable" }}</td>
+                        <td class="py-2 pr-3 text-slate-400">{{ item.precision_label or item.precision }}</td>
                         <td class="py-2 pr-3 text-slate-400">{{ item.source }}</td>
                         <td class="py-2 pr-3">{{ item.title }}</td>
                         <td class="py-2 pr-3 text-slate-400">{{ item.kind }}</td>
-                        <td class="py-2 pr-3 text-emerald-300">
-                            {{ item.published_at or "source time unavailable" }}
-                            {% if item.precision %}<span class="text-slate-500">{{ item.precision }}</span>{% endif %}
-                        </td>
                         <td class="py-2 text-slate-400">{{ item.first_seen_at }}</td>
                     </tr>
                     {% endfor %}

@@ -342,7 +342,7 @@ def test_template_shows_stored_rows_and_placeholders_when_empty():
     assert "first 2026-10-31T00:00:00Z" in filled
     assert "last 2026-10-31T06:00:00Z" in filled
     assert ">Charm<" in filled
-    assert ">year<" in filled
+    assert "Year only" in filled
     assert "First seen" in filled
     assert "+2 over 6h" in filled
     assert "growth-0" in filled
