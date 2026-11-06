@@ -1,6 +1,7 @@
 import asyncio
 import html
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -9,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 
 from crawl import (
     enqueue_search,
+    known_links,
     open_database,
     run_scheduled,
     status_report,
@@ -16,6 +18,7 @@ from crawl import (
 from diag import diagnose
 from graph import load_related_graph
 from analytics import normalize_name
+from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from history import (
     empty_history,
     find_artist,
@@ -26,7 +29,7 @@ from history import (
 )
 from http_client import HttpClient
 from providers import collect_artist
-from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware
+from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware, env_get
 
 try:
     from workers import asgi
@@ -439,28 +442,67 @@ async def dashboard(request: Request, artist: str | None = None):
     if len(query) > 120:
         query = query[:120]
     env = request.scope.get("env")
-    # Enqueue and the growth read run beside the provider calls. Both are bounded.
+    # The crawl still runs in the background. This request does not wait on a slow send.
     enqueue_task = asyncio.create_task(enqueue_search(query, env))
-    history_task = asyncio.create_task(read_dashboard_history(query, env))
-    try:
-        bundle = await collect_artist(query, env=env)
-    except Exception:
-        bundle = {
-            "sources": [],
-            "patterns": {"release_hours": [], "social_hours": [], "weekdays": [], "hour_labels": [], "weekday_labels": []},
-            "insights": ["The dashboard could not load sources. Refresh to try again."],
-        }
-    try:
-        history = await history_task
-    except Exception:
+    now = datetime.now(timezone.utc)
+    youtube_key = bool(env_get(env, "YOUTUBE_API_KEY"))
+    db = await _open_read_db(env)
+    plan = None
+    if db is not None:
+        try:
+            plan = await asyncio.wait_for(
+                load_dashboard_plan(db, query, now, youtube_key=youtube_key),
+                GROWTH_READ_TIMEOUT_S,
+            )
+        except Exception:
+            plan = None
+    if db is None:
+        history = empty_history(
+            "Growth is stored by the crawler when D1 is bound. This page does not write history."
+        )
+        bundle = queued_bundle()
+        bundle["insights"] = [history["reason"]]
+    elif plan is None:
         history = empty_history("Stored growth could not be read on this request.")
+        bundle = queued_bundle()
+        bundle["insights"] = [history["reason"]]
+    elif plan["artist"] is None:
+        history = plan["history"]
+        bundle = queued_bundle()
+    else:
+        history = plan["history"]
+        live = plan["live"]
+        live_bundle = None
+        failed = False
+        if live:
+            skip = [platform for platform in ("musicbrainz", "apple", "spotify", "youtube", "instagram", "tiktok") if platform not in live]
+            try:
+                live_bundle = await collect_artist(
+                    query,
+                    env=env,
+                    known_links=known_links(plan["artist"]),
+                    include_related=False,
+                    skip_platforms=skip,
+                )
+            except Exception:
+                failed = True
+        if failed or not live:
+            cards = plan["cards"] if not failed else cards_from_history(
+                history, plan["clocks"], now, [], youtube_key=youtube_key
+            )
+            bundle = assemble_bundle(cards, None, [], stored_only=not failed and not live)
+            if failed:
+                bundle["insights"] = ["The live refresh failed. Stored counts are shown."] + bundle["insights"]
+                bundle["insights"] = bundle["insights"][:8]
+        else:
+            bundle = assemble_bundle(plan["cards"], live_bundle, live, stored_only=False)
     for source in bundle.get("sources") or []:
         items = source.get("items") or []
         if len(items) > 20:
             source["items"] = items[:20]
-    live = _live_related(bundle)
-    if live and not history.get("related"):
-        history["related"] = live
+    live_related = _live_related(bundle)
+    if live_related and not history.get("related"):
+        history["related"] = live_related
     try:
         await enqueue_task
     except Exception:
