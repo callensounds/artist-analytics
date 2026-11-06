@@ -618,6 +618,8 @@ def test_dashboard_route_performs_no_d1_writes(monkeypatch):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             login = await client.post("/login", data={"email": "artist@demo.com", "password": "demo123"})
             assert login.status_code == 303
+            # Login may insert the demo account. The dashboard requests must not write.
+            binding.writes.clear()
             started = time.perf_counter()
             page = await client.get("/dashboard", params={"artist": "Example"})
             elapsed = time.perf_counter() - started

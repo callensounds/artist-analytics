@@ -144,6 +144,20 @@ CREATE TABLE IF NOT EXISTS alert_backfill (
     artist_id INTEGER PRIMARY KEY,
     checked_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_artists (
+    user_id INTEGER NOT NULL,
+    artist_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, artist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_artists_user
+    ON user_artists (user_id, created_at);
 CREATE TABLE IF NOT EXISTS musicbrainz_releases (
     artist_id INTEGER NOT NULL,
     mbid TEXT NOT NULL,
@@ -204,7 +218,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
