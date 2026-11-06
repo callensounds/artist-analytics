@@ -27,7 +27,12 @@
 
 <div class="grid lg:grid-cols-2 gap-6 mb-6">
     <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <h2 class="font-semibold mb-1">Fans also like</h2>
+        <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1">
+            <h2 class="font-semibold">Fans also like</h2>
+            {% if history.artist_id %}
+            <a href="/artist/{{ history.artist_id }}/related" class="text-xs text-emerald-400 hover:underline">Related graph</a>
+            {% endif %}
+        </div>
         <p class="text-xs text-slate-400 mb-3">From the public Spotify artist page, in the order Spotify prints. A name without that section is left off.</p>
         {% if history.related %}
         <ol class="space-y-2 text-sm">
