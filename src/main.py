@@ -25,8 +25,9 @@ from history import (
     empty_history,
     find_artist,
     find_artist_by_id,
-    load_alert_feed,
     list_tracked_artists,
+    list_trending,
+    load_alert_feed,
     load_dashboard_history,
     load_history_for_artist,
     search_artists,
@@ -377,6 +378,48 @@ async def artists_page(request: Request, page: int = 1, sort: str | None = None)
     )
 
 
+@app.get("/trending", response_class=HTMLResponse)
+async def trending_page(request: Request, window: str | None = None, provider: str | None = None):
+    """Stored growth alerts ranked by percent, then absolute change. No provider fan-out."""
+    user = _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    chosen_window = window if window in {"24h", "7d"} else ""
+    chosen_provider = provider if provider in {"spotify", "instagram", "tiktok"} else ""
+    db = await _open_read_db(request.scope.get("env"))
+    alerts: list[dict] = []
+    failed = False
+    if db is not None:
+        try:
+            alerts = await asyncio.wait_for(
+                list_trending(db, window=chosen_window, provider=chosen_provider),
+                GROWTH_READ_TIMEOUT_S,
+            )
+        except Exception:
+            failed = True
+    if db is None:
+        reason = "Trending is stored by the crawler when D1 is bound. This page does not call providers."
+    elif failed:
+        reason = "Stored alerts could not be read on this request."
+    elif alerts:
+        reason = ""
+    elif chosen_window or chosen_provider:
+        reason = "No stored alerts match that window or provider."
+    else:
+        reason = ALERTS_EMPTY
+    return templates.TemplateResponse(
+        request,
+        "trending.html",
+        {
+            "user": user,
+            "alerts": alerts,
+            "reason": reason,
+            "window": chosen_window,
+            "provider": chosen_provider,
+        },
+    )
+
+
 @app.get("/alerts", response_class=HTMLResponse)
 async def alerts_page(request: Request):
     """Recent stored growth alerts. No provider fan-out."""
@@ -450,7 +493,7 @@ async def export_artist_csv(request: Request, key: str):
             status_code=503,
             media_type="text/plain; charset=utf-8",
         )
-    body = render_export_csv(rows["metrics"], rows["sightings"], rows["edges"])
+    body = render_export_csv(rows["metrics"], rows["sightings"], rows["edges"], rows.get("releases") or [])
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(
         content=body,
