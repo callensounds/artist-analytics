@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import io
 
-from history import _whole_number
+from history import _whole_number, popularity_score
 
 # Newest rows only. Each section stops at this cap.
 EXPORT_ROW_CAP = 5000
@@ -28,6 +28,8 @@ COLUMNS = (
     "to_artist_id",
     "mbid",
     "release_type",
+    "external_id",
+    "album_name",
 )
 
 _METRIC_SQL = """
@@ -62,6 +64,14 @@ ORDER BY released_at DESC, mbid
 LIMIT ?
 """
 
+_TRACK_SQL = """
+SELECT source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+FROM artist_tracks
+WHERE artist_id = ?
+ORDER BY last_seen_at DESC, CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+LIMIT ?
+"""
+
 
 def _blank(value) -> str:
     if value is None:
@@ -75,7 +85,13 @@ def _row(section: str, **fields: object) -> list:
     return [values.get(column, "") for column in COLUMNS]
 
 
-def render_export_csv(metrics: list[dict], sightings: list[dict], edges: list[dict], releases: list[dict] | None = None) -> str:
+def render_export_csv(
+    metrics: list[dict],
+    sightings: list[dict],
+    edges: list[dict],
+    releases: list[dict] | None = None,
+    tracks: list[dict] | None = None,
+) -> str:
     """One CSV. A metric is included only when value is an exact integer."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -133,6 +149,21 @@ def render_export_csv(metrics: list[dict], sightings: list[dict], edges: list[di
                 release_type=row.get("release_type"),
             )
         )
+    for row in tracks or []:
+        score = popularity_score(row.get("popularity"))
+        writer.writerow(
+            _row(
+                "track",
+                provider=row.get("source") or "spotify",
+                title=row.get("track_name") or row.get("title"),
+                value="" if score is None else score,
+                first_seen_at=row.get("first_seen_at"),
+                last_seen_at=row.get("last_seen_at"),
+                rank=row.get("rank"),
+                external_id=row.get("external_id"),
+                album_name=row.get("album_name"),
+            )
+        )
     return buffer.getvalue()
 
 
@@ -142,4 +173,8 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
     sightings = await db.query(_SIGHTING_SQL, (artist_id, cap))
     edges = await db.query(_EDGE_SQL, (artist_id, cap))
     releases = await db.query(_RELEASE_SQL, (artist_id, cap))
-    return {"metrics": metrics, "sightings": sightings, "edges": edges, "releases": releases}
+    try:
+        tracks = await db.query(_TRACK_SQL, (artist_id, cap))
+    except Exception:
+        tracks = []
+    return {"metrics": metrics, "sightings": sightings, "edges": edges, "releases": releases, "tracks": tracks}

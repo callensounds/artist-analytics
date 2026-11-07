@@ -264,6 +264,140 @@ export function parseSpotifyFollowers(lines: string[]): number | null {
   return null;
 }
 
+export interface ParsedTrack {
+  name: string;
+  externalId: string;
+  rank: number;
+  popularity: number | null;
+  album: string | null;
+}
+
+const TRACK_CAP = 10;
+
+export function nameTrackId(name: string): string {
+  const normalized = (name || "").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 80);
+  return normalized ? `name:${normalized}` : "";
+}
+
+function unescapeHtml(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function popularityScore(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 100) return null;
+  return value;
+}
+
+function popularStart(page: string): number {
+  const marker = ">Popular</span>";
+  const marked = page.indexOf(marker);
+  if (marked >= 0) return marked;
+  let cursor = 0;
+  while (cursor < page.length) {
+    const at = page.indexOf("Popular", cursor);
+    if (at < 0) return -1;
+    if (page.startsWith("Popular releases", at)) {
+      cursor = at + "Popular".length;
+      continue;
+    }
+    return at;
+  }
+  return -1;
+}
+
+export function popularSlice(page: string): string {
+  if (!page) return "";
+  const start = popularStart(page);
+  if (start < 0) return "";
+  const end = page.indexOf("Popular releases", start + 7);
+  return page.slice(start, end >= 0 ? end : Math.min(page.length, start + 30_000));
+}
+
+function trackRow(name: string, externalId: string, rank: number, popularity: number | null, album: string | null): ParsedTrack {
+  return {
+    name: name.slice(0, 200),
+    externalId: externalId.slice(0, 80),
+    rank,
+    popularity,
+    album: album ? album.slice(0, 200) : null,
+  };
+}
+
+export function parsePopularTracks(page: string): ParsedTrack[] {
+  const chunk = popularSlice(page);
+  const found: ParsedTrack[] = [];
+  const seen = new Set<string>();
+  const trackId = /spotify:track:([A-Za-z0-9]{10,32})-\d+"\s+aria-label="([^"]*)"/g;
+  for (const match of chunk.matchAll(trackId)) {
+    const externalId = match[1];
+    const name = unescapeHtml(match[2]).replace(/\s+/g, " ").trim();
+    if (!name || name.length > 200 || seen.has(externalId)) continue;
+    seen.add(externalId);
+    found.push(trackRow(name, externalId, found.length + 1, null, null));
+    if (found.length >= TRACK_CAP) return found;
+  }
+  if (found.length) return found;
+  const lines = visibleLines(chunk);
+  const popularAt = lines.indexOf("Popular");
+  if (popularAt < 0) return [];
+  for (let index = popularAt + 1; index < lines.length && found.length < TRACK_CAP; index++) {
+    const title = lines[index];
+    if (title === "Popular releases" || title === "Albums" || title === "Singles and EPs") break;
+    const plays = lines[index + 1] || "";
+    if (!/^[\d,]+$/.test(plays)) continue;
+    const externalId = nameTrackId(title);
+    index += 1;
+    if (!externalId || seen.has(externalId)) continue;
+    seen.add(externalId);
+    found.push(trackRow(title, externalId, found.length + 1, null, null));
+  }
+  return found;
+}
+
+export function parseApiTracks(payload: unknown): ParsedTrack[] {
+  if (!payload || typeof payload !== "object") return [];
+  const tracks = (payload as { tracks?: unknown }).tracks;
+  if (!Array.isArray(tracks)) return [];
+  const found: ParsedTrack[] = [];
+  const seen = new Set<string>();
+  for (const item of tracks) {
+    if (found.length >= TRACK_CAP || !item || typeof item !== "object") continue;
+    const track = item as { id?: unknown; name?: unknown; popularity?: unknown; album?: { name?: unknown } };
+    const name = String(track.name || "").replace(/\s+/g, " ").trim();
+    if (!name) continue;
+    const rawId = typeof track.id === "string" ? track.id.trim() : "";
+    const externalId = /^[A-Za-z0-9]{10,32}$/.test(rawId) ? rawId : nameTrackId(name);
+    if (!externalId || seen.has(externalId)) continue;
+    seen.add(externalId);
+    const albumName = track.album && typeof track.album === "object" ? String(track.album.name || "").replace(/\s+/g, " ").trim() : "";
+    found.push(trackRow(name, externalId, found.length + 1, popularityScore(track.popularity), albumName || null));
+  }
+  return found;
+}
+
+export function mergeApiTracks(publicTracks: ParsedTrack[], apiTracks: ParsedTrack[]): ParsedTrack[] {
+  if (!apiTracks.length) return publicTracks;
+  if (!publicTracks.length) return apiTracks.slice(0, TRACK_CAP);
+  const byId = new Map(apiTracks.map((track) => [track.externalId, track]));
+  const byName = new Map(apiTracks.map((track) => [normalizeName(track.name), track]));
+  return publicTracks.slice(0, TRACK_CAP).map((track) => {
+    const match = byId.get(track.externalId) || byName.get(normalizeName(track.name));
+    if (!match) return track;
+    return {
+      name: track.name || match.name,
+      externalId: match.externalId.startsWith("name:") ? track.externalId : match.externalId,
+      rank: track.rank,
+      popularity: match.popularity,
+      album: match.album || track.album,
+    };
+  });
+}
+
 export function parseRelatedArtists(page: string): RelatedArtist[] {
   if (!page) return [];
   const start = page.indexOf("Fans also like");

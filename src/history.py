@@ -42,6 +42,14 @@ PLAYLIST_UNAVAILABLE = (
     "The Web API lists albums and top tracks, and a playlist search only matches names, not track placements. "
     "This card stays empty until a public source exists."
 )
+TRACK_READ_LIMIT = 10
+TRACKS_EMPTY = (
+    "No Spotify top tracks have been stored yet. "
+    "The crawler reads them from the public artist page. "
+    "A popularity score stays blank until Spotify returns a 0–100 score. "
+    "Nothing here is estimated."
+)
+TRACKS_READ_ERROR = "Stored tracks could not be read on this request."
 ALERT_READ_LIMIT = 20
 ALERTS_PAGE_LIMIT = 40
 RELEASE_READ_LIMIT = 50
@@ -73,6 +81,14 @@ def _whole_number(value) -> int | None:
         if re.fullmatch(r"[\d,]+", text):
             return int(text.replace(",", ""))
     return None
+
+
+def popularity_score(value) -> int | None:
+    """A stored 0–100 score. Missing stays missing, and a play count is not a score."""
+    number = _whole_number(value)
+    if number is None or number > 100:
+        return None
+    return number
 
 
 def audience_exact(metric: dict) -> int | None:
@@ -309,6 +325,65 @@ def present_playlists(rows: list[dict]) -> list[dict]:
     return presented
 
 
+def present_tracks(rows: list[dict]) -> list[dict]:
+    """Stored top tracks. A missing popularity stays missing, not zero."""
+    presented = []
+    for row in rows or []:
+        name = " ".join(str(row.get("track_name") or row.get("name") or "").split())
+        external = str(row.get("external_id") or "").strip()
+        if not name or not external:
+            continue
+        rank = _whole_number(row.get("rank"))
+        if rank is not None and (rank < 1 or rank > 100):
+            rank = None
+        album = " ".join(str(row.get("album_name") or "").split())
+        spotify_id = external if re.fullmatch(r"[A-Za-z0-9]{10,32}", external) else ""
+        presented.append(
+            {
+                "name": name[:200],
+                "external_id": external[:80],
+                "popularity": popularity_score(row.get("popularity")),
+                "album_name": album[:200] or None,
+                "rank": rank,
+                "first_seen_at": str(row.get("first_seen_at") or ""),
+                "last_seen_at": str(row.get("last_seen_at") or ""),
+                "url": f"https://open.spotify.com/track/{spotify_id}" if spotify_id else None,
+            }
+        )
+    return presented
+
+
+def _clean_tracks(raw) -> list[dict]:
+    """Rows the crawler is willing to store. Play counts never become popularity."""
+    cleaned = []
+    seen = set()
+    for item in raw or []:
+        if len(cleaned) >= TRACK_READ_LIMIT or not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or item.get("track_name") or "").split())
+        external = str(item.get("external_id") or "").strip()
+        if not name or not external or len(external) > 80:
+            continue
+        external = external[:80]
+        if external in seen:
+            continue
+        seen.add(external)
+        rank = _whole_number(item.get("rank"))
+        if rank is not None and (rank < 1 or rank > 100):
+            rank = None
+        album = " ".join(str(item.get("album_name") or "").split())
+        cleaned.append(
+            {
+                "name": name[:200],
+                "external_id": external,
+                "popularity": popularity_score(item.get("popularity")),
+                "album_name": album[:200] or None,
+                "rank": rank,
+            }
+        )
+    return cleaned
+
+
 def timeline_instant(published: str | None, precision: str | None, first_seen: str | None) -> datetime | None:
     """Sort key. A year or a day stays at that precision and is not given a fake clock time."""
     text = (published or "").strip()
@@ -363,6 +438,8 @@ def empty_history(reason: str) -> dict:
         "sightings": [],
         "playlists": [],
         "playlists_reason": PLAYLIST_UNAVAILABLE,
+        "tracks": [],
+        "tracks_reason": TRACKS_EMPTY,
         "momentum": [],
         "momentum_reason": None,
         "alerts": [],
@@ -417,6 +494,25 @@ def _value_statements(prefix: str, rows: list[tuple], suffix: str = "") -> list[
         params = tuple(value for row in chunk for value in row)
         statements.append((sql, params))
     return statements
+
+
+async def _latest_track_scores(db, artist_id: int) -> dict[str, dict]:
+    rows = await db.query(
+        """
+        SELECT external_id, popularity, captured_at
+        FROM track_snapshots
+        WHERE artist_id = ? AND source = 'spotify'
+        ORDER BY captured_at DESC, id DESC
+        LIMIT 40
+        """,
+        (artist_id,),
+    )
+    newest = {}
+    for row in rows:
+        external = row.get("external_id")
+        if external and external not in newest:
+            newest[external] = row
+    return newest
 
 
 async def _latest_by_metric(db, artist_id: int) -> dict[tuple[str, str], dict]:
@@ -543,6 +639,65 @@ async def remember(
                 )
             )
             taken += 1
+    stored_tracks = []
+    for source in sources:
+        if source.get("status") == "error" or source.get("platform") != "spotify":
+            continue
+        stored_tracks.extend(_clean_tracks(source.get("tracks")))
+    stored_tracks = stored_tracks[:TRACK_READ_LIMIT]
+    track_values = [
+        (
+            artist_id,
+            "spotify",
+            track["external_id"],
+            track["name"],
+            track["popularity"],
+            track["album_name"],
+            track["rank"],
+            stamp,
+            stamp,
+        )
+        for track in stored_tracks
+    ]
+    snapshot_values = []
+    if stored_tracks:
+        previous_scores = await _latest_track_scores(db, artist_id)
+        for track in stored_tracks:
+            score = track["popularity"]
+            if score is None:
+                continue
+            prior = previous_scores.get(track["external_id"])
+            if prior and popularity_score(prior.get("popularity")) == score:
+                prior_at = parse_utc(prior.get("captured_at"))
+                if prior_at and moment - prior_at < timedelta(seconds=SNAPSHOT_REPEAT_SECONDS):
+                    continue
+            snapshot_values.append((artist_id, "spotify", track["external_id"], score, stamp))
+    statements.extend(
+        _value_statements(
+            """
+            INSERT INTO artist_tracks (
+                artist_id, source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+            )
+            """.strip(),
+            track_values,
+            """
+            ON CONFLICT(artist_id, source, external_id) DO UPDATE SET
+                track_name = excluded.track_name,
+                popularity = COALESCE(excluded.popularity, artist_tracks.popularity),
+                album_name = COALESCE(excluded.album_name, artist_tracks.album_name),
+                rank = excluded.rank,
+                last_seen_at = excluded.last_seen_at
+            """.strip(),
+        )
+    )
+    statements.extend(
+        _value_statements(
+            """
+            INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at)
+            """.strip(),
+            snapshot_values,
+        )
+    )
     statements.extend(
         _value_statements(
             "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)",
@@ -721,6 +876,18 @@ ORDER BY last_seen_at DESC, id DESC
 LIMIT ?
 """
 
+TRACK_SQL = """
+SELECT external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+FROM artist_tracks
+WHERE artist_id = ? AND source = 'spotify'
+  AND last_seen_at = (
+      SELECT MAX(last_seen_at) FROM artist_tracks
+      WHERE artist_id = ? AND source = 'spotify'
+  )
+ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+LIMIT ?
+"""
+
 RELEASE_SQL = """
 SELECT mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
 FROM musicbrainz_releases
@@ -816,6 +983,18 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["playlists"] = present_playlists(playlists or [])
         history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
+    track_rows = None
+    tracks_failed = False
+    try:
+        track_rows = await db.query(TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT))
+    except Exception:
+        tracks_failed = True
+    if tracks_failed:
+        history["tracks"] = []
+        history["tracks_reason"] = TRACKS_READ_ERROR
+    else:
+        history["tracks"] = present_tracks(track_rows or [])
+        history["tracks_reason"] = None if history["tracks"] else TRACKS_EMPTY
     momentum = None
     momentum_failed = False
     try:

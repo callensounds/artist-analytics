@@ -19,7 +19,10 @@ import {
   parseDiscography,
   parseInstagram,
   parseItunesAlbums,
+  mergeApiTracks,
+  parseApiTracks,
   parseMonthlyListeners,
+  parsePopularTracks,
   parseRelatedArtists,
   parseSpotifyFollowers,
   sanitizeQuery,
@@ -70,6 +73,8 @@ export interface CrawlEnv {
   DB: Store;
   CRAWL_QUEUE: { send: (body: unknown) => Promise<unknown> | unknown };
   YOUTUBE_API_KEY?: string;
+  SPOTIFY_CLIENT_ID?: string;
+  SPOTIFY_CLIENT_SECRET?: string;
   CRAWL_ENQUEUE_LIMIT?: string;
   CRAWL_STALE_SECONDS?: string;
   RELATED_AUTOTRACK_CAP?: string;
@@ -334,7 +339,66 @@ async function musicbrainzReleases(mbid: string) {
   return parseReleaseGroups(response.json);
 }
 
-async function spotify(artistId: string): Promise<SavedSource> {
+let spotifyToken: { id: string; value: string; expires: number } = { id: "", value: "", expires: 0 };
+
+export function resetSpotifyToken(): void {
+  spotifyToken = { id: "", value: "", expires: 0 };
+}
+
+async function spotifyAccessToken(clientId: string, clientSecret: string): Promise<string | null> {
+  const now = Date.now();
+  if (spotifyToken.value && spotifyToken.id === clientId && now < spotifyToken.expires) return spotifyToken.value;
+  let response: Response;
+  try {
+    response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": HTTP_USER_AGENT,
+      },
+      body: new URLSearchParams({ grant_type: "client_credentials" }),
+    });
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+  let payload: { access_token?: unknown; expires_in?: unknown } | null = null;
+  try {
+    payload = (await response.json()) as { access_token?: unknown; expires_in?: unknown };
+  } catch {
+    return null;
+  }
+  const token = typeof payload?.access_token === "string" ? payload.access_token : "";
+  if (!token) return null;
+  const expiresIn = typeof payload?.expires_in === "number" ? payload.expires_in : 3600;
+  spotifyToken = { id: clientId, value: token, expires: now + Math.max(expiresIn - 60, 30) * 1000 };
+  return token;
+}
+
+async function enrichTracks(artistId: string, tracks: ReturnType<typeof parsePopularTracks>, env: CrawlEnv) {
+  const clientId = env.SPOTIFY_CLIENT_ID || "";
+  const clientSecret = env.SPOTIFY_CLIENT_SECRET || "";
+  if (!clientId || !clientSecret) return tracks;
+  try {
+    const token = await spotifyAccessToken(clientId, clientSecret);
+    if (!token) return tracks;
+    const response = await fetchJson(
+      `https://api.spotify.com/v1/artists/${encodeURIComponent(artistId)}/top-tracks?${new URLSearchParams({ market: "US" })}`,
+      { Authorization: `Bearer ${token}` },
+    );
+    if (response.status === 401) {
+      resetSpotifyToken();
+      return tracks;
+    }
+    if (!response.ok || !response.json) return tracks;
+    return mergeApiTracks(tracks, parseApiTracks(response.json));
+  } catch {
+    return tracks;
+  }
+}
+
+async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
   const page = await fetchText(`https://open.spotify.com/artist/${artistId}`, FETCH_BYTES);
   if (page.status === 403) {
     return { platform: "spotify", status: "unavailable", reason: "Spotify blocked the public artist page (HTTP 403).", markCrawled: true };
@@ -345,6 +409,7 @@ async function spotify(artistId: string): Promise<SavedSource> {
   const followers = parseSpotifyFollowers(lines);
   const related = parseRelatedArtists(page.text);
   const albums = parseDiscography(lines);
+  const tracks = await enrichTracks(artistId, parsePopularTracks(page.text), env);
   return {
     platform: "spotify",
     status: "ok",
@@ -358,6 +423,13 @@ async function spotify(artistId: string): Promise<SavedSource> {
       kind: "release",
       sortKey: album.year,
       precision: "year",
+    })),
+    tracks: tracks.map((track) => ({
+      externalId: track.externalId,
+      name: track.name,
+      popularity: track.popularity,
+      album: track.album,
+      rank: track.rank,
     })),
     related,
     spotifyId: artistId,
@@ -542,7 +614,7 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   if (provider === "tiktok" && !links.tiktok) return { ok: true, detail: `${row.name} | tiktok=unavailable` };
   if (provider === "youtube" && !env.YOUTUBE_API_KEY) return { ok: true, detail: `${row.name} | youtube=missing_credentials` };
   let saved: SavedSource & { forbidden?: boolean };
-  if (provider === "spotify") saved = await spotify(links.spotify_id);
+  if (provider === "spotify") saved = await spotify(links.spotify_id, env);
   else if (provider === "instagram") saved = await instagram(links.instagram);
   else if (provider === "tiktok") saved = await tiktok(links.tiktok);
   else if (provider === "apple") saved = await apple(String(row.name), links.apple_id);
