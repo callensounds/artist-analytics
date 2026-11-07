@@ -4,8 +4,20 @@
 {% block content %}
 <div class="mb-6">
     <h1 class="text-2xl sm:text-3xl font-bold">US iTunes charts</h1>
-    <p class="text-slate-400 text-sm mt-1">Latest stored top songs and top albums. This page does not fetch Apple or Spotify. A chart artist links here only when the crawler matched a tracked artist by Apple id or by the exact name.</p>
+    <p class="text-slate-400 text-sm mt-1">Stored top songs and top albums. Latest is the newest stored date. This page does not fetch Apple or Spotify. A chart artist links here only when the crawler matched a tracked artist by Apple id or by the exact name.</p>
 </div>
+{% if dates %}
+<form method="get" action="/charts" class="flex flex-wrap items-center gap-2 mb-6">
+    <label for="chart-date" class="text-sm text-slate-400">Stored date</label>
+    <select id="chart-date" name="date" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm">
+        <option value="">Latest</option>
+        {% for day in dates %}
+        <option value="{{ day }}" {% if day == selected_date %}selected{% endif %}>{{ day }}</option>
+        {% endfor %}
+    </select>
+    <button type="submit" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-lg text-sm">Show</button>
+</form>
+{% endif %}
 {% if reason %}
 <p class="text-slate-400 text-sm mb-6">{{ reason }}</p>
 {% endif %}
@@ -41,7 +53,7 @@
             </table>
         </div>
         {% else %}
-        <p class="text-slate-400 text-sm">No top songs are stored yet.</p>
+        <p class="text-slate-400 text-sm">{% if selected_date %}No top songs are stored for this date.{% else %}No top songs are stored yet.{% endif %}</p>
         {% endif %}
     </section>
     <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">
@@ -75,7 +87,7 @@
             </table>
         </div>
         {% else %}
-        <p class="text-slate-400 text-sm">No top albums are stored yet.</p>
+        <p class="text-slate-400 text-sm">{% if selected_date %}No top albums are stored for this date.{% else %}No top albums are stored yet.{% endif %}</p>
         {% endif %}
     </section>
 </div>

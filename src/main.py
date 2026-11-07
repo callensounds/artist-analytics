@@ -566,17 +566,24 @@ async def alerts_page(request: Request):
 
 
 @app.get("/charts", response_class=HTMLResponse)
-async def charts_page(request: Request):
-    """Latest stored US iTunes charts. No feed fetch on this request."""
+async def charts_page(request: Request, date: str = ""):
+    """Stored US iTunes charts for one date. No feed fetch on this request."""
     user = await _require_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     db = await _open_read_db(request.scope.get("env"))
-    board = {"songs": [], "albums": [], "songs_date": "", "albums_date": ""}
+    board = {
+        "songs": [],
+        "albums": [],
+        "songs_date": "",
+        "albums_date": "",
+        "dates": [],
+        "selected_date": "",
+    }
     failed = False
     if db is not None:
         try:
-            board = await asyncio.wait_for(load_chart_board(db), GROWTH_READ_TIMEOUT_S)
+            board = await asyncio.wait_for(load_chart_board(db, date), GROWTH_READ_TIMEOUT_S)
         except Exception:
             failed = True
     if db is None:
@@ -673,6 +680,7 @@ async def export_artist_csv(request: Request, key: str):
         rows["edges"],
         rows.get("releases") or [],
         rows.get("tracks") or [],
+        rows.get("charts") or [],
     )
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(

@@ -72,6 +72,16 @@ ORDER BY last_seen_at DESC, CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, 
 LIMIT ?
 """
 
+# One stored chart row per day and rank. captured_at in the CSV is the chart date.
+_CHART_SQL = """
+SELECT chart_source, territory, chart_date, position, track_or_album_name
+FROM chart_entries
+WHERE artist_id = ?
+  AND position BETWEEN 1 AND 100
+ORDER BY chart_date DESC, chart_source, position
+LIMIT ?
+"""
+
 
 def _blank(value) -> str:
     if value is None:
@@ -85,12 +95,27 @@ def _row(section: str, **fields: object) -> list:
     return [values.get(column, "") for column in COLUMNS]
 
 
+def _chart_position(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        return None
+    if number < 1 or number > 100:
+        return None
+    return number
+
+
 def render_export_csv(
     metrics: list[dict],
     sightings: list[dict],
     edges: list[dict],
     releases: list[dict] | None = None,
     tracks: list[dict] | None = None,
+    charts: list[dict] | None = None,
 ) -> str:
     """One CSV. A metric is included only when value is an exact integer."""
     buffer = io.StringIO()
@@ -164,6 +189,25 @@ def render_export_csv(
                 album_name=row.get("album_name"),
             )
         )
+    for row in charts or []:
+        position = _chart_position(row.get("position"))
+        title = str(row.get("track_or_album_name") or row.get("title") or "").strip()
+        chart_date = str(row.get("chart_date") or "").strip()
+        source = str(row.get("chart_source") or "").strip()
+        if position is None or not title or not chart_date or not source:
+            continue
+        writer.writerow(
+            _row(
+                "chart_entries",
+                captured_at=chart_date,
+                provider=source,
+                metric="position",
+                value=position,
+                title=title,
+                kind=row.get("territory"),
+                rank=position,
+            )
+        )
     return buffer.getvalue()
 
 
@@ -177,4 +221,15 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
         tracks = await db.query(_TRACK_SQL, (artist_id, cap))
     except Exception:
         tracks = []
-    return {"metrics": metrics, "sightings": sightings, "edges": edges, "releases": releases, "tracks": tracks}
+    try:
+        charts = await db.query(_CHART_SQL, (artist_id, cap))
+    except Exception:
+        charts = []
+    return {
+        "metrics": metrics,
+        "sightings": sightings,
+        "edges": edges,
+        "releases": releases,
+        "tracks": tracks,
+        "charts": charts,
+    }
