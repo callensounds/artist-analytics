@@ -10,9 +10,11 @@ from analytics import (
     SOURCE_COLORS,
     build_posting_patterns,
     build_release_calendar,
+    calendar_navigation,
     empty_posting_patterns,
     empty_release_calendar,
     normalize_name,
+    release_years,
 )
 from charts import CHARTS_EMPTY, load_artist_charts
 from db import parse_utc, utc_now
@@ -55,6 +57,10 @@ ALERTS_PAGE_LIMIT = 40
 RELEASE_READ_LIMIT = 50
 EXACT_TIME_READ_LIMIT = 80
 RELEASE_SIGHTING_READ_LIMIT = 60
+# One artist, one year. The jump list is distinct years, not every release row.
+CALENDAR_YEAR_LIMIT = 100
+CALENDAR_PERIOD_LIMIT = 200
+CALENDAR_DATE_LIMIT = 500
 RELEASES_EMPTY = "No official MusicBrainz albums, EPs, or singles with a release date have been stored yet."
 POSTING_READ_ERROR = "Stored timestamps could not be read on this request."
 CALENDAR_READ_ERROR = "Stored releases could not be read on this request."
@@ -913,6 +919,64 @@ ORDER BY published_at DESC, id DESC
 LIMIT ?
 """
 
+# idx_mb_releases_artist is (artist_id, released_at). The range stays on that index.
+# ':' sorts after every digit, so it includes 2006. The text '10000' sorts before '2000'.
+MB_CALENDAR_YEARS_SQL = """
+SELECT substr(released_at, 1, 4) AS year
+FROM musicbrainz_releases
+WHERE artist_id = ?
+  AND released_at >= '1000'
+  AND released_at < ':'
+GROUP BY substr(released_at, 1, 4)
+ORDER BY year DESC
+LIMIT ?
+"""
+
+MB_CALENDAR_PERIOD_SQL = """
+SELECT mbid, title, release_type, released_at, precision
+FROM musicbrainz_releases
+WHERE artist_id = ?
+  AND released_at >= ?
+  AND released_at < ?
+ORDER BY released_at DESC
+LIMIT ?
+"""
+
+# UNIQUE (artist_id, source, external_id) seeks one source. published_at is filtered inside that set.
+# Dates are placed in Python so a UTC offset can land in the next year without a guessed day.
+SIGHTING_CALENDAR_DATES_SQL = """
+SELECT published_at, precision
+FROM content_sightings
+WHERE artist_id = ?
+  AND source = ?
+  AND published_at >= '1000'
+  AND published_at < ':'
+LIMIT ?
+"""
+
+SIGHTING_CALENDAR_YEARS_SQL = """
+SELECT substr(published_at, 1, 4) AS year
+FROM content_sightings
+WHERE artist_id = ?
+  AND source = ?
+  AND published_at >= '1000'
+  AND published_at < ':'
+GROUP BY substr(published_at, 1, 4)
+ORDER BY year DESC
+LIMIT ?
+"""
+
+SIGHTING_CALENDAR_PERIOD_SQL = """
+SELECT source, title, kind, published_at, precision
+FROM content_sightings
+WHERE artist_id = ?
+  AND source = ?
+  AND published_at >= ?
+  AND published_at < ?
+ORDER BY published_at DESC
+LIMIT ?
+"""
+
 ALERT_SQL = """
 SELECT provider, metric, window, delta, delta_pct, baseline_value, latest_value,
        baseline_at, latest_at, detected_at
@@ -946,6 +1010,144 @@ async def load_growth(db, name: str) -> dict:
     history = await load_dashboard_history(db, name)
     if not history.get("growth", {}).get("datasets"):
         history["reason"] = history.get("reason") or "No exact audience count has been stored yet."
+    return history
+
+
+def calendar_period_bounds(year: int) -> tuple[str, str]:
+    """Text bounds for one calendar year, widened by the day a UTC offset can cross.
+
+    Placement still uses the stored precision. A neighbor month is dropped unless
+    the UTC day actually falls in `year`.
+    """
+    if year <= 1000:
+        start = f"{year:04d}"
+    else:
+        start = f"{year - 1:04d}-12"
+    if year >= 9999:
+        end = ":"
+    else:
+        end = f"{year + 1:04d}-02"
+    return start, end
+
+
+def _calendar_year_numbers(rows: list[dict] | None) -> list[int]:
+    found = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("year") or "").strip()
+        if len(text) != 4 or not text.isdigit():
+            continue
+        number = int(text)
+        if 1000 <= number <= 9999:
+            found.append(number)
+    return found
+
+
+async def _safe_rows(db, sql: str, params: tuple) -> list[dict] | None:
+    try:
+        return await db.query(sql, params)
+    except Exception:
+        return None
+
+
+async def _read_posting(db, artist_id: int) -> dict:
+    try:
+        posting_rows = await db.query(EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT))
+    except Exception:
+        return empty_posting_patterns(POSTING_READ_ERROR)
+    return build_posting_patterns(posting_rows or [])
+
+
+def _musicbrainz_calendar_rows(rows: list[dict] | None) -> list[dict]:
+    return [
+        {
+            "title": row.get("title"),
+            "source": "musicbrainz",
+            "released_at": row.get("released_at"),
+            "precision": row.get("precision"),
+            "kind": row.get("release_type"),
+            "mbid": row.get("mbid"),
+        }
+        for row in rows or []
+        if isinstance(row, dict)
+    ]
+
+
+async def _sighting_years(db, artist_id: int, source: str) -> list[int] | None:
+    """Placed years for one source. A full read that hits the cap also keeps the grouped years."""
+    dates = await _safe_rows(db, SIGHTING_CALENDAR_DATES_SQL, (artist_id, source, CALENDAR_DATE_LIMIT))
+    if dates is None:
+        grouped = await _safe_rows(db, SIGHTING_CALENDAR_YEARS_SQL, (artist_id, source, CALENDAR_YEAR_LIMIT))
+        if grouped is None:
+            return None
+        return _calendar_year_numbers(grouped)
+    found = release_years(dates)
+    if len(dates) >= CALENDAR_DATE_LIMIT:
+        grouped = await _safe_rows(db, SIGHTING_CALENDAR_YEARS_SQL, (artist_id, source, CALENDAR_YEAR_LIMIT))
+        found.extend(_calendar_year_numbers(grouped))
+    return found
+
+
+async def load_release_calendar(db, artist_id: int, year: int | None = None) -> dict:
+    """One stored year, plus the years that actually have a release. No provider calls."""
+    mb_years = await _safe_rows(db, MB_CALENDAR_YEARS_SQL, (artist_id, CALENDAR_YEAR_LIMIT))
+    apple_years = await _sighting_years(db, artist_id, "apple")
+    spotify_years = await _sighting_years(db, artist_id, "spotify")
+    if mb_years is None and apple_years is None and spotify_years is None:
+        calendar = empty_release_calendar(CALENDAR_READ_ERROR)
+        calendar["navigation"] = calendar_navigation([], None, artist_id)
+        return calendar
+    years = sorted(
+        set(_calendar_year_numbers(mb_years) + (apple_years or []) + (spotify_years or [])),
+        reverse=True,
+    )
+    if not years:
+        calendar = empty_release_calendar()
+        calendar["navigation"] = calendar_navigation([], None, artist_id)
+        return calendar
+    selected = year if isinstance(year, int) and not isinstance(year, bool) and 1000 <= year <= 9999 else years[0]
+    navigation = calendar_navigation(years, selected, artist_id)
+    start, end = calendar_period_bounds(selected)
+    mb_rows = await _safe_rows(db, MB_CALENDAR_PERIOD_SQL, (artist_id, start, end, CALENDAR_PERIOD_LIMIT))
+    apple_rows = await _safe_rows(db, SIGHTING_CALENDAR_PERIOD_SQL, (artist_id, "apple", start, end, CALENDAR_PERIOD_LIMIT))
+    spotify_rows = await _safe_rows(
+        db, SIGHTING_CALENDAR_PERIOD_SQL, (artist_id, "spotify", start, end, CALENDAR_PERIOD_LIMIT)
+    )
+    if mb_rows is None and apple_rows is None and spotify_rows is None:
+        calendar = empty_release_calendar(CALENDAR_READ_ERROR)
+        calendar["navigation"] = navigation
+        calendar["period_year"] = selected
+        calendar["period_label"] = str(selected)
+        calendar["empty_period"] = False
+        return calendar
+    calendar_rows = _musicbrainz_calendar_rows(mb_rows)
+    if apple_rows:
+        calendar_rows.extend(apple_rows)
+    if spotify_rows:
+        calendar_rows.extend(spotify_rows)
+    calendar = build_release_calendar(calendar_rows, year=selected)
+    calendar["navigation"] = navigation
+    calendar["row_cap_hit"] = any(
+        rows is not None and len(rows) >= CALENDAR_PERIOD_LIMIT for rows in (mb_rows, apple_rows, spotify_rows)
+    )
+    if calendar["empty_period"]:
+        calendar["reason"] = (
+            f"No stored MusicBrainz, Apple, or Spotify release falls in {selected}. "
+            "The years above are the ones with a stored date."
+        )
+    return calendar
+
+
+async def load_calendar_page(db, artist: dict, year: int | None = None) -> dict:
+    """Posting hours and one release year. Skips snapshots, charts, and the other artist cards."""
+    artist_id = int(artist["id"])
+    history = empty_history("No exact audience count has been stored yet.")
+    history["artist_id"] = artist_id
+    history["name"] = artist.get("name")
+    history["available"] = True
+    history["posting"] = await _read_posting(db, artist_id)
+    history["calendar"] = await load_release_calendar(db, artist_id, year)
     return history
 
 
@@ -1033,16 +1235,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     else:
         history["releases"] = present_releases(release_rows or [])
         history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
-    posting_rows = None
-    posting_failed = False
-    try:
-        posting_rows = await db.query(EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT))
-    except Exception:
-        posting_failed = True
-    if posting_failed:
-        history["posting"] = empty_posting_patterns(POSTING_READ_ERROR)
-    else:
-        history["posting"] = build_posting_patterns(posting_rows or [])
+    history["posting"] = await _read_posting(db, artist_id)
     release_sightings = None
     release_sightings_failed = False
     try:

@@ -27,7 +27,7 @@ from crawl import (
 from diag import diagnose
 from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
-from analytics import normalize_name
+from analytics import normalize_name, parse_calendar_period
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from history import (
     ALERTS_EMPTY,
@@ -37,6 +37,7 @@ from history import (
     list_tracked_artists,
     list_trending,
     load_alert_feed,
+    load_calendar_page,
     load_dashboard_history,
     load_history_for_artist,
     search_artists,
@@ -101,7 +102,7 @@ def render_source_cards(sources: list[dict] | None) -> str:
     for source in sources or []:
         label = html.escape(str(source.get("label") or ""))
         status = html.escape(str(source.get("status") or "").replace("_", " "))
-        parts.append('<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">')
+        parts.append('<section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700">')
         parts.append('<div class="flex items-start justify-between gap-3 mb-3"><div>')
         parts.append('<h2 class="text-lg font-semibold flex items-center gap-2">')
         image = source.get("image_url")
@@ -155,12 +156,12 @@ def render_source_cards(sources: list[dict] | None) -> str:
                 weekday = html.escape(str(item.get("weekday"))) if item.get("weekday") else ""
                 clock = f"{precision} · {weekday}" if weekday else precision
                 parts.append(
-                    '<div class="py-2 flex justify-between gap-3"><div class="min-w-0">'
-                    f'<div class="text-sm font-medium truncate">{title}</div>'
-                    f'<div class="text-xs text-slate-500">{detail}</div></div>'
-                    '<div class="text-right shrink-0">'
-                    f'<div class="font-mono text-sm text-emerald-300">{display}</div>'
-                    f'<div class="text-xs text-slate-500">{clock}</div></div></div>'
+                    '<div class="py-2 flex flex-wrap items-baseline justify-between gap-2"><div class="min-w-0 flex-1">'
+                    f'<div class="text-sm font-medium break-words">{title}</div>'
+                    f'<div class="text-xs text-slate-500 break-words">{detail}</div></div>'
+                    '<div>'
+                    f'<div class="font-mono text-sm text-emerald-300 break-words">{display}</div>'
+                    f'<div class="text-xs text-slate-500 break-words">{clock}</div></div></div>'
                 )
             parts.append("</div>")
         elif source.get("status") == "ok":
@@ -732,10 +733,10 @@ async def related_graph_page(request: Request, key: str):
     )
 
 
-async def _load_stored_artist(request: Request, key: str, redirect_suffix: str = ""):
-    """Artist row plus stored history, or a Response when the page should stop.
+async def _resolve_stored_artist(request: Request, key: str, redirect_suffix: str = ""):
+    """The artists row, or a Response when the page should stop.
 
-    Name lookups redirect to the id. This does not call providers.
+    Name lookups redirect to the id and keep the query string. This does not call providers.
     """
     user = await _require_user(request)
     if not user:
@@ -754,7 +755,11 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
         except Exception:
             artist = None
         if artist is not None:
-            return RedirectResponse(f"/artist/{int(artist['id'])}{redirect_suffix}", status_code=303)
+            location = f"/artist/{int(artist['id'])}{redirect_suffix}"
+            query = request.url.query
+            if query:
+                location = f"{location}?{query}"
+            return RedirectResponse(location, status_code=303)
     if artist is None:
         if db is None:
             message = "Crawl history is not available on this request. This page does not call providers."
@@ -773,6 +778,15 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
             },
             status_code=404,
         )
+    return user, artist, db
+
+
+async def _load_stored_artist(request: Request, key: str, redirect_suffix: str = ""):
+    """Artist row plus stored history, or a Response when the page should stop."""
+    loaded = await _resolve_stored_artist(request, key, redirect_suffix)
+    if not isinstance(loaded, tuple):
+        return loaded
+    user, artist, db = loaded
     try:
         history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
     except Exception:
@@ -781,12 +795,18 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
 
 
 @app.get("/artist/{key}/calendar", response_class=HTMLResponse)
-async def artist_calendar(request: Request, key: str):
-    """Stored release calendar and posting hours. No provider fan-out."""
-    loaded = await _load_stored_artist(request, key, "/calendar")
+async def artist_calendar(request: Request, key: str, year: str | None = None):
+    """One stored release year and posting hours. No provider fan-out."""
+    loaded = await _resolve_stored_artist(request, key, "/calendar")
     if not isinstance(loaded, tuple):
         return loaded
-    user, artist, history = loaded
+    user, artist, db = loaded
+    selected = parse_calendar_period(year, request.query_params.get("from"))
+    try:
+        history = await asyncio.wait_for(load_calendar_page(db, artist, selected), GROWTH_READ_TIMEOUT_S)
+    except Exception:
+        history = empty_history("Stored history could not be read on this request.")
+        history["artist_id"] = int(artist["id"])
     return templates.TemplateResponse(
         request,
         "calendar.html",
@@ -794,7 +814,7 @@ async def artist_calendar(request: Request, key: str):
             "user": user,
             "title": artist.get("name") or "Artist",
             "artist_id": int(artist["id"]),
-            "subtitle": "Stored dates only. This page does not fetch providers.",
+            "subtitle": "Stored dates only, one year at a time. This page does not fetch providers.",
             "history": history,
         },
     )
