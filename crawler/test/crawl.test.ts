@@ -13,8 +13,9 @@ import {
   runQueue,
   runScheduled,
 } from "../src/crawl";
-import { listenerSlices, parseInstagram, parseMonthlyListeners, parseRelatedArtists, leadingInt, tiktokVideos } from "../src/parse";
-import { type Store, migrate } from "../src/store";
+import { listenerSlices, mergeApiTracks, parseInstagram, parseMonthlyListeners, parsePopularTracks, parseRelatedArtists, leadingInt, tiktokVideos } from "../src/parse";
+import { type Store, migrate, saveSource } from "../src/store";
+import { resetSpotifyToken } from "../src/crawl";
 
 function sqliteStore(db: DatabaseSync): Store {
   return {
@@ -350,6 +351,164 @@ describe("playlist schema", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 0 });
     const version = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0004_playlist_appearances.sql");
     expect(version).toBeTruthy();
+  });
+});
+
+describe("spotify tracks", () => {
+  it("parses public ids and does not treat a play count as popularity", () => {
+    const page = `
+      <span>Popular</span>
+      <div aria-labelledby="listrow-title-track-spotify:track:0dpyzcT3RMNNSd2xKBf35I-0" aria-label="Be Sweet">
+        <span>113,493,783</span>
+      </div>
+      <h2>Popular releases</h2>
+    `;
+    const rows = parsePopularTracks(page);
+    expect(rows).toEqual([
+      { name: "Be Sweet", externalId: "0dpyzcT3RMNNSd2xKBf35I", rank: 1, popularity: null, album: null },
+    ]);
+    const named = parsePopularTracks("Popular\nExample Song\n9,876,543\nPopular releases\n");
+    expect(named[0]).toMatchObject({ externalId: "name:examplesong", popularity: null, name: "Example Song" });
+    expect(JSON.stringify(named)).not.toContain("9876543");
+  });
+
+  it("merges a Web API score onto the public track and leaves a missing score null", () => {
+    const merged = mergeApiTracks(
+      [
+        { name: "Be Sweet", externalId: "name:besweet", rank: 1, popularity: null, album: null },
+        { name: "No Score", externalId: "0O4sIQ728ugLlwBVaxF8UM", rank: 2, popularity: null, album: null },
+      ],
+      [
+        { name: "Be Sweet", externalId: "0dpyzcT3RMNNSd2xKBf35I", rank: 1, popularity: 80, album: "Jubilee" },
+        { name: "No Score", externalId: "0O4sIQ728ugLlwBVaxF8UM", rank: 2, popularity: null, album: null },
+      ],
+    );
+    expect(merged[0]).toMatchObject({ externalId: "0dpyzcT3RMNNSd2xKBf35I", popularity: 80, album: "Jubilee", rank: 1 });
+    expect(merged[1].popularity).toBeNull();
+  });
+
+  it("stores public track ids without calling the Web API and leaves popularity null", async () => {
+    resetSpotifyToken();
+    const html = `
+      <div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>
+      <span>Popular</span>
+      <div aria-labelledby="listrow-title-track-spotify:track:0dpyzcT3RMNNSd2xKBf35I-0" aria-label="Be Sweet">
+        <span>113,493,783</span>
+      </div>
+      <div aria-labelledby="listrow-title-track-spotify:track:0O4sIQ728ugLlwBVaxF8UM-1" aria-label="No Score"></div>
+      <h2>Popular releases</h2>
+    `;
+    const urls: string[] = [];
+    const { env, db } = memoryEnv({ "open.spotify.com/artist/": { body: html } });
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("open.spotify.com/artist/")) return new Response(html, { status: 200 });
+      return new Response("nope", { status: 500 });
+    });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
+    ).run("2020-01-01T00:00:00Z");
+    const version = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0010_artist_tracks.sql");
+    expect(version).toBeTruthy();
+    await handleMessage(env, { artist_id: 1, provider: "spotify" }, new Date("2026-11-06T00:00:00Z"));
+    const rows = db.prepare("SELECT external_id, track_name, popularity, album_name, rank FROM artist_tracks ORDER BY rank").all();
+    expect(rows).toEqual([
+      { external_id: "0dpyzcT3RMNNSd2xKBf35I", track_name: "Be Sweet", popularity: null, album_name: null, rank: 1 },
+      { external_id: "0O4sIQ728ugLlwBVaxF8UM", track_name: "No Score", popularity: null, album_name: null, rank: 2 },
+    ]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 0 });
+    expect(urls.some((url) => url.includes("api.spotify.com") || url.includes("accounts.spotify.com"))).toBe(false);
+  });
+
+  it("fills popularity from the top-tracks API when credentials exist", async () => {
+    resetSpotifyToken();
+    const html = `
+      <div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>
+      <span>Popular</span>
+      <div aria-labelledby="listrow-title-track-spotify:track:0dpyzcT3RMNNSd2xKBf35I-0" aria-label="Be Sweet"></div>
+      <div aria-labelledby="listrow-title-track-spotify:track:0O4sIQ728ugLlwBVaxF8UM-1" aria-label="No Score"></div>
+      <h2>Popular releases</h2>
+    `;
+    const { env, db } = memoryEnv({
+      "open.spotify.com/artist/": { body: html },
+      "accounts.spotify.com": { body: JSON.stringify({ access_token: "tok", expires_in: 3600 }) },
+      "api.spotify.com": {
+        body: JSON.stringify({
+          tracks: [
+            { id: "0dpyzcT3RMNNSd2xKBf35I", name: "Be Sweet", popularity: 72, album: { name: "Jubilee" } },
+            { id: "0O4sIQ728ugLlwBVaxF8UM", name: "No Score", popularity: null },
+          ],
+        }),
+      },
+    });
+    env.SPOTIFY_CLIENT_ID = "cid";
+    env.SPOTIFY_CLIENT_SECRET = "sec";
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
+    ).run("2020-01-01T00:00:00Z");
+    await handleMessage(env, { artist_id: 1, provider: "spotify" }, new Date("2026-11-06T00:00:00Z"));
+    const sweet = db.prepare("SELECT popularity, album_name FROM artist_tracks WHERE external_id = ?").get("0dpyzcT3RMNNSd2xKBf35I") as {
+      popularity: number;
+      album_name: string;
+    };
+    const quiet = db.prepare("SELECT popularity FROM artist_tracks WHERE external_id = ?").get("0O4sIQ728ugLlwBVaxF8UM") as {
+      popularity: number | null;
+    };
+    expect(sweet).toEqual({ popularity: 72, album_name: "Jubilee" });
+    expect(quiet.popularity).toBeNull();
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 1 });
+    const detail = db.prepare("SELECT detail FROM crawl_runs").all() as { detail: string }[];
+    expect(JSON.stringify(detail)).not.toContain("sec");
+  });
+
+  it("does not snapshot a missing score, keeps a stored score, and skips an unchanged one inside an hour", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('A', 'a', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    const missing = { externalId: "0dpyzcT3RMNNSd2xKBf35I", name: "Be Sweet", popularity: null as number | null, album: null as string | null, rank: 1 };
+    await saveSource(store, { id: 1, name: "A" }, { platform: "spotify", status: "ok", tracks: [missing] }, new Date("2026-11-06T00:00:00Z"), 0);
+    expect(db.prepare("SELECT popularity FROM artist_tracks").get()).toEqual({ popularity: null });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 0 });
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...missing, popularity: 113493783 }] },
+      new Date("2026-11-06T00:30:00Z"),
+      0,
+    );
+    expect(db.prepare("SELECT popularity FROM artist_tracks").get()).toEqual({ popularity: null });
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...missing, popularity: 72, album: "Jubilee" }] },
+      new Date("2026-11-06T01:00:00Z"),
+      0,
+    );
+    expect(db.prepare("SELECT popularity, album_name FROM artist_tracks").get()).toEqual({ popularity: 72, album_name: "Jubilee" });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 1 });
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...missing, popularity: 72, album: "Jubilee" }] },
+      new Date("2026-11-06T01:20:00Z"),
+      0,
+    );
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 1 });
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...missing, popularity: null, album: null }] },
+      new Date("2026-11-06T02:00:00Z"),
+      0,
+    );
+    expect(db.prepare("SELECT popularity, album_name FROM artist_tracks").get()).toEqual({ popularity: 72, album_name: "Jubilee" });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 1 });
   });
 });
 

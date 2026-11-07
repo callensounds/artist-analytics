@@ -119,6 +119,8 @@ def test_csv_keeps_exact_values_and_caps_each_section():
             "to_artist_id": "",
             "mbid": "",
             "release_type": "",
+            "external_id": "",
+            "album_name": "",
         }
     ]
     assert "1.2M" not in text

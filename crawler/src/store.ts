@@ -188,6 +188,30 @@ CREATE INDEX IF NOT EXISTS idx_chart_entries_artist
     ON chart_entries (artist_id, chart_date);
 CREATE INDEX IF NOT EXISTS idx_chart_entries_source_date
     ON chart_entries (chart_source, chart_date);
+CREATE TABLE IF NOT EXISTS artist_tracks (
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    track_name TEXT NOT NULL,
+    popularity INTEGER,
+    album_name TEXT,
+    rank INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (artist_id, source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_artist_tracks_seen
+    ON artist_tracks (artist_id, source, last_seen_at);
+CREATE TABLE IF NOT EXISTS track_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    popularity INTEGER NOT NULL,
+    captured_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_track_snapshots_lookup
+    ON track_snapshots (artist_id, source, external_id, captured_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -235,7 +259,7 @@ export async function migrate(store: Store): Promise<void> {
   }
   void column;
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql", "0009_itunes_charts.sql"]) {
+  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql", "0009_itunes_charts.sql", "0010_artist_tracks.sql"]) {
     const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
     if (!applied) {
       await store.batch([
@@ -267,6 +291,7 @@ export interface SavedSource {
   metrics?: MetricPoint[];
   sightings?: { title: string; url: string; kind: string; sortKey: string; precision: string }[];
   related?: { name: string; spotify_id: string; rank: number }[];
+  tracks?: { externalId: string; name: string; popularity: number | null; album: string | null; rank: number | null }[];
   musicbrainzId?: string | null;
   spotifyId?: string | null;
   appleId?: string | null;
@@ -274,6 +299,30 @@ export interface SavedSource {
   instagram?: string | null;
   tiktok?: string | null;
   markCrawled?: boolean;
+}
+
+function popularityScore(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 100) return null;
+  return value;
+}
+
+function cleanTracks(raw: SavedSource["tracks"]) {
+  const found: { externalId: string; name: string; popularity: number | null; album: string | null; rank: number | null }[] = [];
+  const seen = new Set<string>();
+  for (const track of raw || []) {
+    if (found.length >= 10) break;
+    const name = (track.name || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    const externalId = (track.externalId || "").trim().slice(0, 80);
+    if (!name || !externalId || seen.has(externalId)) continue;
+    seen.add(externalId);
+    const rank =
+      typeof track.rank === "number" && Number.isInteger(track.rank) && track.rank >= 1 && track.rank <= 100
+        ? track.rank
+        : null;
+    const album = (track.album || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    found.push({ externalId, name, popularity: popularityScore(track.popularity), album: album || null, rank });
+  }
+  return found;
 }
 
 function whole(value: unknown): number | null {
@@ -426,6 +475,62 @@ export async function saveSource(
       discovered += 1;
       room -= 1;
     }
+  }
+  const tracks = cleanTracks(source.tracks);
+  const trackRows: unknown[][] = [];
+  const trackSnapshots: unknown[][] = [];
+  if (tracks.length) {
+    const prior = await store.all<{ external_id: string; popularity: number | null; captured_at: string }>(
+      `SELECT external_id, popularity, captured_at FROM track_snapshots
+       WHERE artist_id = ? AND source = ? ORDER BY captured_at DESC, id DESC LIMIT 40`,
+      [artistId, source.platform],
+    );
+    const newest = new Map<string, { popularity: number | null; captured_at: string }>();
+    for (const row of prior) {
+      if (!newest.has(row.external_id)) newest.set(row.external_id, row);
+    }
+    for (const track of tracks) {
+      trackRows.push([
+        artistId,
+        source.platform,
+        track.externalId,
+        track.name,
+        track.popularity,
+        track.album,
+        track.rank,
+        stamp,
+        stamp,
+      ]);
+      if (track.popularity === null) continue;
+      const previous = newest.get(track.externalId);
+      if (previous && popularityScore(previous.popularity) === track.popularity) {
+        const at = parseUtc(previous.captured_at);
+        if (at && now.getTime() - at.getTime() < 3600_000) continue;
+      }
+      trackSnapshots.push([artistId, source.platform, track.externalId, track.popularity, stamp]);
+    }
+  }
+  if (trackRows.length) {
+    const marks = trackRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+    statements.push({
+      sql: `INSERT INTO artist_tracks (
+          artist_id, source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+        ) VALUES ${marks}
+        ON CONFLICT(artist_id, source, external_id) DO UPDATE SET
+          track_name = excluded.track_name,
+          popularity = COALESCE(excluded.popularity, artist_tracks.popularity),
+          album_name = COALESCE(excluded.album_name, artist_tracks.album_name),
+          rank = excluded.rank,
+          last_seen_at = excluded.last_seen_at`,
+      params: trackRows.flat(),
+    });
+  }
+  if (trackSnapshots.length) {
+    const marks = trackSnapshots.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    statements.push({
+      sql: `INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at) VALUES ${marks}`,
+      params: trackSnapshots.flat(),
+    });
   }
   const wrote = snapshots.length || edges;
   const status = source.status === "error" ? (wrote ? "partial" : "error") : "ok";

@@ -8,7 +8,7 @@ import json
 import re
 import time
 
-from analytics import compact_count, scrub, spotify_precision
+from analytics import scrub, spotify_precision
 from http_client import TransportError
 from models import Metric, SourceResult, errored, make_item, sort_items, unavailable
 from providers.common import cache_key, cached, drop_blocks, script_body, strip_tags
@@ -141,6 +141,127 @@ def parse_discography(lines: list[str]) -> list[tuple[str, str, str]]:
             continue
         seen.add(key)
         found.append((title, kind, year))
+    return found
+
+
+TRACK_CAP = 10
+TRACK_ID = re.compile(r'spotify:track:([A-Za-z0-9]{10,32})-\d+"\s+aria-label="([^"]*)"')
+
+
+def name_track_id(name: str) -> str:
+    """Stable fallback when Spotify did not print a track id. Not a Spotify id."""
+    normalized = re.sub(r"[^a-z0-9]+", "", (name or "").casefold())[:80]
+    return f"name:{normalized}" if normalized else ""
+
+
+def popularity_score(value) -> int | None:
+    """Spotify's 0–100 score. A play count, a bool, or anything else stays missing."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if 0 <= value <= 100:
+        return value
+    return None
+
+
+def _popular_start(page: str) -> int:
+    marker = ">Popular</span>"
+    start = page.find(marker)
+    if start >= 0:
+        return start
+    cursor = 0
+    while True:
+        at = page.find("Popular", cursor)
+        if at < 0:
+            return -1
+        if page.startswith("Popular releases", at):
+            cursor = at + len("Popular")
+            continue
+        return at
+
+
+def popular_slice(page: str) -> str:
+    """The Popular shelf only. Later album shelves are not top tracks."""
+    if not page:
+        return ""
+    start = _popular_start(page)
+    if start < 0:
+        return ""
+    end = page.find("Popular releases", start + 7)
+    if end < 0:
+        end = min(len(page), start + 30_000)
+    return page[start:end]
+
+
+def _track_row(name: str, external_id: str, rank: int, popularity: int | None, album_name: str | None) -> dict:
+    return {
+        "name": name[:200],
+        "external_id": external_id[:80],
+        "rank": rank,
+        "popularity": popularity,
+        "album_name": album_name[:200] if album_name else None,
+    }
+
+
+def parse_popular_tracks(page: str) -> list[dict]:
+    """Names and ids from the public Popular shelf. Play counts are not popularity."""
+    chunk = popular_slice(page)
+    found = []
+    seen = set()
+    for match in TRACK_ID.finditer(chunk):
+        external = match.group(1)
+        name = " ".join(html.unescape(match.group(2)).split())
+        if not name or len(name) > 200 or external in seen:
+            continue
+        seen.add(external)
+        found.append(_track_row(name, external, len(found) + 1, None, None))
+        if len(found) >= TRACK_CAP:
+            return found
+    if found:
+        return found
+    for title, _plays in parse_popular(visible_lines(chunk))[:TRACK_CAP]:
+        external = name_track_id(title)
+        if not external or external in seen:
+            continue
+        seen.add(external)
+        found.append(_track_row(title, external, len(found) + 1, None, None))
+    return found
+
+
+def parse_api_tracks(payload: dict | None) -> list[dict]:
+    """Web API top tracks. A missing popularity stays missing."""
+    if not isinstance(payload, dict):
+        return []
+    found = []
+    seen = set()
+    for track in payload.get("tracks") or []:
+        if len(found) >= TRACK_CAP or not isinstance(track, dict):
+            continue
+        name = " ".join(str(track.get("name") or "").split())
+        if not name:
+            continue
+        external = str(track.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9]{10,32}", external):
+            external = name_track_id(name)
+        if not external or external in seen:
+            continue
+        seen.add(external)
+        album = track.get("album") if isinstance(track.get("album"), dict) else {}
+        album_name = " ".join(str((album or {}).get("name") or "").split()) or None
+        found.append(_track_row(name, external, len(found) + 1, popularity_score(track.get("popularity")), album_name))
+    return found
+
+
+def tracks_from_titles(titles: list[str]) -> list[dict]:
+    """Embed titles when the artist page had no Popular shelf. Still no invented score."""
+    found = []
+    seen = set()
+    for title in titles[:TRACK_CAP]:
+        name = " ".join(str(title or "").split())
+        external = name_track_id(name)
+        if not name or not external or external in seen:
+            continue
+        seen.add(external)
+        found.append(_track_row(name, external, len(found) + 1, None, None))
     return found
 
 
@@ -377,10 +498,6 @@ async def _fetch_api(name: str, artist_id: str, env_secrets: tuple[str, str], ht
         items = parse_albums(albums)
         followers = (artist.get("followers") or {}).get("total")
         follower_exact = followers if isinstance(followers, int) and not isinstance(followers, bool) and followers >= 0 else None
-        tracks = []
-        for track in (top.get("tracks") or [])[:5]:
-            score = track.get("popularity")
-            tracks.append(f"{track.get('name')} ({score})" if score is not None else track.get("name"))
         return SourceResult(
             platform="spotify",
             label="Spotify",
@@ -395,38 +512,17 @@ async def _fetch_api(name: str, artist_id: str, env_secrets: tuple[str, str], ht
                     exact=follower_exact,
                     reason=None if follower_exact is not None else "Spotify did not return a follower count.",
                 ),
-                Metric(
-                    label="Top tracks",
-                    available=bool(tracks),
-                    value=", ".join(track for track in tracks if track) or None,
-                    reason=None if tracks else "Spotify did not return top tracks.",
-                ),
             ],
+            tracks=parse_api_tracks(top),
             items=items,
             notices=[
                 "Optional Web API client-credentials path. release_date_precision is preserved. "
-                "This path is unused unless both Spotify secrets are set."
+                "This path is unused unless both Spotify secrets are set. "
+                "Top tracks keep Spotify's 0–100 popularity when it is present and stay blank when it is not."
             ],
         )
 
     return await cached(cache, cache_key("spotify-api", name, artist_id), produce)
-
-
-def _top_track_metric(embed_tracks: list[str], popular: list[tuple[str, int | None]]) -> Metric:
-    plays = {title.casefold(): count for title, count in popular}
-    labels = []
-    names = embed_tracks or [title for title, _ in popular]
-    for title in names[:5]:
-        count = plays.get(title.casefold())
-        pretty = compact_count(count) if count is not None else None
-        labels.append(f"{title} ({pretty} plays)" if pretty else title)
-    if not labels:
-        return Metric(
-            label="Top tracks",
-            available=False,
-            reason="The public artist and embed pages did not include a top-track list.",
-        )
-    return Metric(label="Top tracks", available=True, value=", ".join(labels))
 
 
 async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = False) -> SourceResult:
@@ -484,9 +580,10 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
         # Related-artist HTML is crawl-only. The dashboard keeps the 9f16bbd card path.
         related = parse_related_artists(page_text) if include_related else []
         embed = parse_embed_state(embed_page.text) if embed_page is not None and embed_page.ok else {}
+        tracks = parse_popular_tracks(page_text) or tracks_from_titles(embed.get("tracks") or [])
         items = _release_items(discography)
         listener_exact = int(listeners.replace(",", "")) if listeners_exact and listeners else None
-        if not items and listeners is None and not (embed.get("tracks") or popular) and not oembed.get("title"):
+        if not items and listeners is None and not tracks and not popular and not oembed.get("title"):
             return unavailable(
                 "spotify",
                 "Spotify",
@@ -523,9 +620,9 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
                     exact=follower_count,
                     reason=None if follower_count is not None else "The public artist page did not include a follower count.",
                 ),
-                _top_track_metric(embed.get("tracks") or [], popular),
                 Metric(label="Releases with a year", available=True, value=str(len(items))),
             ],
+            tracks=tracks,
             related=related,
             items=items[:40],
             notices=notices,

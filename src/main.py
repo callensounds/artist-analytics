@@ -666,7 +666,13 @@ async def export_artist_csv(request: Request, key: str):
             status_code=503,
             media_type="text/plain; charset=utf-8",
         )
-    body = render_export_csv(rows["metrics"], rows["sightings"], rows["edges"], rows.get("releases") or [])
+    body = render_export_csv(
+        rows["metrics"],
+        rows["sightings"],
+        rows["edges"],
+        rows.get("releases") or [],
+        rows.get("tracks") or [],
+    )
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(
         content=body,
