@@ -72,31 +72,126 @@
         <h2 class="font-semibold">Apple / iTunes charts</h2>
         <a href="/charts" class="text-xs text-emerald-400 hover:underline">US charts</a>
     </div>
-    <p class="text-xs text-slate-400 mb-3">Latest stored US iTunes top songs and top albums for this artist. The crawler reads the public RSS feeds. Spotify charts are not listed; there is no public chart JSON without a login.</p>
+    <p class="text-xs text-slate-400 mb-3">Stored US iTunes top songs and top albums for this artist. Now is the rank on the latest stored chart date, and a dash means this title is not on that date. Peak is the best stored rank and the first date it was hit. Days is the number of distinct stored chart dates. A line connects those dates and does not fill missing ones. Spotify charts are not listed; there is no public chart JSON without a login.</p>
     {% if history.charts %}
     <p class="data-scroll-hint">Swipe sideways to see every column.</p>
     <div class="data-scroll overflow-x-auto">
         <table class="w-full text-sm">
             <thead>
                 <tr class="text-left text-xs text-slate-500">
-                    <th class="py-1 pr-3 font-medium">#</th>
+                    <th class="py-1 pr-3 font-medium">Now</th>
                     <th class="py-1 pr-3 font-medium">Chart</th>
                     <th class="py-1 pr-3 font-medium">Title</th>
-                    <th class="py-1 font-medium">Date</th>
+                    <th class="py-1 pr-3 font-medium">Peak</th>
+                    <th class="py-1 pr-3 font-medium">Days</th>
+                    <th class="py-1 font-medium">Last</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in history.charts %}
                 <tr class="border-t border-slate-700/80">
-                    <td class="py-2 pr-3 font-mono text-emerald-300">{{ row.position }}</td>
+                    <td class="py-2 pr-3 font-mono text-emerald-300">{% if row.current_position is not none %}{{ row.current_position }}{% else %}—{% endif %}</td>
                     <td class="py-2 pr-3 text-slate-400">{{ row.chart_label }}</td>
                     <td class="py-2 pr-3 cell-wrap">{{ row.title }}</td>
+                    <td class="py-2 pr-3"><span class="font-mono text-emerald-300">{{ row.peak_position }}</span><span class="text-slate-500"> · </span><span class="text-slate-400">{{ row.peak_date }}</span></td>
+                    <td class="py-2 pr-3 font-mono text-emerald-300">{{ row.days_on_chart }}</td>
                     <td class="py-2 text-slate-400">{{ row.chart_date }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
+    {% set ns = namespace(plots=false) %}
+    {% for row in history.charts %}
+    {% if row.series|length > 1 %}{% set ns.plots = true %}{% endif %}
+    {% endfor %}
+    {% if ns.plots %}
+    <div class="grid md:grid-cols-2 gap-4 mt-4">
+        {% for row in history.charts %}
+        {% if row.series|length > 1 %}
+        <div>
+            <p class="text-xs text-slate-400 mb-1">{{ row.title }} · {{ row.chart_label }}</p>
+            <div class="relative h-40"><canvas id="itunes-{{ loop.index0 }}"></canvas></div>
+            {% if row.series_capped %}
+            <p class="text-xs text-slate-500 mt-1">Newest stored dates. Peak and days use every stored date.</p>
+            {% endif %}
+        </div>
+        {% endif %}
+        {% endfor %}
+    </div>
+    <script id="itunes-chart-data" type="application/json">{{ history.charts | tojson }}</script>
+    <script>
+    (function () {
+        const node = document.getElementById("itunes-chart-data");
+        let rows = [];
+        try {
+            rows = JSON.parse(node ? node.textContent : "[]");
+        } catch (err) {
+            rows = [];
+        }
+        if (!Array.isArray(rows) || typeof Chart !== "function") return;
+        rows.forEach(function (row, index) {
+            const canvas = document.getElementById("itunes-" + index);
+            const series = row && Array.isArray(row.series) ? row.series : [];
+            if (!canvas || series.length < 2) return;
+            try {
+                new Chart(canvas, {
+                    type: "line",
+                    data: {
+                        datasets: [{
+                            label: (row.title || "Position") + " position",
+                            data: series,
+                            borderColor: row.color || "#34d399",
+                            backgroundColor: row.color || "#34d399",
+                            pointRadius: 3,
+                            tension: 0,
+                            spanGaps: false
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        parsing: true,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            y: {
+                                reverse: true,
+                                ticks: {
+                                    color: "#94a3b8",
+                                    precision: 0,
+                                    callback: function (value) {
+                                        const number = Number(value);
+                                        if (!Number.isInteger(number)) return "";
+                                        return number;
+                                    }
+                                },
+                                grid: { color: "#334155" }
+                            },
+                            x: {
+                                type: "linear",
+                                ticks: {
+                                    color: "#94a3b8",
+                                    maxRotation: 0,
+                                    autoSkip: true,
+                                    maxTicksLimit: 4,
+                                    callback: function (value) {
+                                        const date = new Date(value);
+                                        if (Number.isNaN(date.getTime())) return "";
+                                        return date.toISOString().slice(0, 10);
+                                    }
+                                },
+                                grid: { display: false }
+                            }
+                        }
+                    }
+                });
+            } catch (err) {
+                return;
+            }
+        });
+    })();
+    </script>
+    {% endif %}
     {% else %}
     <p class="text-slate-400 text-sm">{{ history.charts_reason or "No Apple Music or iTunes chart position is stored for this artist." }}</p>
     {% endif %}
