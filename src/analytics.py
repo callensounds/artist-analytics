@@ -55,6 +55,7 @@ CALENDAR_EMPTY = (
     "No MusicBrainz, Apple, or Spotify release date is stored yet. "
     "Year-only dates are not placed on a day."
 )
+_PERIOD_RE = re.compile(r"\A(\d{4})(?:-(\d{2}))?\Z")
 PRECISION_RANK = {"unknown": 0, "year": 1, "month": 2, "day": 3, "time": 4}
 PRECISION_LABELS = {
     "time": "Exact time",
@@ -529,6 +530,82 @@ def _valid_day(year: int, month: int, day: int) -> bool:
     return True
 
 
+def parse_calendar_period(year: str | None = None, start: str | None = None) -> int | None:
+    """A stored year from ?year=YYYY or ?from=YYYY / ?from=YYYY-MM.
+
+    `year` wins when it is usable. A day on the end of the string is not read,
+    so the parameter cannot invent a more precise date than the query named.
+    """
+    for raw in (year, start):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        match = _PERIOD_RE.fullmatch(text)
+        if match is None:
+            continue
+        number = int(match.group(1))
+        month = match.group(2)
+        if month is not None and not 1 <= int(month) <= 12:
+            continue
+        if 1000 <= number <= 9999:
+            return number
+    return None
+
+
+def release_years(rows: list[dict] | None) -> list[int]:
+    """Years a row lands on after precision is applied. A clock uses UTC. Nothing is made finer."""
+    found = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        raw = _row_text(row, ("when", "released_at", "published_at"))
+        place = _calendar_place(raw, stated_precision(raw, row.get("precision")))
+        if place is not None and 1000 <= place[1] <= 9999:
+            found.append(place[1])
+    return found
+
+
+def calendar_navigation(years: list[int], selected: int | None, artist_id: int) -> dict:
+    """Prev, next, and a decade list. Only years that have a stored release are included."""
+    clean: list[int] = []
+    seen: set[int] = set()
+    for value in years:
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value in seen or not 1000 <= value <= 9999:
+            continue
+        seen.add(value)
+        clean.append(value)
+    clean.sort(reverse=True)
+    chosen = selected if isinstance(selected, int) and not isinstance(selected, bool) and 1000 <= selected <= 9999 else None
+    prev_year = next((item for item in clean if chosen is not None and item < chosen), None)
+    next_year = next((item for item in reversed(clean) if chosen is not None and item > chosen), None)
+    try:
+        artist_key = int(artist_id)
+    except (TypeError, ValueError):
+        artist_key = 0
+
+    def href(value: int) -> str:
+        return f"/artist/{artist_key}/calendar?year={value}"
+
+    grouped: dict[int, list[dict]] = {}
+    for value in clean:
+        start = (value // 10) * 10
+        grouped.setdefault(start, []).append(
+            {"year": value, "href": href(value), "current": value == chosen}
+        )
+    decades = [{"label": f"{start}s", "years": grouped[start]} for start in sorted(grouped, reverse=True)]
+    return {
+        "years": clean,
+        "decades": decades,
+        "selected": chosen,
+        "prev_year": prev_year,
+        "next_year": next_year,
+        "prev_href": href(prev_year) if prev_year is not None else None,
+        "next_href": href(next_year) if next_year is not None else None,
+    }
+
+
 def _calendar_place(raw: str, precision: str):
     """A day placement, a month mark, or a year. Never a guessed day."""
     if precision == "time":
@@ -564,14 +641,22 @@ def _calendar_item(row: dict, precision: str, moment: datetime | None) -> dict:
     return item
 
 
-def build_release_calendar(rows: list[dict] | None, *, month_cap: int = CALENDAR_MONTH_CAP) -> dict:
+def build_release_calendar(
+    rows: list[dict] | None,
+    *,
+    month_cap: int = CALENDAR_MONTH_CAP,
+    year: int | None = None,
+) -> dict:
     """Month grids for MusicBrainz, Apple, and Spotify releases.
 
     Day precision and exact UTC times land on that calendar day. A month-only
     date marks the month and does not pick a day. A year-only date, including a
-    Spotify year, stays off the day cells.
+    Spotify year, stays off the day cells. When `year` is set, only that
+    calendar year is returned. Other years stay reachable through navigation,
+    and this function does not invent a finer date to fill the gap.
     """
     cap = month_cap if isinstance(month_cap, int) and not isinstance(month_cap, bool) and month_cap > 0 else CALENDAR_MONTH_CAP
+    selected = year if isinstance(year, int) and not isinstance(year, bool) and 1000 <= year <= 9999 else None
     grouped: dict[tuple[int, int], dict] = {}
     year_only: list[dict] = []
     seen: set[tuple] = set()
@@ -588,6 +673,8 @@ def build_release_calendar(rows: list[dict] | None, *, month_cap: int = CALENDAR
         precision = stated_precision(raw, row.get("precision"))
         place = _calendar_place(raw, precision)
         if place is None:
+            continue
+        if selected is not None and place[1] != selected:
             continue
         if place[0] == "day":
             place_key = ("day", place[1], place[2], place[3])
@@ -611,9 +698,14 @@ def build_release_calendar(rows: list[dict] | None, *, month_cap: int = CALENDAR
         bucket["days"].setdefault(place[3], []).append(item)
         day_count += 1
     month_keys = sorted(grouped, reverse=True)
-    omitted = max(0, len(month_keys) - cap)
+    if selected is not None:
+        shown_keys = month_keys
+        omitted = 0
+    else:
+        shown_keys = month_keys[:cap]
+        omitted = max(0, len(month_keys) - cap)
     months = []
-    for year, month in month_keys[:cap]:
+    for year, month in shown_keys:
         bucket = grouped[(year, month)]
         days = bucket["days"]
         show_grid = bool(days)
@@ -653,14 +745,29 @@ def build_release_calendar(rows: list[dict] | None, *, month_cap: int = CALENDAR
     year_only.sort(key=lambda item: item["title"].casefold())
     year_only.sort(key=lambda item: item["year"], reverse=True)
     available = bool(months or year_only)
+    empty_period = selected is not None and not available
+    if available:
+        reason = None
+    elif empty_period:
+        reason = (
+            f"No stored MusicBrainz, Apple, or Spotify release falls in {selected}. "
+            "A month or a year is not given a day."
+        )
+    else:
+        reason = CALENDAR_EMPTY
     return {
         "available": available,
-        "reason": None if available else CALENDAR_EMPTY,
+        "reason": reason,
         "months": months,
         "year_only": year_only,
         "omitted_months": omitted,
         "day_count": day_count,
         "month_count": month_marks,
+        "empty_period": empty_period,
+        "period_year": selected,
+        "period_label": str(selected) if selected is not None else None,
+        "navigation": None,
+        "row_cap_hit": False,
     }
 
 

@@ -6,6 +6,19 @@
     <title>{% block title %}Average Analytics{% endblock %}</title>
     <link rel="icon" href="/favicon.ico" type="image/svg+xml">
     <link rel="stylesheet" href="/static/app.css">
+    <style>
+        .data-scroll { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
+        .data-scroll > table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.875rem; line-height: 1.4; }
+        .data-scroll th, .data-scroll td { white-space: nowrap; vertical-align: top; }
+        .data-scroll .cell-wrap { white-space: normal; overflow-wrap: anywhere; min-width: 9rem; max-width: 18rem; }
+        .data-scroll-hint { display: none; margin: 0 0 0.5rem; font-size: 0.75rem; color: #94a3b8; }
+        .calendar-grid, .posting-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+        .calendar-grid > *, .posting-week > * { min-width: 0; overflow-wrap: anywhere; }
+        @media (max-width: 639px) {
+            .data-scroll-hint { display: block; }
+            .data-scroll > table { font-size: 0.875rem; }
+        }
+    </style>
     {% block head %}{% endblock %}
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen overflow-x-hidden">
