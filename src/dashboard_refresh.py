@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from analytics import WEEKDAYS, build_insights, build_patterns, hour_labels, normalize_name
-from db import parse_utc
+from db import missing_table, parse_utc
 
 # Six hours: long enough that a crawled artist is not fetched again on every
 # page view, short enough that a missed crawl still refreshes the same day.
@@ -32,24 +32,25 @@ LABELS = {
     "tiktok": "TikTok",
 }
 
-_CLOCK_SQL = (
-    (
-        """
-        SELECT source, MAX(captured_at) AS captured_at
-        FROM metric_snapshots
-        WHERE artist_id = ?
-        GROUP BY source
-        """,
-    ),
-    (
-        """
-        SELECT source, MAX(first_seen_at) AS captured_at
-        FROM content_sightings
-        WHERE artist_id = ?
-        GROUP BY source
-        """,
-    ),
-)
+_SNAPSHOT_CLOCK_SQL = """
+SELECT source, captured_at
+FROM source_freshness
+WHERE artist_id = ?
+"""
+
+_SNAPSHOT_CLOCK_FALLBACK_SQL = """
+SELECT source, MAX(captured_at) AS captured_at
+FROM metric_snapshots
+WHERE artist_id = ?
+GROUP BY source
+"""
+
+_SIGHTING_CLOCK_SQL = """
+SELECT source, MAX(first_seen_at) AS captured_at
+FROM content_sightings
+WHERE artist_id = ?
+GROUP BY source
+"""
 
 _ARTIST_SQL = """
 SELECT id, name, normalized_name, tracked, last_crawled_at,
@@ -247,9 +248,17 @@ async def provider_clocks(db, artist: dict) -> dict[str, datetime | None]:
     """Newest snapshot or sighting time per source, plus last_crawled_at for MusicBrainz."""
     clocks: dict[str, datetime | None] = {}
     artist_id = int(artist["id"])
-    for (sql,) in _CLOCK_SQL:
-        rows = await db.query(sql, (artist_id,))
-        for row in rows:
+    legacy_clock = False
+    try:
+        snapshot_rows = await db.query(_SNAPSHOT_CLOCK_SQL, (artist_id,))
+    except Exception as exc:
+        if not missing_table(exc):
+            raise
+        legacy_clock = True
+    if legacy_clock:
+        snapshot_rows = await db.query(_SNAPSHOT_CLOCK_FALLBACK_SQL, (artist_id,))
+    for sql_rows in (snapshot_rows, await db.query(_SIGHTING_CLOCK_SQL, (artist_id,))):
+        for row in sql_rows:
             source = str(row.get("source") or "")
             moment = parse_utc(row.get("captured_at"))
             if not source or moment is None:

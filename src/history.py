@@ -17,7 +17,7 @@ from analytics import (
     release_years,
 )
 from charts import CHARTS_EMPTY, load_artist_charts
-from db import parse_utc, utc_now
+from db import missing_table, parse_utc, utc_now
 from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
@@ -51,7 +51,7 @@ TRACKS_EMPTY = (
     "A popularity score stays blank until Spotify returns a 0–100 score. "
     "Nothing here is estimated."
 )
-TRACKS_READ_ERROR = "Stored tracks could not be read on this request."
+TRACKS_READ_ERROR = "Data temporarily unavailable. Stored tracks could not be read on this request."
 ALERT_READ_LIMIT = 20
 ALERTS_PAGE_LIMIT = 40
 RELEASE_READ_LIMIT = 50
@@ -62,8 +62,8 @@ CALENDAR_YEAR_LIMIT = 100
 CALENDAR_PERIOD_LIMIT = 200
 CALENDAR_DATE_LIMIT = 500
 RELEASES_EMPTY = "No official MusicBrainz albums, EPs, or singles with a release date have been stored yet."
-POSTING_READ_ERROR = "Stored timestamps could not be read on this request."
-CALENDAR_READ_ERROR = "Stored releases could not be read on this request."
+POSTING_READ_ERROR = "Data temporarily unavailable. Stored timestamps could not be read on this request."
+CALENDAR_READ_ERROR = "Data temporarily unavailable. Stored releases could not be read on this request."
 ALERTS_EMPTY = (
     "No growth alerts yet. The crawler stores one when a 24h change reaches 2% "
     "or a 7d change reaches 5%, or the absolute jump is large. The same two readings are not stored twice."
@@ -525,16 +525,8 @@ async def _latest_by_metric(db, artist_id: int) -> dict[tuple[str, str], dict]:
     rows = await db.query(
         """
         SELECT source, metric, value, captured_at
-        FROM (
-            SELECT source, metric, value, captured_at,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY source, metric
-                       ORDER BY captured_at DESC, id DESC
-                   ) AS rn
-            FROM metric_snapshots
-            WHERE artist_id = ?
-        ) AS ranked
-        WHERE rn = 1
+        FROM metric_latest
+        WHERE artist_id = ?
         """,
         (artist_id,),
     )
@@ -733,6 +725,24 @@ async def remember(
     }
 
 
+async def _related_tracked(db) -> int:
+    """Cached count of auto-tracked related artists. One COUNT fills the cache."""
+    row = await db.query_one("SELECT related_tracked FROM crawl_state WHERE id = 1")
+    if row is not None and row.get("related_tracked") is not None:
+        return int(row["related_tracked"])
+    counted = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
+    total = int((counted or {}).get("n") or 0)
+    await db.execute(
+        """
+        INSERT INTO crawl_state (id, next_artist_id, updated_at, related_tracked)
+        VALUES (1, 0, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET related_tracked = excluded.related_tracked
+        """,
+        (utc_now(), total),
+    )
+    return total
+
+
 async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_cap: int) -> tuple[list[tuple[str, tuple]], int, int]:
     related = []
     for source in bundle.get("sources") or []:
@@ -764,8 +774,7 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
     discovered = 0
     if related_cap <= 0 or not edge_rows:
         return statements, written, discovered
-    row = await db.query_one("SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1")
-    before = int((row or {}).get("n") or 0)
+    before = await _related_tracked(db)
     room = related_cap - before
     if room <= 0:
         return statements, written, discovered
@@ -816,6 +825,12 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
             )
         )
         discovered = len(new_rows)
+        statements.append(
+            (
+                "UPDATE crawl_state SET related_tracked = COALESCE(related_tracked, 0) + ? WHERE id = 1",
+                (discovered,),
+            )
+        )
         for to_name, normalized, spotify_id, _, _, _ in new_rows:
             link_updates.append((normalized, spotify_id, artist_id, spotify_id))
     if link_updates:
@@ -1181,7 +1196,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     history["sightings"] = present_sightings(sightings)
     if playlists_failed:
         history["playlists"] = []
-        history["playlists_reason"] = "Stored playlists could not be read on this request."
+        history["playlists_reason"] = "Data temporarily unavailable. Stored playlists could not be read on this request."
     else:
         history["playlists"] = present_playlists(playlists or [])
         history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
@@ -1207,7 +1222,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         momentum_failed = True
     if momentum_failed:
         history["momentum"] = []
-        history["momentum_reason"] = "Stored momentum could not be read on this request."
+        history["momentum_reason"] = "Data temporarily unavailable. Stored momentum could not be read on this request."
     else:
         history["momentum"] = momentum or []
         history["momentum_reason"] = None if history["momentum"] else MOMENTUM_EMPTY
@@ -1219,7 +1234,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         alerts_failed = True
     if alerts_failed:
         history["alerts"] = []
-        history["alerts_reason"] = "Stored alerts could not be read on this request."
+        history["alerts_reason"] = "Data temporarily unavailable. Stored alerts could not be read on this request."
     else:
         history["alerts"] = present_alerts(alert_rows or [])
         history["alerts_reason"] = None if history["alerts"] else ALERTS_EMPTY
@@ -1231,7 +1246,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         releases_failed = True
     if releases_failed:
         history["releases"] = []
-        history["releases_reason"] = "Stored MusicBrainz releases could not be read on this request."
+        history["releases_reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
     else:
         history["releases"] = present_releases(release_rows or [])
         history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
@@ -1260,9 +1275,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         if releases_failed and release_sightings_failed:
             history["calendar"] = empty_release_calendar(CALENDAR_READ_ERROR)
         elif releases_failed:
-            history["calendar"]["reason"] = "Stored MusicBrainz releases could not be read on this request."
+            history["calendar"]["reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
         else:
-            history["calendar"]["reason"] = "Stored Apple and Spotify releases could not be read on this request."
+            history["calendar"]["reason"] = "Data temporarily unavailable. Stored Apple and Spotify releases could not be read on this request."
     chart_rows = None
     charts_failed = False
     try:
@@ -1271,7 +1286,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         charts_failed = True
     if charts_failed:
         history["charts"] = []
-        history["charts_reason"] = "Stored chart positions could not be read on this request."
+        history["charts_reason"] = "Data temporarily unavailable. Stored chart positions could not be read on this request."
     else:
         history["charts"] = chart_rows or []
         history["charts_reason"] = None if history["charts"] else CHARTS_EMPTY
@@ -1285,7 +1300,7 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         history["score_text"] = None
         history["score_components"] = []
         history["score_formula"] = SCORE_FORMULA
-        history["score_reason"] = "Stored audience counts could not be read on this request." if score_failed else SCORE_EMPTY
+        history["score_reason"] = "Data temporarily unavailable. Stored audience counts could not be read on this request." if score_failed else SCORE_EMPTY
     else:
         history["score_text"] = score["score_text"]
         history["score_components"] = score["components"]
@@ -1370,6 +1385,19 @@ LIMIT ? OFFSET ?
 _DIRECTORY_LISTENER_SQL = """
 SELECT a.id, a.name, a.normalized_name, listeners.value AS monthly_listeners
 FROM artists AS a
+LEFT JOIN metric_latest AS listeners
+  ON listeners.artist_id = a.id
+ AND listeners.source = 'spotify'
+ AND listeners.metric = 'Monthly listeners'
+ AND listeners.value IS NOT NULL
+WHERE a.tracked = 1
+ORDER BY CASE WHEN listeners.value IS NULL THEN 1 ELSE 0 END, listeners.value DESC, a.name COLLATE NOCASE, a.id
+LIMIT ? OFFSET ?
+"""
+
+_DIRECTORY_LISTENER_FALLBACK_SQL = """
+SELECT a.id, a.name, a.normalized_name, listeners.value AS monthly_listeners
+FROM artists AS a
 LEFT JOIN (
     SELECT artist_id, value
     FROM (
@@ -1402,7 +1430,15 @@ async def list_tracked_artists(db, *, page: int = 1, sort: str = "name") -> dict
     safe_page = min(max(requested, 1), pages)
     offset = (safe_page - 1) * DIRECTORY_PAGE_SIZE
     sql = _DIRECTORY_LISTENER_SQL if mode == "listeners" else _DIRECTORY_NAME_SQL
-    rows = await db.query(sql, (DIRECTORY_PAGE_SIZE, offset))
+    legacy_listeners = False
+    try:
+        rows = await db.query(sql, (DIRECTORY_PAGE_SIZE, offset))
+    except Exception as exc:
+        if mode != "listeners" or not missing_table(exc):
+            raise
+        legacy_listeners = True
+    if legacy_listeners:
+        rows = await db.query(_DIRECTORY_LISTENER_FALLBACK_SQL, (DIRECTORY_PAGE_SIZE, offset))
     ids = [int(row["id"]) for row in rows]
     metrics = await _latest_metrics(db, ids)
     linked: set[int] = set()
@@ -1510,22 +1546,37 @@ async def _latest_metrics(db, artist_ids: list[int]) -> dict[int, list[dict]]:
     if not artist_ids:
         return {}
     marks = ",".join("?" for _ in artist_ids)
-    rows = await db.query(
-        f"""
-        SELECT artist_id, source, metric, value, captured_at
-        FROM (
-            SELECT artist_id, source, metric, value, captured_at,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY artist_id, source, metric
-                       ORDER BY captured_at DESC, id DESC
-                   ) AS rn
-            FROM metric_snapshots
+    legacy = False
+    try:
+        rows = await db.query(
+            f"""
+            SELECT artist_id, source, metric, value, captured_at
+            FROM metric_latest
             WHERE artist_id IN ({marks}) AND value IS NOT NULL
-        ) AS ranked
-        WHERE rn = 1
-        """,
-        tuple(artist_ids),
-    )
+            """,
+            tuple(artist_ids),
+        )
+    except Exception as exc:
+        if not missing_table(exc):
+            raise
+        legacy = True
+    if legacy:
+        rows = await db.query(
+            f"""
+            SELECT artist_id, source, metric, value, captured_at
+            FROM (
+                SELECT artist_id, source, metric, value, captured_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY artist_id, source, metric
+                           ORDER BY captured_at DESC, id DESC
+                       ) AS rn
+                FROM metric_snapshots
+                WHERE artist_id IN ({marks}) AND value IS NOT NULL
+            ) AS ranked
+            WHERE rn = 1
+            """,
+            tuple(artist_ids),
+        )
     grouped: dict[int, list[dict]] = {}
     for row in rows:
         grouped.setdefault(int(row["artist_id"]), []).append(row)

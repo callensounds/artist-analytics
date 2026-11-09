@@ -5,6 +5,8 @@ import { HTTP_USER_AGENT } from "./parse";
 
 export const CHART_TERRITORY = "us";
 export const CHART_REFRESH_MS = 6 * 60 * 60 * 1000;
+/** A failed feed waits this long before the next cron reads artists again. */
+export const CHART_RETRY_MS = 60 * 60 * 1000;
 export const CHART_MAX_BYTES = 450_000;
 export const CHART_SOURCES = [
   {
@@ -217,44 +219,79 @@ async function writeRows(
   return { written: values.length, linked };
 }
 
+function shouldFetch(
+  row: { collected_at?: string | null; next_try_at?: string | null } | null,
+  now: Date,
+  refreshMs: number,
+): boolean {
+  if (refreshMs <= 0) return true;
+  const retryAt = row?.next_try_at ? Date.parse(row.next_try_at) : NaN;
+  if (!Number.isNaN(retryAt) && retryAt > now.getTime()) return false;
+  return !isFresh(row?.collected_at, now, refreshMs);
+}
+
+async function noteChartAttempt(store: Store, source: string, day: string, now: Date, ok: boolean, collectedAt: string): Promise<void> {
+  if (ok) {
+    await store.batch([
+      {
+        sql: `INSERT INTO chart_freshness (chart_source, territory, chart_date, collected_at, next_try_at)
+              VALUES (?, ?, ?, ?, NULL)
+              ON CONFLICT(chart_source, territory, chart_date) DO UPDATE SET
+                collected_at = excluded.collected_at,
+                next_try_at = NULL`,
+        params: [source, CHART_TERRITORY, day, collectedAt],
+      },
+    ]);
+    return;
+  }
+  const next = new Date(now.getTime() + CHART_RETRY_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
+  await store.batch([
+    {
+      sql: `INSERT INTO chart_freshness (chart_source, territory, chart_date, collected_at, next_try_at)
+            VALUES (?, ?, ?, NULL, ?)
+            ON CONFLICT(chart_source, territory, chart_date) DO UPDATE SET
+              next_try_at = excluded.next_try_at`,
+      params: [source, CHART_TERRITORY, day, next],
+    },
+  ]);
+}
+
 export async function ingestItunesCharts(store: Store, now = new Date(), refreshMs = CHART_REFRESH_MS): Promise<ChartIngestResult> {
   const day = chartDay(now);
   const result: ChartIngestResult = { status: "fresh", written: 0, linked: 0, errors: [] };
-  let attempted = 0;
-  const recent = await store.all<{ chart_source: string; collected_at: string }>(
-    `SELECT chart_source, MAX(collected_at) AS collected_at
-     FROM chart_entries
-     WHERE territory = ? AND chart_date = ?
-     GROUP BY chart_source`,
-    [CHART_TERRITORY, day],
-  );
-  const fresh = new Map(recent.map((row) => [row.chart_source, row.collected_at]));
-  const due = CHART_SOURCES.filter((chart) => !isFresh(fresh.get(chart.source), now, refreshMs));
+  const due = [];
+  for (const chart of CHART_SOURCES) {
+    const row = await store.first<{ collected_at: string | null; next_try_at: string | null }>(
+      `SELECT collected_at, next_try_at FROM chart_freshness
+       WHERE chart_source = ? AND territory = ? AND chart_date = ?`,
+      [chart.source, CHART_TERRITORY, day],
+    );
+    if (shouldFetch(row, now, refreshMs)) due.push(chart);
+  }
   if (!due.length) return result;
-  const artists = await store.all<{ id: number; name: string; apple_id: string | null }>(
-    "SELECT id, name, apple_id FROM artists WHERE tracked = 1",
-  );
-  const index = indexArtists(artists.map((row) => ({ id: Number(row.id), name: String(row.name || ""), appleId: row.apple_id })));
-  const collectedAt = utcNow(now);
+  const parsed: { source: string; rows: ChartRow[] }[] = [];
   for (const chart of due) {
-    attempted += 1;
     let page: { status: number; text: string; truncated: boolean } | { error: string };
     try {
       page = await fetchChart(chart.url);
     } catch (error) {
       result.errors.push(`${chart.source}: ${error instanceof Error ? error.message : "fetch failed"}`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
     if ("error" in page) {
       result.errors.push(`${chart.source}: ${page.error}`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
     if (page.truncated) {
       result.errors.push(`${chart.source}: response exceeded ${CHART_MAX_BYTES} bytes`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
     if (page.status !== 200) {
       result.errors.push(`${chart.source}: HTTP ${page.status}`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
     let payload: unknown;
@@ -262,24 +299,38 @@ export async function ingestItunesCharts(store: Store, now = new Date(), refresh
       payload = JSON.parse(page.text);
     } catch {
       result.errors.push(`${chart.source}: response was not JSON`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
     const rows = parseItunesRss(payload);
     if (!rows.length) {
       result.errors.push(`${chart.source}: feed had no chart rows`);
+      await noteChartAttempt(store, chart.source, day, now, false, "");
       continue;
     }
-    try {
-      const written = await writeRows(store, chart.source, rows, index, day, collectedAt);
-      result.written += written.written;
-      result.linked += written.linked;
-    } catch (error) {
-      result.errors.push(`${chart.source}: ${error instanceof Error ? error.message : "write failed"}`);
+    parsed.push({ source: chart.source, rows });
+  }
+  const collectedAt = utcNow(now);
+  if (parsed.length) {
+    const artists = await store.all<{ id: number; name: string; apple_id: string | null }>(
+      "SELECT id, name, apple_id FROM artists WHERE tracked = 1",
+    );
+    const index = indexArtists(artists.map((row) => ({ id: Number(row.id), name: String(row.name || ""), appleId: row.apple_id })));
+    for (const chart of parsed) {
+      try {
+        const written = await writeRows(store, chart.source, chart.rows, index, day, collectedAt);
+        result.written += written.written;
+        result.linked += written.linked;
+        await noteChartAttempt(store, chart.source, day, now, true, collectedAt);
+      } catch (error) {
+        result.errors.push(`${chart.source}: ${error instanceof Error ? error.message : "write failed"}`);
+        await noteChartAttempt(store, chart.source, day, now, false, "");
+      }
     }
   }
   if (result.errors.length && result.written) result.status = "partial";
   else if (result.errors.length) result.status = "error";
-  else if (attempted) result.status = "stored";
+  else if (parsed.length) result.status = "stored";
   else result.status = "fresh";
   if (result.errors.length) {
     console.log(JSON.stringify({ message: "chart ingest", status: result.status, written: result.written, errors: result.errors }));

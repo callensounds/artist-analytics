@@ -202,10 +202,9 @@ def handler_env(owner, passed):
 async def fresh_sources(db, artist_id: int, now: datetime, seconds: int = PROVIDER_FRESH_SECONDS) -> set[str]:
     rows = await db.query(
         """
-        SELECT source, MAX(captured_at) AS captured_at
-        FROM metric_snapshots
+        SELECT source, captured_at
+        FROM source_freshness
         WHERE artist_id = ?
-        GROUP BY source
         """,
         (artist_id,),
     )

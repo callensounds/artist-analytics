@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 
+from db import missing_table
+
 # Order is the breakdown order. A metric that is not stored is left out.
 SCORE_METRICS = (
     ("spotify", "Monthly listeners", "Spotify monthly listeners"),
@@ -30,6 +32,17 @@ SCORE_RANK_LIMIT = 50
 SCORE_RANK_EMPTY = "No tracked artist has an exact audience count stored yet, so there is nothing to rank."
 
 _FILTER = """
+    metric_latest.value IS NOT NULL
+    AND (
+          (metric_latest.source = 'spotify' AND metric_latest.metric IN ('Monthly listeners', 'Followers'))
+       OR (metric_latest.source = 'instagram' AND metric_latest.metric = 'Followers')
+       OR (metric_latest.source = 'tiktok' AND metric_latest.metric IN ('Followers', 'Likes'))
+       OR (metric_latest.source = 'youtube' AND metric_latest.metric = 'Subscribers')
+    )
+"""
+
+# Used only when metric_latest has not been created yet.
+_LEGACY_FILTER = """
     value IS NOT NULL
     AND (
           (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
@@ -100,7 +113,20 @@ def score_from_counts(rows: list[dict]) -> dict:
     }
 
 
-def _window_sql(where_artist: str) -> str:
+def _latest_sql(where_artist: str) -> str:
+    return f"""
+        SELECT metric_latest.artist_id AS artist_id,
+               artists.name AS name,
+               metric_latest.source AS source,
+               metric_latest.metric AS metric,
+               metric_latest.value AS value
+        FROM metric_latest
+        JOIN artists ON artists.id = metric_latest.artist_id AND artists.tracked = 1
+        WHERE {where_artist} {_FILTER}
+    """
+
+
+def _legacy_window_sql(where_artist: str) -> str:
     return f"""
         SELECT artist_id, name, source, metric, value
         FROM (
@@ -115,18 +141,36 @@ def _window_sql(where_artist: str) -> str:
                    ) AS rn
             FROM metric_snapshots
             JOIN artists ON artists.id = metric_snapshots.artist_id AND artists.tracked = 1
-            WHERE {where_artist} {_FILTER}
+            WHERE {where_artist} {_LEGACY_FILTER}
         ) AS ranked
         WHERE rn = 1
     """
 
 
+async def _score_rows(db, where_new: str, where_old: str, params: tuple) -> list[dict]:
+    legacy = False
+    try:
+        rows = await db.query(_latest_sql(where_new), params)
+    except Exception as exc:
+        if not missing_table(exc):
+            raise
+        legacy = True
+    if legacy:
+        rows = await db.query(_legacy_window_sql(where_old), params)
+    return rows
+
+
 async def load_scores(db, artist_ids: list[int]) -> dict[int, dict]:
-    """Scores for a small set of artists. One indexed read."""
+    """Scores for a small set of artists. One indexed read of the latest row per metric."""
     if not artist_ids:
         return {}
     marks = ",".join("?" for _ in artist_ids)
-    rows = await db.query(_window_sql(f"metric_snapshots.artist_id IN ({marks}) AND"), tuple(artist_ids))
+    rows = await _score_rows(
+        db,
+        f"metric_latest.artist_id IN ({marks}) AND",
+        f"metric_snapshots.artist_id IN ({marks}) AND",
+        tuple(artist_ids),
+    )
     return _group_scores(rows)
 
 
@@ -141,7 +185,7 @@ async def load_artist_score(db, artist_id: int) -> dict:
 async def rank_scores(db, limit: int = SCORE_RANK_LIMIT) -> list[dict]:
     """Tracked artists with a score, highest first. Capped so the request stays one read plus a sort."""
     cap = max(1, min(int(limit), SCORE_RANK_LIMIT))
-    rows = await db.query(_window_sql(""))
+    rows = await _score_rows(db, "", "", ())
     names: dict[int, str] = {}
     buckets: dict[int, list[dict]] = {}
     for row in rows:

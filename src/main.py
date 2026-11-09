@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import html
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from crawl import (
     known_links,
     open_database,
     run_scheduled,
+    settings,
     status_report,
 )
 from diag import diagnose
@@ -55,6 +57,29 @@ except ImportError:  # The workers runtime exists on Cloudflare, not in local te
 
 app = FastAPI(title="Average Analytics")
 app.add_middleware(WorkerSessionMiddleware, fallback_secret=FALLBACK_SESSION_SECRET)
+
+
+@app.middleware("http")
+async def d1_outage_page(request: Request, call_next):
+    """A D1 limit error must not become a bare Internal Server Error."""
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        if not _d1_outage(exc):
+            raise
+        if request.url.path.endswith(".csv"):
+            return Response(
+                f"{DATA_UNAVAILABLE}\n",
+                status_code=503,
+                media_type="text/plain; charset=utf-8",
+            )
+        page = (
+            "<!DOCTYPE html><html><body><main>"
+            f"<h1>{DATA_UNAVAILABLE}</h1>"
+            "<p>Stored rows could not be read. Nothing on this page is estimated.</p>"
+            "</main></body></html>"
+        )
+        return HTMLResponse(page, status_code=503)
 
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
 # so a ../templates path exists locally and 500s on every HTML route after deploy.
@@ -94,6 +119,39 @@ def _memory_user(email: str) -> dict | None:
 
 # Overlaps the provider fan-out. A stuck D1 read cannot stretch the page.
 GROWTH_READ_TIMEOUT_S = 1.5
+DATA_UNAVAILABLE = "Data temporarily unavailable."
+
+
+def _unavailable(detail: str) -> str:
+    return f"{DATA_UNAVAILABLE} {detail}"
+
+
+def _demo_password(password: str) -> bool:
+    return hmac.compare_digest(password, DEMO_PASSWORD)
+
+
+def _issue_session(request: Request, user: dict, auth: str) -> None:
+    request.session["user_id"] = int(user["id"])
+    request.session["auth"] = auth
+    request.session["email"] = str(user.get("email") or "")
+    request.session["artist_name"] = str(user.get("artist_name") or user.get("email") or "")
+
+
+def _user_from_session(request: Request) -> dict | None:
+    """A logged-in shell when D1 cannot be read. It does not grant a new login."""
+    user_id = request.session.get("user_id")
+    if not user_id:
+        return None
+    email = str(request.session.get("email") or "")
+    artist_name = request.session.get("artist_name")
+    if not artist_name:
+        artist_name = "Demo Artist" if email == DEMO_EMAIL else (email or "Artist")
+    return {"id": int(user_id), "email": email, "artist_name": str(artist_name)}
+
+
+def _d1_outage(exc: BaseException) -> bool:
+    text = f"{exc.__class__.__name__}: {exc}"
+    return "D1_ERROR" in text or "exceeded D1" in text or "row read limit" in text
 
 
 def render_source_cards(sources: list[dict] | None) -> str:
@@ -207,7 +265,7 @@ async def read_dashboard_history(name: str, env) -> dict:
     try:
         return await asyncio.wait_for(load_dashboard_history(db, name), GROWTH_READ_TIMEOUT_S)
     except Exception:
-        return empty_history("Stored growth could not be read on this request.")
+        return empty_history(_unavailable("Stored growth could not be read on this request."))
 
 
 async def get_current_user(request: Request):
@@ -217,16 +275,19 @@ async def get_current_user(request: Request):
     if request.session.get("auth") == "d1":
         db = await _open_read_db(request.scope.get("env"))
         if db is None:
-            return None
+            return _user_from_session(request)
         row = None
         try:
             row = await db.query_one("SELECT id, email FROM users WHERE id = ?", (int(user_id),))
         except Exception:
-            return None
+            return _user_from_session(request)
         if not row:
             return None
         email = str(row["email"])
-        return {"id": int(row["id"]), "email": email, "artist_name": "Demo Artist" if email == "artist@demo.com" else email}
+        artist_name = "Demo Artist" if email == DEMO_EMAIL else email
+        request.session["email"] = email
+        request.session["artist_name"] = artist_name
+        return {"id": int(row["id"]), "email": email, "artist_name": artist_name}
     for user in USERS.values():
         if user["id"] == user_id:
             return user
@@ -266,18 +327,42 @@ async def login_page(request: Request):
 @app.post("/login")
 async def login(request: Request, email: str = Form(...), password: str = Form(...)):
     email = email.strip().lower()
+    # The public demo password is checked here so a D1 outage can still sign
+    # that account in. A wrong demo password never touches D1. Other accounts
+    # still require the stored hash.
+    demo = email == DEMO_EMAIL
+    if demo and not _demo_password(password):
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {"error": "Invalid email or password"},
+            status_code=400,
+        )
     db = await _open_read_db(request.scope.get("env"))
     if db is not None:
-        user = await authenticate(db, email, password)
+        try:
+            user = await authenticate(db, email, password)
+        except Exception:
+            if demo:
+                _issue_session(
+                    request,
+                    {"id": USERS[DEMO_EMAIL]["id"], "email": DEMO_EMAIL, "artist_name": "Demo Artist"},
+                    "memory",
+                )
+                return RedirectResponse("/dashboard", status_code=303)
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                {"error": DATA_UNAVAILABLE},
+                status_code=503,
+            )
         if user:
-            request.session["user_id"] = user["id"]
-            request.session["auth"] = "d1"
+            _issue_session(request, user, "d1")
             return RedirectResponse("/dashboard", status_code=303)
     else:
         user = _memory_user(email)
         if user and verify_password(password, str(user.get("password_hash") or "")):
-            request.session["user_id"] = user["id"]
-            request.session["auth"] = "memory"
+            _issue_session(request, user, "memory")
             return RedirectResponse("/dashboard", status_code=303)
     return templates.TemplateResponse(
         request,
@@ -318,7 +403,15 @@ async def register(
         )
     db = await _open_read_db(request.scope.get("env"))
     if db is not None:
-        created = await register_user(db, email, password)
+        try:
+            created = await register_user(db, email, password)
+        except Exception:
+            return templates.TemplateResponse(
+                request,
+                "register.html",
+                {"error": DATA_UNAVAILABLE},
+                status_code=503,
+            )
         if created is None:
             return templates.TemplateResponse(
                 request,
@@ -326,8 +419,7 @@ async def register(
                 {"error": "Email already registered"},
                 status_code=400,
             )
-        request.session["user_id"] = created["id"]
-        request.session["auth"] = "d1"
+        _issue_session(request, created, "d1")
         return RedirectResponse("/dashboard", status_code=303)
     if any(user.get("email") == email for user in USERS.values()):
         return templates.TemplateResponse(
@@ -342,8 +434,7 @@ async def register(
         "password_hash": hash_password(password),
         "artist_name": artist_name,
     }
-    request.session["user_id"] = NEXT_ID
-    request.session["auth"] = "memory"
+    _issue_session(request, USERS[email], "memory")
     NEXT_ID += 1
     return RedirectResponse("/dashboard", status_code=303)
 
@@ -366,7 +457,7 @@ async def watch_page(request: Request):
             except Exception:
                 failed = True
         if db is None or failed:
-            note = "The watchlist could not be read on this request."
+            note = "Data temporarily unavailable. The watchlist could not be read on this request."
         elif not artists:
             note = "You are not watching any artists yet."
     return templates.TemplateResponse(
@@ -434,7 +525,7 @@ async def search_page(request: Request, q: str | None = None):
                 matches = await asyncio.wait_for(search_artists(db, query), GROWTH_READ_TIMEOUT_S)
             except Exception:
                 matches = []
-                note = "Search could not be read on this request."
+                note = "Data temporarily unavailable. Search could not be read on this request."
     return templates.TemplateResponse(
         request,
         "search.html",
@@ -484,7 +575,7 @@ async def artists_page(request: Request, page: int = 1, sort: str | None = None)
             "has_prev": False,
             "has_next": False,
         }
-        note = "The artist directory could not be read on this request."
+        note = "Data temporarily unavailable. The artist directory could not be read on this request."
     else:
         note = None
     return templates.TemplateResponse(
@@ -516,7 +607,7 @@ async def trending_page(request: Request, window: str | None = None, provider: s
     if db is None:
         reason = "Trending is stored by the crawler when D1 is bound. This page does not call providers."
     elif failed:
-        reason = "Stored alerts could not be read on this request."
+        reason = "Data temporarily unavailable. Stored alerts could not be read on this request."
     elif alerts:
         reason = ""
     elif chosen_window or chosen_provider:
@@ -553,7 +644,7 @@ async def alerts_page(request: Request):
     if db is None:
         reason = "Alerts are stored by the crawler when D1 is bound. This page does not call providers."
     elif failed:
-        reason = "Stored alerts could not be read on this request."
+        reason = "Data temporarily unavailable. Stored alerts could not be read on this request."
     elif alerts:
         reason = ""
     else:
@@ -589,7 +680,7 @@ async def charts_page(request: Request, date: str = ""):
     if db is None:
         reason = "Charts are stored by the crawler when D1 is bound. This page does not fetch Apple or Spotify."
     elif failed:
-        reason = "Stored chart positions could not be read on this request."
+        reason = "Data temporarily unavailable. Stored chart positions could not be read on this request."
     elif board["songs"] or board["albums"]:
         reason = ""
     else:
@@ -618,7 +709,7 @@ async def scores_page(request: Request):
     if db is None:
         reason = "Scores are computed from counts the crawler stored. This page does not call providers."
     elif failed:
-        reason = "Stored audience counts could not be read on this request."
+        reason = "Data temporarily unavailable. Stored audience counts could not be read on this request."
     elif ranked:
         reason = ""
     else:
@@ -659,7 +750,7 @@ async def export_artist_csv(request: Request, key: str):
             failed = True
     if artist is None:
         if db is None or failed:
-            text = "Stored history could not be read on this request.\n"
+            text = "Data temporarily unavailable. Stored history could not be read on this request.\n"
         else:
             text = "This artist is not tracked.\n"
         return Response(text, status_code=404, media_type="text/plain; charset=utf-8")
@@ -670,7 +761,7 @@ async def export_artist_csv(request: Request, key: str):
         rows = None
     if rows is None:
         return Response(
-            "Stored history could not be read on this request.\n",
+            "Data temporarily unavailable. Stored history could not be read on this request.\n",
             status_code=503,
             media_type="text/plain; charset=utf-8",
         )
@@ -718,7 +809,7 @@ async def related_graph_page(request: Request, key: str):
             failed = True
     if graph is None:
         if db is None or failed:
-            message = "Crawl history is not available on this request. This page does not call providers."
+            message = _unavailable("Crawl history is not available on this request. This page does not call providers.")
         else:
             message = "This artist is not tracked yet. This page does not look them up on Spotify."
         return templates.TemplateResponse(
@@ -752,16 +843,19 @@ async def _resolve_stored_artist(request: Request, key: str, redirect_suffix: st
     token = (key or "").strip()[:120]
     db = await _open_read_db(request.scope.get("env"))
     artist = None
+    lookup_failed = False
     if db is not None and token.isdigit():
         try:
             artist = await asyncio.wait_for(find_artist_by_id(db, int(token)), GROWTH_READ_TIMEOUT_S)
         except Exception:
             artist = None
+            lookup_failed = True
     elif db is not None and token:
         try:
             artist = await asyncio.wait_for(find_artist(db, token), GROWTH_READ_TIMEOUT_S)
         except Exception:
             artist = None
+            lookup_failed = True
         if artist is not None:
             location = f"/artist/{int(artist['id'])}{redirect_suffix}"
             query = request.url.query
@@ -769,8 +863,8 @@ async def _resolve_stored_artist(request: Request, key: str, redirect_suffix: st
                 location = f"{location}?{query}"
             return RedirectResponse(location, status_code=303)
     if artist is None:
-        if db is None:
-            message = "Crawl history is not available on this request. This page does not call providers."
+        if db is None or lookup_failed:
+            message = _unavailable("Crawl history is not available on this request. This page does not call providers.")
         else:
             message = "This artist is not tracked yet. This page does not look them up on Spotify, MusicBrainz, or the other providers."
         return templates.TemplateResponse(
@@ -798,7 +892,7 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
     try:
         history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
     except Exception:
-        history = empty_history("Stored history could not be read on this request.")
+        history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
     return user, artist, history
 
 
@@ -813,7 +907,7 @@ async def artist_calendar(request: Request, key: str, year: str | None = None):
     try:
         history = await asyncio.wait_for(load_calendar_page(db, artist, selected), GROWTH_READ_TIMEOUT_S)
     except Exception:
-        history = empty_history("Stored history could not be read on this request.")
+        history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
         history["artist_id"] = int(artist["id"])
     return templates.TemplateResponse(
         request,
@@ -884,7 +978,7 @@ async def dashboard(request: Request, artist: str | None = None):
         bundle = queued_bundle()
         bundle["insights"] = [history["reason"]]
     elif plan is None:
-        history = empty_history("Stored growth could not be read on this request.")
+        history = empty_history(_unavailable("Stored growth could not be read on this request."))
         bundle = queued_bundle()
         bundle["insights"] = [history["reason"]]
     elif plan["artist"] is None:
@@ -976,7 +1070,22 @@ async def admin_page(request: Request):
     user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    report = await status_report(request.scope.get("env"))
+    try:
+        report = await status_report(request.scope.get("env"))
+    except Exception:
+        report = {
+            "database": "unavailable",
+            "reason": DATA_UNAVAILABLE,
+            "mode": "cursor",
+            "schedule": "*/15 * * * *",
+            "artists": 0,
+            "related_artists": 0,
+            "snapshots": 0,
+            "edges": 0,
+            "cursor": 0,
+            "runs": [],
+            "settings": settings(request.scope.get("env")),
+        }
     return templates.TemplateResponse(
         request,
         "admin.html",

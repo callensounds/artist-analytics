@@ -23,17 +23,34 @@ export const BACKFILL_ARTISTS_PER_TICK = 5;
 /** Alerts inserted on one cron tick, across that artist batch. */
 export const BACKFILL_ALERTS_PER_TICK = 50;
 
+// audience_artists is one row per artist who has an exact alert metric.
+// The old form scanned every matching metric_snapshots row on each cron tick.
 export const BACKFILL_SQL = `
-SELECT DISTINCT artist_id
-FROM metric_snapshots
-WHERE value IS NOT NULL
-  AND (
-       (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
-    OR (source = 'instagram' AND metric = 'Followers')
-    OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
-  )
-  AND artist_id NOT IN (SELECT artist_id FROM alert_backfill)
-ORDER BY artist_id
+SELECT audience_artists.artist_id AS artist_id
+FROM audience_artists
+WHERE NOT EXISTS (
+  SELECT 1 FROM alert_backfill WHERE alert_backfill.artist_id = audience_artists.artist_id
+)
+ORDER BY audience_artists.artist_id
+LIMIT ?
+`;
+
+export const ALERT_SERIES_SQL = `
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'spotify' AND metric = 'Monthly listeners' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'spotify' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'instagram' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'tiktok' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'tiktok' AND metric = 'Likes' AND captured_at >= ? AND value IS NOT NULL
+ORDER BY captured_at ASC, id ASC
 LIMIT ?
 `;
 
@@ -163,20 +180,16 @@ export function evaluateAlerts(
   return found.slice(0, ALERT_WRITE_CAP);
 }
 
-export async function recordAlerts(store: Store, artistId: number, now = new Date(), maxAlerts = ALERT_WRITE_CAP): Promise<number> {
+export async function recordAlerts(
+  store: Store,
+  artistId: number,
+  now = new Date(),
+  maxAlerts = ALERT_WRITE_CAP,
+): Promise<{ written: number; complete: boolean }> {
   const cutoff = new Date(now.getTime() - WINDOW_7D_MS).toISOString().replace(/\.\d{3}Z$/, "Z");
   const rows = await store.all<{ source: string; metric: string; value: unknown; captured_at: string }>(
-    `SELECT source, metric, value, captured_at
-     FROM metric_snapshots
-     WHERE artist_id = ? AND captured_at >= ? AND value IS NOT NULL
-       AND (
-            (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
-         OR (source = 'instagram' AND metric = 'Followers')
-         OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
-       )
-     ORDER BY captured_at ASC, id ASC
-     LIMIT 2000`,
-    [artistId, cutoff],
+    ALERT_SERIES_SQL,
+    [artistId, cutoff, artistId, cutoff, artistId, cutoff, artistId, cutoff, artistId, cutoff, 2000],
   );
   const pending = evaluateAlerts(rows, now);
   const alerts = pending.slice(0, Math.max(0, maxAlerts));
@@ -209,6 +222,40 @@ export async function recordAlerts(store: Store, artistId: number, now = new Dat
   return { written: alerts.length, complete: alerts.length === pending.length };
 }
 
+export async function markAlertChecked(store: Store, artistId: number, now = new Date()): Promise<void> {
+  await store.batch([
+    {
+      sql: `INSERT INTO alert_backfill (artist_id, checked_at) VALUES (?, ?)
+            ON CONFLICT(artist_id) DO NOTHING`,
+      params: [artistId, utcNow(now)],
+    },
+  ]);
+}
+
+async function backfillFinished(store: Store): Promise<boolean> {
+  const row = await store.first<{ alert_backfill_done: number | null }>(
+    "SELECT alert_backfill_done FROM crawl_state WHERE id = 1",
+  );
+  return Number(row?.alert_backfill_done || 0) === 1;
+}
+
+async function setBackfillDone(store: Store, now: Date, done: boolean): Promise<void> {
+  await store.batch([
+    {
+      sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at, alert_backfill_done)
+            VALUES (1, 0, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              alert_backfill_done = excluded.alert_backfill_done,
+              updated_at = excluded.updated_at`,
+      params: [utcNow(now), done ? 1 : 0],
+    },
+  ]);
+}
+
+export async function clearBackfillDone(store: Store, now = new Date()): Promise<void> {
+  await setBackfillDone(store, now, false);
+}
+
 export async function backfillAlerts(
   store: Store,
   now = new Date(),
@@ -217,24 +264,30 @@ export async function backfillAlerts(
   const artistCap = Math.max(0, Math.min(limits.artists ?? BACKFILL_ARTISTS_PER_TICK, 20));
   const alertCap = Math.max(0, Math.min(limits.alerts ?? BACKFILL_ALERTS_PER_TICK, 50));
   if (!artistCap || !alertCap) return { artists: 0, alerts: 0 };
+  if (await backfillFinished(store)) return { artists: 0, alerts: 0 };
   const pending = await store.all<{ artist_id: number }>(BACKFILL_SQL, [artistCap]);
+  if (!pending.length) {
+    await setBackfillDone(store, now, true);
+    return { artists: 0, alerts: 0 };
+  }
   let artists = 0;
   let alerts = 0;
-  const stamp = utcNow(now);
+  let finished = true;
   for (const row of pending) {
-    if (alerts >= alertCap) break;
+    if (alerts >= alertCap) {
+      finished = false;
+      break;
+    }
     const artistId = Number(row.artist_id);
     const result = await recordAlerts(store, artistId, now, Math.min(ALERT_WRITE_CAP, alertCap - alerts));
     alerts += result.written;
     artists += 1;
-    if (!result.complete) break;
-    await store.batch([
-      {
-        sql: `INSERT INTO alert_backfill (artist_id, checked_at) VALUES (?, ?)
-              ON CONFLICT(artist_id) DO NOTHING`,
-        params: [artistId, stamp],
-      },
-    ]);
+    if (!result.complete) {
+      finished = false;
+      break;
+    }
+    await markAlertChecked(store, artistId, now);
   }
+  if (finished && pending.length < artistCap) await setBackfillDone(store, now, true);
   return { artists, alerts };
 }
