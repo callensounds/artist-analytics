@@ -25,17 +25,23 @@ MOMENTUM_METRICS = (
 MOMENTUM_ROW_CAP = 2000
 MOMENTUM_EMPTY = "Not enough stored readings in the last 24 hours or 7 days. One reading is not a trend."
 
+# One indexed range per series. A single OR across sources cannot use
+# (artist_id, source, metric, captured_at) and would read every older row.
 _MOMENTUM_SQL = """
-SELECT source, metric, value, captured_at
-FROM metric_snapshots
-WHERE artist_id = ?
-  AND captured_at >= ?
-  AND value IS NOT NULL
-  AND (
-        (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
-     OR (source = 'instagram' AND metric = 'Followers')
-     OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
-  )
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'spotify' AND metric = 'Monthly listeners' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'spotify' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'instagram' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'tiktok' AND metric = 'Followers' AND captured_at >= ? AND value IS NOT NULL
+UNION ALL
+SELECT source, metric, value, captured_at, id FROM metric_snapshots
+WHERE artist_id = ? AND source = 'tiktok' AND metric = 'Likes' AND captured_at >= ? AND value IS NOT NULL
 ORDER BY captured_at ASC, id ASC
 LIMIT ?
 """
@@ -161,5 +167,8 @@ def build_momentum(rows: list[dict], now: datetime) -> list[dict]:
 async def load_momentum(db, artist_id: int, now: datetime | None = None) -> list[dict]:
     moment = now or datetime.now(timezone.utc)
     cutoff = utc_now(moment - timedelta(seconds=WINDOW_7D))
-    rows = await db.query(_MOMENTUM_SQL, (artist_id, cutoff, MOMENTUM_ROW_CAP))
+    rows = await db.query(
+        _MOMENTUM_SQL,
+        (artist_id, cutoff, artist_id, cutoff, artist_id, cutoff, artist_id, cutoff, artist_id, cutoff, MOMENTUM_ROW_CAP),
+    )
     return build_momentum(rows, moment)

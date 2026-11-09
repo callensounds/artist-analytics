@@ -31,7 +31,8 @@ interface D1Like {
 }
 
 export function fromD1(db: D1Like): Store {
-  return {
+  const store: Store & { binding?: object } = {
+    binding: db,
     async all(sql, params = []) {
       const prepared = db.prepare(sql);
       const statement = params.length ? prepared.bind(...params) : prepared;
@@ -53,6 +54,7 @@ export function fromD1(db: D1Like): Store {
       );
     },
   };
+  return store;
 }
 
 const SCHEMA = `
@@ -248,25 +250,197 @@ export function parseUtc(value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+export const LATEST_MIGRATION = "0011_read_budget.sql";
+
+const MIGRATION_VERSIONS = [
+  "0001_crawl.sql",
+  "0002_apple_backoff.sql",
+  "0003_dashboard_reads.sql",
+  "0004_playlist_appearances.sql",
+  "0005_metric_alerts.sql",
+  "0006_alert_backfill.sql",
+  "0007_musicbrainz_releases.sql",
+  "0008_users.sql",
+  "0009_itunes_charts.sql",
+  "0010_artist_tracks.sql",
+  LATEST_MIGRATION,
+];
+
+// Same statements as src/migrations/0011_read_budget.sql, without the ALTER
+// lines. Those are applied only when the column is missing.
+const READ_BUDGET_SQL = [
+  `CREATE TABLE IF NOT EXISTS metric_latest (
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    value REAL,
+    value_text TEXT,
+    captured_at TEXT NOT NULL,
+    snapshot_id INTEGER,
+    PRIMARY KEY (artist_id, source, metric)
+  )`,
+  `CREATE TABLE IF NOT EXISTS source_freshness (
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY (artist_id, source)
+  )`,
+  `CREATE TABLE IF NOT EXISTS audience_artists (
+    artist_id INTEGER PRIMARY KEY
+  )`,
+  `CREATE TABLE IF NOT EXISTS chart_freshness (
+    chart_source TEXT NOT NULL,
+    territory TEXT NOT NULL,
+    chart_date TEXT NOT NULL,
+    collected_at TEXT,
+    next_try_at TEXT,
+    PRIMARY KEY (chart_source, territory, chart_date)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_snapshots_artist_captured
+    ON metric_snapshots (artist_id, captured_at, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_chart_entries_day
+    ON chart_entries (territory, chart_date, chart_source)`,
+  `CREATE INDEX IF NOT EXISTS idx_artists_origin_tracked
+    ON artists (origin, tracked)`,
+  `CREATE TRIGGER IF NOT EXISTS metric_snapshots_fresh
+    AFTER INSERT ON metric_snapshots
+    FOR EACH ROW
+    BEGIN
+      INSERT INTO source_freshness (artist_id, source, captured_at)
+      VALUES (NEW.artist_id, NEW.source, NEW.captured_at)
+      ON CONFLICT(artist_id, source) DO UPDATE SET
+        captured_at = excluded.captured_at
+      WHERE excluded.captured_at > source_freshness.captured_at;
+    END`,
+  `CREATE TRIGGER IF NOT EXISTS metric_snapshots_latest
+    AFTER INSERT ON metric_snapshots
+    FOR EACH ROW
+    WHEN NEW.value IS NOT NULL
+    BEGIN
+      INSERT INTO metric_latest (
+        artist_id, source, metric, value, value_text, captured_at, snapshot_id
+      ) VALUES (
+        NEW.artist_id, NEW.source, NEW.metric, NEW.value, NEW.value_text, NEW.captured_at, NEW.id
+      )
+      ON CONFLICT(artist_id, source, metric) DO UPDATE SET
+        value = excluded.value,
+        value_text = excluded.value_text,
+        captured_at = excluded.captured_at,
+        snapshot_id = excluded.snapshot_id
+      WHERE excluded.captured_at > metric_latest.captured_at
+         OR (
+              excluded.captured_at = metric_latest.captured_at
+              AND excluded.snapshot_id >= COALESCE(metric_latest.snapshot_id, 0)
+         );
+    END`,
+  `CREATE TRIGGER IF NOT EXISTS metric_snapshots_audience
+    AFTER INSERT ON metric_snapshots
+    FOR EACH ROW
+    WHEN NEW.value IS NOT NULL AND (
+         (NEW.source = 'spotify' AND NEW.metric IN ('Monthly listeners', 'Followers'))
+      OR (NEW.source = 'instagram' AND NEW.metric = 'Followers')
+      OR (NEW.source = 'tiktok' AND NEW.metric IN ('Followers', 'Likes'))
+    )
+    BEGIN
+      INSERT INTO audience_artists (artist_id) VALUES (NEW.artist_id)
+      ON CONFLICT(artist_id) DO NOTHING;
+    END`,
+  `INSERT INTO metric_latest (artist_id, source, metric, value, value_text, captured_at, snapshot_id)
+    SELECT artist_id, source, metric, value, value_text, captured_at, id
+    FROM (
+      SELECT artist_id, source, metric, value, value_text, captured_at, id,
+             ROW_NUMBER() OVER (
+               PARTITION BY artist_id, source, metric
+               ORDER BY captured_at DESC, id DESC
+             ) AS rn
+      FROM metric_snapshots
+      WHERE value IS NOT NULL
+    ) AS ranked
+    WHERE rn = 1
+    ON CONFLICT(artist_id, source, metric) DO UPDATE SET
+      value = excluded.value,
+      value_text = excluded.value_text,
+      captured_at = excluded.captured_at,
+      snapshot_id = excluded.snapshot_id
+    WHERE excluded.captured_at > metric_latest.captured_at
+       OR (
+            excluded.captured_at = metric_latest.captured_at
+            AND excluded.snapshot_id >= COALESCE(metric_latest.snapshot_id, 0)
+       )`,
+  `INSERT INTO source_freshness (artist_id, source, captured_at)
+    SELECT artist_id, source, MAX(captured_at)
+    FROM metric_snapshots
+    GROUP BY artist_id, source
+    ON CONFLICT(artist_id, source) DO UPDATE SET
+      captured_at = excluded.captured_at
+    WHERE excluded.captured_at > source_freshness.captured_at`,
+  `INSERT INTO audience_artists (artist_id)
+    SELECT DISTINCT artist_id
+    FROM metric_snapshots
+    WHERE value IS NOT NULL
+      AND (
+           (source = 'spotify' AND metric IN ('Monthly listeners', 'Followers'))
+        OR (source = 'instagram' AND metric = 'Followers')
+        OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
+      )
+    ON CONFLICT(artist_id) DO NOTHING`,
+  `INSERT INTO chart_freshness (chart_source, territory, chart_date, collected_at)
+    SELECT chart_source, territory, chart_date, MAX(collected_at)
+    FROM chart_entries
+    GROUP BY chart_source, territory, chart_date
+    ON CONFLICT(chart_source, territory, chart_date) DO UPDATE SET
+      collected_at = excluded.collected_at
+    WHERE excluded.collected_at > COALESCE(chart_freshness.collected_at, '')`,
+];
+
+const migrated = new WeakSet<object>();
+
+function migrateKey(store: Store): object {
+  const binding = (store as { binding?: object }).binding;
+  return binding ?? store;
+}
+
+async function ensureColumn(store: Store, column: string, ddl: string): Promise<void> {
+  const columns = await store.all<{ name: string }>("PRAGMA table_info(crawl_state)");
+  if (!columns.some((row) => row.name === column)) {
+    await store.batch([{ sql: ddl, params: [] }]);
+  }
+}
+
 export async function migrate(store: Store): Promise<void> {
+  const key = migrateKey(store);
+  if (migrated.has(key)) return;
+  try {
+    const latest = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [LATEST_MIGRATION]);
+    if (latest) {
+      migrated.add(key);
+      return;
+    }
+  } catch {
+    // schema_migrations does not exist on a brand new database.
+  }
   for (const statement of SCHEMA.split(";").map((part) => part.trim()).filter(Boolean)) {
     await store.batch([{ sql: statement, params: [] }]);
   }
-  const column = await store.first<{ name: string }>("PRAGMA table_info(crawl_state)");
-  const columns = await store.all<{ name: string }>("PRAGMA table_info(crawl_state)");
-  if (!columns.some((row) => row.name === "apple_blocked_until")) {
-    await store.batch([{ sql: "ALTER TABLE crawl_state ADD COLUMN apple_blocked_until TEXT", params: [] }]);
+  await ensureColumn(store, "apple_blocked_until", "ALTER TABLE crawl_state ADD COLUMN apple_blocked_until TEXT");
+  await ensureColumn(
+    store,
+    "alert_backfill_done",
+    "ALTER TABLE crawl_state ADD COLUMN alert_backfill_done INTEGER NOT NULL DEFAULT 0",
+  );
+  await ensureColumn(store, "related_tracked", "ALTER TABLE crawl_state ADD COLUMN related_tracked INTEGER");
+  for (const sql of READ_BUDGET_SQL) {
+    await store.batch([{ sql, params: [] }]);
   }
-  void column;
+  const applied = await store.all<{ version: string }>("SELECT version FROM schema_migrations");
+  const have = new Set(applied.map((row) => row.version));
   const stamp = utcNow();
-  for (const version of ["0001_crawl.sql", "0002_apple_backoff.sql", "0003_dashboard_reads.sql", "0004_playlist_appearances.sql", "0005_metric_alerts.sql", "0006_alert_backfill.sql", "0007_musicbrainz_releases.sql", "0008_users.sql", "0009_itunes_charts.sql", "0010_artist_tracks.sql"]) {
-    const applied = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [version]);
-    if (!applied) {
-      await store.batch([
-        { sql: "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)", params: [version, stamp] },
-      ]);
-    }
-  }
+  const missing = MIGRATION_VERSIONS.filter((version) => !have.has(version)).map((version) => ({
+    sql: "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    params: [version, stamp],
+  }));
+  if (missing.length) await store.batch(missing);
+  migrated.add(key);
 }
 
 const AUDIENCE = new Set([
@@ -340,9 +514,9 @@ export async function saveSource(
 ): Promise<{ snapshots: number; edges: number; discovered: number }> {
   const artistId = Number(row.id);
   const stamp = utcNow(now);
-  const latest = await store.all<{ source: string; metric: string; value: number; captured_at: string }>(
-    `SELECT source, metric, value, captured_at FROM metric_snapshots
-     WHERE artist_id = ? AND source = ? ORDER BY captured_at DESC`,
+  const latest = await store.all<{ metric: string; value: number; captured_at: string }>(
+    `SELECT metric, value, captured_at FROM metric_latest
+     WHERE artist_id = ? AND source = ?`,
     [artistId, source.platform],
   );
   const seenMetric = new Set<string>();
@@ -438,10 +612,7 @@ export async function saveSource(
     });
   }
   if (relatedCap > 0 && edgeRows.length) {
-    const count = await store.first<{ n: number }>(
-      "SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1",
-    );
-    let room = relatedCap - Number(count?.n || 0);
+    let room = relatedCap - (await relatedTracked(store, now));
     const selfId = source.spotifyId || "";
     for (const item of related) {
       if (room <= 0) break;
@@ -474,6 +645,12 @@ export async function saveSource(
       });
       discovered += 1;
       room -= 1;
+    }
+    if (discovered) {
+      statements.push({
+        sql: "UPDATE crawl_state SET related_tracked = COALESCE(related_tracked, 0) + ? WHERE id = 1",
+        params: [discovered],
+      });
     }
   }
   const tracks = cleanTracks(source.tracks);
@@ -588,6 +765,26 @@ export async function saveMusicBrainzReleases(
       },
     ]);
   }
+}
+
+async function relatedTracked(store: Store, now: Date): Promise<number> {
+  const row = await store.first<{ related_tracked: number | null }>(
+    "SELECT related_tracked FROM crawl_state WHERE id = 1",
+  );
+  if (row && row.related_tracked !== null && row.related_tracked !== undefined) return Number(row.related_tracked);
+  const count = await store.first<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM artists WHERE origin = 'related' AND tracked = 1",
+  );
+  const total = Number(count?.n || 0);
+  await store.batch([
+    {
+      sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at, related_tracked)
+            VALUES (1, 0, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET related_tracked = excluded.related_tracked`,
+      params: [utcNow(now), total],
+    },
+  ]);
+  return total;
 }
 
 function normalizeName(value: string): string {

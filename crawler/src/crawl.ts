@@ -30,7 +30,7 @@ import {
   tiktokVideos,
   visibleLines,
 } from "./parse";
-import { backfillAlerts, recordAlerts } from "./alerts";
+import { backfillAlerts, clearBackfillDone, markAlertChecked, recordAlerts } from "./alerts";
 import { parseReleaseGroups } from "./releases";
 import { ingestItunesCharts } from "./charts";
 import { type SavedSource, type Store, migrate, parseUtc, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
@@ -118,7 +118,7 @@ function stale(row: Record<string, unknown>, now: Date, seconds: number): boolea
 
 async function freshSources(store: Store, artistId: number, now: Date): Promise<Set<string>> {
   const rows = await store.all<{ source: string; captured_at: string }>(
-    "SELECT source, MAX(captured_at) AS captured_at FROM metric_snapshots WHERE artist_id = ? GROUP BY source",
+    "SELECT source, captured_at FROM source_freshness WHERE artist_id = ?",
     [artistId],
   );
   const fresh = new Set<string>();
@@ -624,9 +624,16 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   const written = await saveSource(env.DB, row, saved, now, relatedCap);
   if (written.snapshots > 0 && (provider === "spotify" || provider === "instagram" || provider === "tiktok")) {
     try {
-      await recordAlerts(env.DB, artistId, now);
+      const alerts = await recordAlerts(env.DB, artistId, now);
+      if (alerts.complete) await markAlertChecked(env.DB, artistId, now);
+      else await clearBackfillDone(env.DB, now);
     } catch {
       // The snapshot is already stored. A failed alert insert does not drop the crawl.
+      try {
+        await clearBackfillDone(env.DB, now);
+      } catch {
+        // The next cron still walks audience_artists if the flag cannot be cleared.
+      }
     }
   }
   return { ok: saved.status !== "error", detail: `${row.name} | ${saved.platform}=${saved.status}` };

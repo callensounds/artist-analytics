@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,13 +28,26 @@ def parse_utc(value: str | None) -> datetime | None:
 
 
 def split_sql(script: str) -> list[str]:
+    """Split a migration on semicolons. BEGIN/END blocks stay one statement.
+
+    Trigger bodies contain semicolons. A line-ending semicolon is a boundary
+    only when it is outside those blocks. ``END`` from ``CASE`` is ignored
+    unless the line is the ``END`` that closes a ``BEGIN``.
+    """
     statements = []
     buffer: list[str] = []
+    depth = 0
     for line in script.splitlines():
-        if line.strip().startswith("--"):
+        stripped = line.strip()
+        if depth == 0 and stripped.startswith("--"):
             continue
         buffer.append(line)
-        if line.strip().endswith(";"):
+        upper = stripped.upper()
+        if upper == "BEGIN":
+            depth += 1
+        elif upper == "END;" or upper == "END":
+            depth = max(0, depth - 1)
+        if depth == 0 and stripped.endswith(";"):
             text = "\n".join(buffer).strip().rstrip(";").strip()
             buffer = []
             if text:
@@ -174,7 +188,56 @@ class D1Database:
         await _await(batch_fn(prepared))
 
 
+# Bump this when a new file is added under src/migrations. A database that
+# already has this version skips the per-file probes.
+LATEST_MIGRATION = "0011_read_budget.sql"
+
+# One successful migrate per database object (or its D1 binding). The next
+# request on that isolate does not read schema_migrations again.
+_MIGRATED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def missing_table(exc: BaseException) -> bool:
+    """True when a summary table is not created yet. A D1 limit error is not this."""
+    return "no such table" in str(exc).lower()
+
+
+def _migrate_key(db):
+    binding = getattr(db, "binding", None)
+    return binding if binding is not None else db
+
+
+def _already_migrated(db) -> bool:
+    try:
+        return bool(_MIGRATED.get(_migrate_key(db)))
+    except TypeError:
+        return False
+
+
+def _remember_migrated(db) -> None:
+    try:
+        _MIGRATED[_migrate_key(db)] = True
+    except TypeError:
+        return
+
+
+async def _latest_recorded(db) -> bool:
+    try:
+        row = await db.query_one(
+            "SELECT version FROM schema_migrations WHERE version = ?",
+            (LATEST_MIGRATION,),
+        )
+    except Exception:
+        return False
+    return row is not None
+
+
 async def migrate(db) -> None:
+    if _already_migrated(db):
+        return
+    if await _latest_recorded(db):
+        _remember_migrated(db)
+        return
     await db.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
@@ -188,3 +251,4 @@ async def migrate(db) -> None:
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (path.name, utc_now()),
         )
+    _remember_migrated(db)
