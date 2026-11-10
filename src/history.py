@@ -896,7 +896,19 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
     return statements, written, discovered
 
 
-ARTIST_LOOKUP_SQL = "SELECT id, name, normalized_name FROM artists WHERE normalized_name = ?"
+# deezer_id is on this same row. The card does not look the artist up again.
+ARTIST_LOOKUP_SQL = (
+    "SELECT id, name, normalized_name, deezer_id, deezer_nb_album "
+    "FROM artists WHERE normalized_name = ?"
+)
+_ARTIST_LOOKUP_BARE_SQL = "SELECT id, name, normalized_name FROM artists WHERE normalized_name = ?"
+_ARTIST_BY_ID_SQL = (
+    "SELECT id, name, normalized_name, tracked, last_crawled_at, deezer_id, deezer_nb_album "
+    "FROM artists WHERE id = ?"
+)
+_ARTIST_BY_ID_BARE_SQL = (
+    "SELECT id, name, normalized_name, tracked, last_crawled_at FROM artists WHERE id = ?"
+)
 
 SNAPSHOT_SQL = """
 SELECT source, metric, value, captured_at
@@ -1045,12 +1057,26 @@ LIMIT ?
 """
 
 
+async def _artist_row(db, sql: str, bare: str, params: tuple) -> dict | None:
+    """One artists row. A database that has not applied 0012 still resolves the artist.
+
+    The fallback read stays outside ``except``. Awaiting a D1 promise while an
+    exception is still propagating breaks the Workers runtime.
+    """
+    try:
+        return await db.query_one(sql, params)
+    except Exception as exc:
+        if "no such column" not in str(exc).lower():
+            raise
+    return await db.query_one(bare, params)
+
+
 async def find_artist(db, name: str) -> dict | None:
     """Lookup by the same normalized_name the crawler stores. Display case does not matter."""
     normalized = normalize_name(name)
     if not normalized:
         return None
-    return await db.query_one(ARTIST_LOOKUP_SQL, (normalized,))
+    return await _artist_row(db, ARTIST_LOOKUP_SQL, _ARTIST_LOOKUP_BARE_SQL, (normalized,))
 
 
 async def load_growth(db, name: str) -> dict:
@@ -1210,10 +1236,7 @@ async def load_calendar_page(db, artist: dict, year: int | None = None) -> dict:
 async def find_artist_by_id(db, artist_id: int) -> dict | None:
     if not isinstance(artist_id, int) or isinstance(artist_id, bool) or artist_id < 1:
         return None
-    return await db.query_one(
-        "SELECT id, name, normalized_name, tracked, last_crawled_at FROM artists WHERE id = ?",
-        (artist_id,),
-    )
+    return await _artist_row(db, _ARTIST_BY_ID_SQL, _ARTIST_BY_ID_BARE_SQL, (artist_id,))
 
 
 DEEZER_FANS_SQL = """
@@ -1327,13 +1350,29 @@ def present_deezer_card(
                 "hour_utc": None,
             }
         )
+    profile_name = str(name or "").strip()[:120] or None if deezer_id else None
+    profile_url = f"https://www.deezer.com/artist/{deezer_id}" if deezer_id else None
+    # A failed read must not be described as an empty catalog.
+    if failed:
+        return {
+            "platform": "deezer",
+            "label": "Deezer",
+            "status": "unavailable",
+            "reason": DEEZER_READ_ERROR,
+            "profile_name": profile_name,
+            "profile_url": profile_url,
+            "metrics": [],
+            "items": [],
+            "tracks": [],
+            "notices": [DEEZER_PAGE_NOTICE],
+        }
     has_profile = bool(deezer_id or fans_number is not None or track_rows or item_dicts or albums is not None)
     if not has_profile:
         return {
             "platform": "deezer",
             "label": "Deezer",
             "status": "unavailable",
-            "reason": DEEZER_READ_ERROR if failed else DEEZER_UNAVAILABLE,
+            "reason": DEEZER_UNAVAILABLE,
             "profile_name": None,
             "profile_url": None,
             "metrics": [],
@@ -1373,13 +1412,15 @@ def present_deezer_card(
     notices = [DEEZER_PAGE_NOTICE]
     if item_dicts:
         notices.append("Deezer dates have no time of day. No hour was added.")
+    # An id from MusicBrainz can land before the Deezer crawl stores fans.
+    pending = fans_number is None and not track_rows and not item_dicts
     return {
         "platform": "deezer",
         "label": "Deezer",
-        "status": "ok",
+        "status": "pending" if pending else "ok",
         "reason": None,
-        "profile_name": str(name or "").strip()[:120] or None if deezer_id else None,
-        "profile_url": f"https://www.deezer.com/artist/{deezer_id}" if deezer_id else None,
+        "profile_name": profile_name,
+        "profile_url": profile_url,
         "metrics": metrics,
         "items": item_dicts,
         "tracks": track_rows[:10],
@@ -1395,39 +1436,68 @@ def _deezer_read_failed(exc: BaseException) -> bool:
     return True
 
 
-async def load_deezer_card(db, artist_id: int, name: str | None) -> dict:
-    """Indexed reads only. No Deezer request."""
-    identity = None
+def _row_deezer_identity(artist: dict | None) -> dict | None:
+    """Identity already loaded with the artist, so the card does not select that row again."""
+    if not isinstance(artist, dict):
+        return None
+    if "deezer_id" not in artist and "deezer_nb_album" not in artist:
+        return None
+    return {"deezer_id": artist.get("deezer_id"), "deezer_nb_album": artist.get("deezer_nb_album")}
+
+
+def _stored_deezer_id(identity: dict | None) -> str:
+    text = str((identity or {}).get("deezer_id") or "").strip()
+    return text if text.isdigit() else ""
+
+
+async def load_deezer_card(db, artist_id: int, name: str | None, artist: dict | None = None) -> dict:
+    """Stored Deezer card. No Deezer request.
+
+    Fan, track, and release rows are written with the artist id. When that id is
+    missing, those queries are skipped so an empty catalog cannot add D1 round
+    trips. The artist page calls this after history is already in hand.
+    """
+    identity = _row_deezer_identity(artist)
+    failed = False
+    if identity is None:
+        try:
+            identity = await db.query_one(DEEZER_IDENTITY_SQL, (artist_id,))
+        except Exception as exc:
+            failed = _deezer_read_failed(exc) or failed
+            identity = None
+    if failed or not _stored_deezer_id(identity):
+        return present_deezer_card(str(name or ""), identity, None, [], [], failed=failed)
     fans = None
     tracks: list[dict] = []
     releases: list[dict] = []
-    failed = False
-    try:
-        identity = await db.query_one(DEEZER_IDENTITY_SQL, (artist_id,))
-    except Exception as exc:
-        failed = _deezer_read_failed(exc) or failed
     try:
         fans = await db.query_one(DEEZER_FANS_SQL, (artist_id,))
     except Exception as exc:
         failed = _deezer_read_failed(exc) or failed
-    try:
-        tracks = await db.query(DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
-    except Exception as exc:
-        failed = _deezer_read_failed(exc) or failed
-        tracks = []
-    try:
-        releases = await db.query(DEEZER_RELEASES_SQL, (artist_id, 20))
-    except Exception as exc:
-        failed = _deezer_read_failed(exc) or failed
-        releases = []
-    return present_deezer_card(str(name or ""), identity, fans, tracks or [], releases or [], failed=failed)
+    if not failed:
+        try:
+            tracks = await db.query(DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
+        except Exception as exc:
+            failed = _deezer_read_failed(exc) or failed
+            tracks = []
+    if not failed:
+        try:
+            releases = await db.query(DEEZER_RELEASES_SQL, (artist_id, 20))
+        except Exception as exc:
+            failed = _deezer_read_failed(exc) or failed
+            releases = []
+    if failed:
+        return present_deezer_card(str(name or ""), identity, None, [], [], failed=True)
+    return present_deezer_card(str(name or ""), identity, fans, tracks or [], releases or [], failed=False)
 
 
-async def load_history_for_artist(db, artist: dict, on_growth=None, *, include_deezer_card: bool = False) -> dict:
+async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     """Snapshots, related edges, and sightings for one known artists row. No network.
 
     Audience points are read first. ``on_growth`` runs before the other reads so a
     later failure or a cancelled budget can still keep the series already stored.
+    The Deezer card is not read here. The artist page loads it afterwards so a
+    slow or failed card cannot discard this history.
     """
     artist_id = int(artist["id"])
     growth_failed = False
@@ -1593,12 +1663,6 @@ async def load_history_for_artist(db, artist: dict, on_growth=None, *, include_d
         history["score_components"] = score["components"]
         history["score_formula"] = score["formula"]
         history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
-    if include_deezer_card:
-        try:
-            history["deezer"] = await load_deezer_card(db, artist_id, artist.get("name"))
-        except Exception as exc:
-            log_read_failure("deezer card", exc)
-            history["deezer"] = present_deezer_card(str(artist.get("name") or ""), None, None, [], [], failed=True)
     return history
 
 

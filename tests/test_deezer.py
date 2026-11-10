@@ -9,7 +9,19 @@ import main
 from analytics import build_release_calendar
 from crawl import reset_pool
 from db import SqliteDatabase, migrate
-from history import build_growth, load_deezer_card, present_deezer_card, remember
+from history import (
+    DEEZER_FANS_SQL,
+    DEEZER_IDENTITY_SQL,
+    DEEZER_READ_ERROR,
+    DEEZER_RELEASES_SQL,
+    DEEZER_TRACKS_SQL,
+    build_growth,
+    find_artist_by_id,
+    load_deezer_card,
+    load_history_for_artist,
+    present_deezer_card,
+    remember,
+)
 from http_client import HttpResult, TransportError
 from providers.common import deezer_artist_id
 from providers.deezer import (
@@ -313,5 +325,207 @@ def test_artist_page_renders_the_stored_deezer_card_without_a_live_call(monkeypa
     assert "Deezer" in empty.text
     assert "unavailable" in empty.text.lower()
     assert calls == []
+    assert "Stored history could not be read" not in empty.text
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+HISTORY_UNAVAILABLE = "Stored history could not be read on this request."
+
+
+def _norm_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _card_sql() -> set[str]:
+    return {_norm_sql(sql) for sql in (DEEZER_FANS_SQL, DEEZER_TRACKS_SQL, DEEZER_RELEASES_SQL, DEEZER_IDENTITY_SQL)}
+
+
+def _plan(database: SqliteDatabase, sql: str, params: tuple = ()) -> str:
+    async def run():
+        rows = await database.query("EXPLAIN QUERY PLAN " + sql, params)
+        return " ".join(str(row.get("detail") or "") for row in rows)
+
+    return asyncio.run(run())
+
+
+async def _seed_spotify_history(database: SqliteDatabase, *, deezer_id: str | None = None) -> int:
+    await migrate(database)
+    await database.execute(
+        """
+        INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id, deezer_nb_album)
+        VALUES ('Daft Punk', 'daftpunk', 'search', 1, '2026-11-01T00:00:00Z', ?, NULL)
+        """,
+        (deezer_id,),
+    )
+    artist_id = int((await database.query_one("SELECT id FROM artists"))["id"])
+    await database.execute(
+        """
+        INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+        VALUES (?, 'spotify', 'Followers', 2000000, '2,000,000', '2026-10-31T00:30:32Z'),
+               (?, 'spotify', 'Followers', 2063093, '2,063,093', '2026-10-31T06:30:32Z')
+        """,
+        (artist_id, artist_id),
+    )
+    return artist_id
+
+
+def _open_page(monkeypatch, path):
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+
+    async def fan_out(*args, **kwargs):
+        raise AssertionError("artist page must not call Deezer")
+
+    monkeypatch.setattr(main, "collect_artist", fan_out)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    return client
+
+
+def test_deezer_card_queries_hit_indexes_and_history_does_not_run_them():
+    database = SqliteDatabase(":memory:")
+
+    async def run():
+        artist_id = await _seed_spotify_history(database, deezer_id="27")
+        artist = await find_artist_by_id(database, artist_id)
+        seen = []
+        original = database.query
+
+        async def spy(sql, params=()):
+            seen.append(_norm_sql(sql))
+            return await original(sql, params)
+
+        database.query = spy
+        history = await load_history_for_artist(database, artist)
+        return artist_id, history, seen
+
+    artist_id, history, seen = asyncio.run(run())
+    assert artist_id
+    assert history["deezer"] is None
+    assert history["growth"]["datasets"]
+    assert _card_sql().isdisjoint(seen)
+
+    fans = _plan(database, DEEZER_FANS_SQL, (artist_id,))
+    tracks = _plan(database, DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
+    releases = _plan(database, DEEZER_RELEASES_SQL, (artist_id, 20))
+    assert "metric_latest" in fans and "SCAN metric_latest" not in fans
+    assert "idx_artist_tracks_seen" in tracks and "SCAN artist_tracks" not in tracks
+    assert "SCAN content_sightings" not in releases
+
+
+def test_artist_page_renders_full_history_with_zero_deezer_data(monkeypatch, tmp_path):
+    path = tmp_path / "zero-deezer.sqlite"
+    database = SqliteDatabase(str(path))
+    artist_id = asyncio.run(_seed_spotify_history(database))
+    seen = []
+    original = SqliteDatabase.query
+
+    async def spy(self, sql, params=()):
+        seen.append(_norm_sql(sql))
+        return await original(self, sql, params)
+
+    monkeypatch.setattr(SqliteDatabase, "query", spy)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "2,063,093" in page.text
+    assert "Deezer" in page.text
+    assert "No Deezer artist is stored for this name" in page.text
+    assert "unavailable" in page.text.lower()
+    assert "pending" not in page.text.lower()
+    assert HISTORY_UNAVAILABLE not in page.text
+    assert _card_sql().isdisjoint(seen)
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_stored_deezer_id_without_fans_is_pending_and_keeps_history(monkeypatch, tmp_path):
+    path = tmp_path / "pending-deezer.sqlite"
+    database = SqliteDatabase(str(path))
+    artist_id = asyncio.run(_seed_spotify_history(database, deezer_id="27"))
+    seen = []
+    original = SqliteDatabase.query
+
+    async def spy(self, sql, params=()):
+        seen.append(_norm_sql(sql))
+        return await original(self, sql, params)
+
+    monkeypatch.setattr(SqliteDatabase, "query", spy)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "pending" in page.text.lower()
+    assert "No fan count has been stored yet." in page.text
+    assert HISTORY_UNAVAILABLE not in page.text
+    assert _norm_sql(DEEZER_IDENTITY_SQL) not in seen
+    assert {_norm_sql(DEEZER_FANS_SQL), _norm_sql(DEEZER_TRACKS_SQL), _norm_sql(DEEZER_RELEASES_SQL)} <= set(seen)
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_deezer_read_failure_keeps_history_and_logs_without_secrets(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "failed-deezer.sqlite"
+    database = SqliteDatabase(str(path))
+    artist_id = asyncio.run(_seed_spotify_history(database, deezer_id="27"))
+    original = SqliteDatabase.query
+
+    async def explode(self, sql, params=()):
+        if sql == DEEZER_TRACKS_SQL:
+            raise RuntimeError("D1_ERROR: token=super-secret-value deezer tracks")
+        return await original(self, sql, params)
+
+    monkeypatch.setattr(SqliteDatabase, "query", explode)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "2,063,093" in page.text
+    assert DEEZER_READ_ERROR in page.text
+    assert HISTORY_UNAVAILABLE not in page.text
+    assert "super-secret-value" not in page.text
+    logged = capsys.readouterr().out
+    assert "stored read failed" in logged
+    assert "deezer card" in logged
+    assert "super-secret-value" not in logged
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_deezer_card_timeout_keeps_full_history(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "slow-deezer.sqlite"
+    database = SqliteDatabase(str(path))
+    artist_id = asyncio.run(_seed_spotify_history(database, deezer_id="27"))
+    monkeypatch.setattr(main, "GROWTH_READ_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(main, "DEEZER_CARD_TIMEOUT_S", 0.05)
+
+    async def slow_card(*args, **kwargs):
+        await asyncio.sleep(0.4)
+        raise AssertionError("the Deezer card read should have timed out")
+
+    monkeypatch.setattr(main, "load_deezer_card", slow_card)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "2,063,093" in page.text
+    assert DEEZER_READ_ERROR in page.text
+    assert HISTORY_UNAVAILABLE not in page.text
+    logged = capsys.readouterr().out
+    assert "stored read failed" in logged
+    assert "deezer card" in logged
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_failed_deezer_card_does_not_claim_the_catalog_is_empty():
+    failed = present_deezer_card("Daft Punk", {"deezer_id": "27", "deezer_nb_album": 12}, None, [], [], failed=True)
+    assert failed["status"] == "unavailable"
+    assert failed["reason"] == DEEZER_READ_ERROR
+    assert failed["metrics"] == []
+    assert failed["profile_url"] == "https://www.deezer.com/artist/27"
+    pending = present_deezer_card("Daft Punk", {"deezer_id": "27", "deezer_nb_album": None}, None, [], [])
+    assert pending["status"] == "pending"
+    assert pending["metrics"][0]["reason"] == "No fan count has been stored yet."
