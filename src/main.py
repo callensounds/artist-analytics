@@ -252,7 +252,21 @@ def render_source_cards(sources: list[dict] | None) -> str:
                     f'<div class="text-xs text-slate-500 break-words">{clock}</div></div></div>'
                 )
             parts.append("</div>")
-        elif source.get("status") == "ok":
+        tracks = source.get("tracks") or []
+        if tracks:
+            parts.append('<ol class="mt-3 space-y-1 text-sm">')
+            for track in tracks[:10]:
+                rank = track.get("rank")
+                prefix = f"{int(rank)}. " if isinstance(rank, int) and not isinstance(rank, bool) else ""
+                title = html.escape(str(track.get("name") or ""))
+                url = track.get("url")
+                if url:
+                    title = f'<a href="{html.escape(str(url), quote=True)}" class="hover:text-emerald-300">{title}</a>'
+                album = html.escape(str(track.get("album_name") or ""))
+                extra = f' <span class="text-slate-500">{album}</span>' if album else ""
+                parts.append(f'<li class="break-words"><span class="font-mono text-emerald-300">{prefix}</span>{title}{extra}</li>')
+            parts.append("</ol>")
+        elif source.get("status") == "ok" and not items:
             parts.append('<p class="text-sm text-slate-400">This source returned profile data, but no dated rows.</p>')
         for note in source.get("notices") or []:
             parts.append(f'<p class="text-xs text-slate-500 mt-3">{html.escape(str(note))}</p>')
@@ -921,7 +935,10 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
         return loaded
     user, artist, db = loaded
     try:
-        history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
+        history = await asyncio.wait_for(
+            load_history_for_artist(db, artist, include_deezer_card=True),
+            GROWTH_READ_TIMEOUT_S,
+        )
     except Exception:
         history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
     return user, artist, history
@@ -974,6 +991,7 @@ async def artist_page(request: Request, key: str):
             "subtitle": subtitle,
             "message": "",
             "history": history,
+            "deezer_card": render_source_cards([history["deezer"]]) if history.get("deezer") else "",
             "can_watch": request.session.get("auth") == "d1",
         },
     )

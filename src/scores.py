@@ -14,13 +14,14 @@ SCORE_METRICS = (
     ("tiktok", "Followers", "TikTok followers"),
     ("tiktok", "Likes", "TikTok likes"),
     ("youtube", "Subscribers", "YouTube subscribers"),
+    ("deezer", "Fans", "Deezer fans"),
 )
 SCORE_FORMULA = (
     "Score = sum of log10(count), each term rounded to 2 decimal places, "
     "using only the latest exact stored count for each source. "
     "A source is included only when that exact integer is stored: "
     "Spotify monthly listeners, Spotify followers, Instagram followers, "
-    "TikTok followers, TikTok likes, and YouTube subscribers. "
+    "TikTok followers, TikTok likes, YouTube subscribers, and Deezer fans. "
     "A missing source is left out. Zero and rounded text are left out. "
     "Nothing is estimated."
 )
@@ -38,6 +39,7 @@ _FILTER = """
        OR (metric_latest.source = 'instagram' AND metric_latest.metric = 'Followers')
        OR (metric_latest.source = 'tiktok' AND metric_latest.metric IN ('Followers', 'Likes'))
        OR (metric_latest.source = 'youtube' AND metric_latest.metric = 'Subscribers')
+       OR (metric_latest.source = 'deezer' AND metric_latest.metric = 'Fans')
     )
 """
 
@@ -49,6 +51,7 @@ _LEGACY_FILTER = """
        OR (source = 'instagram' AND metric = 'Followers')
        OR (source = 'tiktok' AND metric IN ('Followers', 'Likes'))
        OR (source = 'youtube' AND metric = 'Subscribers')
+       OR (source = 'deezer' AND metric = 'Fans')
     )
 """
 

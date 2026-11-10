@@ -274,7 +274,7 @@ def test_stored_calendar_pages_one_year_and_an_empty_year_stays_empty(monkeypatc
     assert "December 2019" not in crossed.text
 
     assert empty.status_code == 200
-    assert "No stored MusicBrainz, Apple, or Spotify release falls in 1990" in empty.text
+    assert "No stored MusicBrainz, Apple, Spotify, or Deezer release falls in 1990" in empty.text
     assert "Bag" not in empty.text
     assert "Sling" not in empty.text
     assert "New Year" not in empty.text

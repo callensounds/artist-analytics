@@ -18,6 +18,7 @@ from models import Metric, SourceResult, errored, make_item, sort_items, source_
 from providers.common import (
     apple_artist_id,
     cache_key,
+    deezer_artist_id,
     instagram_handle,
     spotify_artist_id,
     tiktok_handle,
@@ -52,6 +53,7 @@ def extract_links(relations: list[dict]) -> dict:
         "youtube_handles": [],
         "instagram": "",
         "tiktok": "",
+        "deezer_id": "",
     }
     seen_channels = set()
     for relation in relations or []:
@@ -64,6 +66,8 @@ def extract_links(relations: list[dict]) -> dict:
             links["instagram"] = instagram_handle(url) or ""
         if not links["tiktok"]:
             links["tiktok"] = tiktok_handle(url) or ""
+        if not links["deezer_id"]:
+            links["deezer_id"] = deezer_artist_id(url) or ""
         channel = youtube_channel_id(url)
         if channel and channel not in seen_channels:
             seen_channels.add(channel)

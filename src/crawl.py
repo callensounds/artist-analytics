@@ -17,7 +17,7 @@ from runtime import env_get
 
 # One queue message is one of these. MusicBrainz runs first and stores ids;
 # the others then read that row and do a single fetch.
-PROVIDERS = ("musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube")
+PROVIDERS = ("musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube", "deezer")
 
 DEFAULT_STALE_SECONDS = 6 * 60 * 60
 SCAN_WINDOW = 50
@@ -68,6 +68,8 @@ def known_links(row: dict) -> dict:
         links["tiktok"] = row["tiktok_handle"]
     if row.get("youtube_channel_id"):
         links["youtube_channel_ids"] = [row["youtube_channel_id"]]
+    if row.get("deezer_id"):
+        links["deezer_id"] = row["deezer_id"]
     return links
 
 
@@ -553,6 +555,8 @@ def _followup_providers(links: dict, fresh: set[str], *, youtube: bool, apple_bl
         chosen.append("apple")
     if youtube and "youtube" not in fresh:
         chosen.append("youtube")
+    if "deezer" not in fresh:
+        chosen.append("deezer")
     return chosen
 
 
@@ -577,6 +581,10 @@ async def _fetch_one(provider: str, name: str, links: dict, env, http, cache):
         from providers.youtube import fetch_youtube
 
         return await fetch_youtube(name, links, env, http, cache)
+    if provider == "deezer":
+        from providers.deezer import fetch_deezer
+
+        return await fetch_deezer(name, links, http, cache)
     from models import unavailable
 
     return unavailable(provider, provider, "This crawler message has no provider.")

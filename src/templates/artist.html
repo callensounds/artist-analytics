@@ -33,6 +33,7 @@
 </div>
 
 {% if found %}
+{% if deezer_card %}{{ deezer_card|safe }}{% endif %}
 {% include "history_cards.html" %}
 {% else %}
 <section class="bg-slate-800 rounded-2xl p-5 border border-slate-700">

@@ -84,11 +84,17 @@ export function youtubeChannelId(url: string): string {
   return match?.[1] ?? "";
 }
 
+export function deezerArtistId(url: string): string {
+  const match = /deezer\.com\/(?:[a-z]{2}\/)?artist\/(\d+)/i.exec(url || "");
+  return match?.[1] ?? "";
+}
+
 export interface MbLinks {
   spotify_id: string;
   apple_id: string;
   instagram: string;
   tiktok: string;
+  deezer_id: string;
   youtube_channel_ids: string[];
   youtube_handles: string[];
   _mbid: string;
@@ -101,6 +107,7 @@ export function emptyLinks(): MbLinks {
     apple_id: "",
     instagram: "",
     tiktok: "",
+    deezer_id: "",
     youtube_channel_ids: [],
     youtube_handles: [],
     _mbid: "",
@@ -117,6 +124,7 @@ export function extractLinks(relations: { url?: { resource?: string } }[]): MbLi
     if (!links.apple_id) links.apple_id = appleArtistId(url);
     if (!links.instagram) links.instagram = instagramHandle(url);
     if (!links.tiktok) links.tiktok = tiktokHandle(url);
+    if (!links.deezer_id) links.deezer_id = deezerArtistId(url);
     const channel = youtubeChannelId(url);
     if (channel && !seen.has(channel)) {
       seen.add(channel);

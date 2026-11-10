@@ -39,11 +39,12 @@ POSTING_LABELS = {
     "apple": "Apple Music",
 }
 POSTING_MIN_EXACT = 3
-CALENDAR_SOURCES = ("musicbrainz", "apple", "spotify")
+CALENDAR_SOURCES = ("musicbrainz", "apple", "spotify", "deezer")
 CALENDAR_LABELS = {
     "musicbrainz": "MusicBrainz",
     "apple": "Apple Music",
     "spotify": "Spotify",
+    "deezer": "Deezer",
 }
 CALENDAR_MONTH_CAP = 12
 CALENDAR_CELL_CAP = 3
@@ -52,7 +53,7 @@ POSTING_NONE = (
     "Year, month, and day-only dates are excluded, and no hour is guessed."
 )
 CALENDAR_EMPTY = (
-    "No MusicBrainz, Apple, or Spotify release date is stored yet. "
+    "No MusicBrainz, Apple, Spotify, or Deezer release date is stored yet. "
     "Year-only dates are not placed on a day."
 )
 _PERIOD_RE = re.compile(r"\A(\d{4})(?:-(\d{2}))?\Z")
@@ -71,6 +72,7 @@ SOURCE_COLORS = {
     "youtube": "#f87171",
     "instagram": "#c084fc",
     "tiktok": "#22d3ee",
+    "deezer": "#a78bfa",
 }
 RELEASE_PLATFORMS = {"musicbrainz", "apple", "spotify"}
 SOCIAL_PLATFORMS = {"youtube", "instagram", "tiktok"}
@@ -647,7 +649,7 @@ def build_release_calendar(
     month_cap: int = CALENDAR_MONTH_CAP,
     year: int | None = None,
 ) -> dict:
-    """Month grids for MusicBrainz, Apple, and Spotify releases.
+    """Month grids for MusicBrainz, Apple, Spotify, and Deezer releases.
 
     Day precision and exact UTC times land on that calendar day. A month-only
     date marks the month and does not pick a day. A year-only date, including a
@@ -750,7 +752,7 @@ def build_release_calendar(
         reason = None
     elif empty_period:
         reason = (
-            f"No stored MusicBrainz, Apple, or Spotify release falls in {selected}. "
+            f"No stored MusicBrainz, Apple, Spotify, or Deezer release falls in {selected}. "
             "A month or a year is not given a day."
         )
     else:

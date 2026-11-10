@@ -33,6 +33,7 @@ import {
 import { backfillAlerts, clearBackfillDone, markAlertChecked, recordAlerts } from "./alerts";
 import { parseReleaseGroups } from "./releases";
 import { ingestItunesCharts } from "./charts";
+import { DeezerBusy, fetchDeezer } from "./deezer";
 import { type SavedSource, type Store, migrate, parseUtc, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
@@ -88,7 +89,7 @@ export interface CrawlMessage {
   mbid?: string;
 }
 
-const PROVIDERS = new Set(["musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube"]);
+const PROVIDERS = new Set(["musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube", "deezer"]);
 
 let mbNext = 0;
 
@@ -219,6 +220,7 @@ async function sendFollowups(env: CrawlEnv, artistId: number, links: MbLinks, fr
   if (links.tiktok && !fresh.has("tiktok")) providers.push("tiktok");
   if (!blocked && !fresh.has("apple")) providers.push("apple");
   if (env.YOUTUBE_API_KEY && !fresh.has("youtube")) providers.push("youtube");
+  if (!fresh.has("deezer")) providers.push("deezer");
   for (const provider of providers) {
     await env.CRAWL_QUEUE.send({ artist_id: artistId, provider });
   }
@@ -583,6 +585,7 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
       youtubeChannelId: identity.links.youtube_channel_ids[0] || null,
       instagram: identity.links.instagram || null,
       tiktok: identity.links.tiktok || null,
+      deezerId: identity.links.deezer_id || null,
       markCrawled: identity.status !== "error",
     }, now, 0);
     if (identity.status === "ok" && identity.links._mbid) {
@@ -608,6 +611,7 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
     tiktok: String(row.tiktok_handle || ""),
     apple_id: String(row.apple_id || ""),
     youtube_channel_id: String(row.youtube_channel_id || ""),
+    deezer_id: String(row.deezer_id || ""),
   };
   if (provider === "spotify" && !links.spotify_id) return { ok: true, detail: `${row.name} | spotify=unavailable` };
   if (provider === "instagram" && !links.instagram) return { ok: true, detail: `${row.name} | instagram=unavailable` };
@@ -618,7 +622,14 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   else if (provider === "instagram") saved = await instagram(links.instagram);
   else if (provider === "tiktok") saved = await tiktok(links.tiktok);
   else if (provider === "apple") saved = await apple(String(row.name), links.apple_id);
-  else saved = await youtube(String(row.name), links.youtube_channel_id, env.YOUTUBE_API_KEY || "");
+  else if (provider === "deezer") {
+    try {
+      saved = await fetchDeezer(String(row.name), links.deezer_id);
+    } catch (error) {
+      if (error instanceof DeezerBusy) throw new RetryableFetch(retryDelaySeconds(null), error.message);
+      throw error;
+    }
+  } else saved = await youtube(String(row.name), links.youtube_channel_id, env.YOUTUBE_API_KEY || "");
   if (saved.forbidden) await blockApple(env.DB, now);
   const relatedCap = provider === "spotify" ? numberSetting(env.RELATED_AUTOTRACK_CAP, 25, 500) : 0;
   const written = await saveSource(env.DB, row, saved, now, relatedCap);
