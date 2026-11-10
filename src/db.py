@@ -153,6 +153,13 @@ class SqliteDatabase:
             self.conn.rollback()
             raise
 
+    async def query_batch(self, statements: list[tuple[str, tuple]]) -> list[list[dict]]:
+        """Several reads. Local sqlite has no network round trip, so each runs in order."""
+        found = []
+        for sql, params in statements:
+            found.append(await self.query(sql, params))
+        return found
+
 
 class D1Database:
     """Await the D1 binding. ``prepare`` and ``bind`` are sync; ``run`` and ``all`` are promises."""
@@ -194,6 +201,27 @@ class D1Database:
             prepared.append(await self._statement(sql, params))
         await _await(batch_fn(prepared))
 
+    async def query_batch(self, statements: list[tuple[str, tuple]]) -> list[list[dict]]:
+        """One D1 round trip for many reads. ``prepare`` and ``bind`` stay sync."""
+        if not statements:
+            return []
+        batch_fn = getattr(self.binding, "batch", None)
+        if batch_fn is None:
+            found = []
+            for sql, params in statements:
+                found.append(await self.query(sql, params))
+            return found
+        prepared = []
+        for sql, params in statements:
+            prepared.append(await self._statement(sql, params))
+        results = await _await(batch_fn(prepared))
+        found = []
+        for result in list(results or []):
+            found.append([_row_dict(row) for row in _result_rows(result)])
+        if len(found) != len(statements):
+            raise RuntimeError("D1 batch returned a different number of results")
+        return found
+
 
 # Bump this when a new file is added under src/migrations. A database that
 # already has this version skips the per-file probes.
@@ -207,6 +235,35 @@ _MIGRATED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 def missing_table(exc: BaseException) -> bool:
     """True when a summary table is not created yet. A D1 limit error is not this."""
     return "no such table" in str(exc).lower()
+
+
+async def read_many(db, statements: list[tuple[str, tuple]]) -> list:
+    """Rows for every statement, or the exception that statement raised.
+
+    One ``query_batch`` call is a single D1 round trip. If that call fails, each
+    statement is tried on its own so a missing table does not blank the rest.
+    """
+    if not statements:
+        return []
+    batch = getattr(db, "query_batch", None)
+    if batch is not None and len(statements) > 1:
+        try:
+            found = await batch(statements)
+        except Exception as exc:
+            log_read_failure("batched read", exc)
+            found = None
+        else:
+            found = list(found or [])
+            if len(found) == len(statements):
+                return found
+            log_read_failure("batched read", RuntimeError("D1 batch returned a different number of results"))
+    found = []
+    for sql, params in statements:
+        try:
+            found.append(await db.query(sql, params))
+        except Exception as exc:
+            found.append(exc)
+    return found
 
 
 def log_read_failure(scope: str, exc: BaseException) -> None:

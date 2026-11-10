@@ -16,10 +16,10 @@ from analytics import (
     normalize_name,
     release_years,
 )
-from charts import CHARTS_EMPTY, load_artist_charts
-from db import log_read_failure, missing_table, parse_utc, utc_now
+from charts import CHARTS_EMPTY, artist_chart_statements, charts_from_reads
+from db import log_read_failure, missing_table, parse_utc, read_many, utc_now
 from models import make_item
-from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
+from scores import SCORE_EMPTY, SCORE_FORMULA, artist_score_statement, load_artist_score, load_scores, score_from_counts
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
 AUDIENCE = {
@@ -1467,37 +1467,46 @@ async def load_deezer_card(db, artist_id: int, name: str | None, artist: dict | 
             identity = None
     if failed or not _stored_deezer_id(identity):
         return present_deezer_card(str(name or ""), identity, None, [], [], failed=failed)
-    fans = None
-    tracks: list[dict] = []
-    releases: list[dict] = []
-    try:
-        fans = await db.query_one(DEEZER_FANS_SQL, (artist_id,))
-    except Exception as exc:
-        failed = _deezer_read_failed(exc) or failed
-    if not failed:
-        try:
-            tracks = await db.query(DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
-        except Exception as exc:
-            failed = _deezer_read_failed(exc) or failed
-            tracks = []
-    if not failed:
-        try:
-            releases = await db.query(DEEZER_RELEASES_SQL, (artist_id, 20))
-        except Exception as exc:
-            failed = _deezer_read_failed(exc) or failed
-            releases = []
+    # Fans, tracks, and releases are independent. One batch, not three round trips.
+    # A real failure still blanks the card. A database without these tables does not.
+    values = await read_many(
+        db,
+        [
+            (DEEZER_FANS_SQL, (artist_id,)),
+            (DEEZER_TRACKS_SQL, (artist_id, artist_id, 10)),
+            (DEEZER_RELEASES_SQL, (artist_id, 20)),
+        ],
+    )
+    rows: list[list[dict]] = []
+    for value in values:
+        if isinstance(value, BaseException):
+            failed = _deezer_read_failed(value) or failed
+            rows.append([])
+        else:
+            rows.append(list(value or []))
     if failed:
         return present_deezer_card(str(name or ""), identity, None, [], [], failed=True)
-    return present_deezer_card(str(name or ""), identity, fans, tracks or [], releases or [], failed=False)
+    fans = rows[0][0] if rows[0] else None
+    return present_deezer_card(str(name or ""), identity, fans, rows[1], rows[2], failed=False)
+
+
+def _logged_rows(scope: str, value) -> list[dict] | None:
+    """Rows from ``read_many``. None means that statement failed and was logged."""
+    if isinstance(value, BaseException):
+        log_read_failure(scope, value)
+        return None
+    return list(value or [])
 
 
 async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     """Snapshots, related edges, and sightings for one known artists row. No network.
 
-    Audience points are read first. ``on_growth`` runs before the other reads so a
-    later failure or a cancelled budget can still keep the series already stored.
-    The Deezer card is not read here. The artist page loads it afterwards so a
-    slow or failed card cannot discard this history.
+    Audience points are one indexed read, reported through ``on_growth`` before
+    anything else. The remaining cards are a single batch: each used to be its
+    own D1 round trip, and the sum of those waits exceeded the page budget once
+    a few dozen extra snapshot rows had to be decoded on every trip. The Deezer
+    card is not in this batch. The artist page loads it afterwards so a slow
+    card cannot discard this history.
     """
     artist_id = int(artist["id"])
     growth_failed = False
@@ -1524,94 +1533,84 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
                 "growth": history["growth"],
             }
         )
-    try:
-        related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
-    except Exception as exc:
-        log_read_failure("related edges", exc)
-        related = []
-    try:
-        sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
-    except Exception as exc:
-        log_read_failure("content sightings", exc)
-        sightings = []
-    playlists = None
-    playlists_failed = False
-    try:
-        playlists = await db.query(PLAYLIST_SQL, (artist_id, PLAYLIST_READ_LIMIT))
-    except Exception as exc:
-        playlists_failed = True
-        log_read_failure("playlists", exc)
+    from momentum import MOMENTUM_EMPTY, MOMENTUM_ROW_CAP, WINDOW_7D, _MOMENTUM_SQL, build_momentum
+
+    moment = datetime.now(timezone.utc)
+    cutoff = utc_now(moment - timedelta(seconds=WINDOW_7D))
+    charts = artist_chart_statements(artist_id)
+    labeled = [
+        ("related edges", RELATED_SQL, (artist_id, RELATED_READ_LIMIT)),
+        ("content sightings", SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT)),
+        ("playlists", PLAYLIST_SQL, (artist_id, PLAYLIST_READ_LIMIT)),
+        ("tracks", TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT)),
+        ("momentum", _MOMENTUM_SQL, (artist_id, cutoff) * 5 + (MOMENTUM_ROW_CAP,)),
+        ("alerts", ALERT_SQL, (artist_id, ALERT_READ_LIMIT)),
+        ("musicbrainz releases", RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT)),
+        ("posting times", EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT)),
+        ("release sightings", RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT)),
+    ]
+    body_count = len(labeled)
+    labeled.extend(("chart positions", sql, params) for sql, params in charts)
+    score_sql, score_params = artist_score_statement(artist_id)
+    labeled.append(("audience score", score_sql, score_params))
+    raw = await read_many(db, [(sql, params) for _scope, sql, params in labeled])
+    loaded = [
+        _logged_rows(scope, value)
+        for (scope, _sql, _params), value in zip(labeled[:body_count], raw[:body_count])
+    ]
+    chart_values = [
+        _logged_rows(scope, value)
+        for (scope, _sql, _params), value in zip(labeled[body_count:-1], raw[body_count:-1])
+    ]
+    score_value = raw[-1]
+    related = loaded[0] or []
+    sightings = loaded[1] or []
+    playlists = loaded[2]
+    track_rows = loaded[3]
+    momentum_rows = loaded[4]
+    alert_rows = loaded[5]
+    release_rows = loaded[6]
+    posting_rows = loaded[7]
+    release_sightings = loaded[8]
     history["available"] = bool(rows or related or sightings)
     history["related"] = present_related(related)
     history["sightings"] = present_sightings(sightings)
-    if playlists_failed:
+    if playlists is None:
         history["playlists"] = []
         history["playlists_reason"] = "Data temporarily unavailable. Stored playlists could not be read on this request."
     else:
-        history["playlists"] = present_playlists(playlists or [])
+        history["playlists"] = present_playlists(playlists)
         history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
-    track_rows = None
-    tracks_failed = False
-    try:
-        track_rows = await db.query(TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT))
-    except Exception as exc:
-        tracks_failed = True
-        log_read_failure("tracks", exc)
-    if tracks_failed:
+    if track_rows is None:
         history["tracks"] = []
         history["tracks_reason"] = TRACKS_READ_ERROR
     else:
-        history["tracks"] = present_tracks(track_rows or [])
+        history["tracks"] = present_tracks(track_rows)
         history["tracks_reason"] = None if history["tracks"] else TRACKS_EMPTY
-    momentum = None
-    momentum_failed = False
-    try:
-        from momentum import MOMENTUM_EMPTY, load_momentum
-
-        momentum = await load_momentum(db, artist_id)
-    except Exception as exc:
-        momentum_failed = True
-        log_read_failure("momentum", exc)
-    if momentum_failed:
+    if momentum_rows is None:
         history["momentum"] = []
         history["momentum_reason"] = "Data temporarily unavailable. Stored momentum could not be read on this request."
     else:
-        history["momentum"] = momentum or []
+        history["momentum"] = build_momentum(momentum_rows, moment)
         history["momentum_reason"] = None if history["momentum"] else MOMENTUM_EMPTY
-    alert_rows = None
-    alerts_failed = False
-    try:
-        alert_rows = await db.query(ALERT_SQL, (artist_id, ALERT_READ_LIMIT))
-    except Exception as exc:
-        alerts_failed = True
-        log_read_failure("alerts", exc)
-    if alerts_failed:
+    if alert_rows is None:
         history["alerts"] = []
         history["alerts_reason"] = "Data temporarily unavailable. Stored alerts could not be read on this request."
     else:
-        history["alerts"] = present_alerts(alert_rows or [])
+        history["alerts"] = present_alerts(alert_rows)
         history["alerts_reason"] = None if history["alerts"] else ALERTS_EMPTY
-    release_rows = None
-    releases_failed = False
-    try:
-        release_rows = await db.query(RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT))
-    except Exception as exc:
-        releases_failed = True
-        log_read_failure("musicbrainz releases", exc)
+    releases_failed = release_rows is None
     if releases_failed:
         history["releases"] = []
         history["releases_reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
     else:
-        history["releases"] = present_releases(release_rows or [])
+        history["releases"] = present_releases(release_rows)
         history["releases_reason"] = None if history["releases"] else RELEASES_EMPTY
-    history["posting"] = await _read_posting(db, artist_id)
-    release_sightings = None
-    release_sightings_failed = False
-    try:
-        release_sightings = await db.query(RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT))
-    except Exception as exc:
-        release_sightings_failed = True
-        log_read_failure("release sightings", exc)
+    if posting_rows is None:
+        history["posting"] = empty_posting_patterns(POSTING_READ_ERROR)
+    else:
+        history["posting"] = build_posting_patterns(posting_rows)
+    release_sightings_failed = release_sightings is None
     calendar_rows = [
         {
             "title": release.get("title"),
@@ -1633,26 +1632,27 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
             history["calendar"]["reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
         else:
             history["calendar"]["reason"] = "Data temporarily unavailable. Stored Apple, Spotify, and Deezer releases could not be read on this request."
-    chart_rows = None
-    charts_failed = False
-    try:
-        chart_rows = await load_artist_charts(db, artist_id)
-    except Exception as exc:
-        charts_failed = True
-        log_read_failure("chart positions", exc)
-    if charts_failed:
+    if any(value is None for value in chart_values):
         history["charts"] = []
         history["charts_reason"] = "Data temporarily unavailable. Stored chart positions could not be read on this request."
     else:
-        history["charts"] = chart_rows or []
+        history["charts"] = charts_from_reads(*chart_values)
         history["charts_reason"] = None if history["charts"] else CHARTS_EMPTY
     score = None
     score_failed = False
-    try:
-        score = await load_artist_score(db, artist_id)
-    except Exception as exc:
-        score_failed = True
-        log_read_failure("audience score", exc)
+    if isinstance(score_value, BaseException):
+        # 0011 is what creates metric_latest. Until then the snapshot window still scores.
+        if missing_table(score_value):
+            try:
+                score = await load_artist_score(db, artist_id)
+            except Exception as exc:
+                score_failed = True
+                log_read_failure("audience score", exc)
+        else:
+            score_failed = True
+            log_read_failure("audience score", score_value)
+    else:
+        score = score_from_counts(list(score_value or []))
     if score_failed or score is None:
         history["score_text"] = None
         history["score_components"] = []

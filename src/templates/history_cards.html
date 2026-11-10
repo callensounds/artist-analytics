@@ -309,7 +309,7 @@
             {% endfor %}
         </ol>
         {% else %}
-        <p class="text-slate-400 text-sm">No related artists have been stored yet.</p>
+        <p class="text-slate-400 text-sm">{{ history.related_reason or "No related artists have been stored yet." }}</p>
         {% endif %}
     </section>
     <section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700">
@@ -344,7 +344,7 @@
             </table>
         </div>
         {% else %}
-        <p class="text-slate-400 text-sm">No releases or posts have been stored yet.</p>
+        <p class="text-slate-400 text-sm">{{ history.sightings_reason or "No releases or posts have been stored yet." }}</p>
         {% endif %}
     </section>
 </div>

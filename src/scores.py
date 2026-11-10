@@ -177,6 +177,11 @@ async def load_scores(db, artist_ids: list[int]) -> dict[int, dict]:
     return _group_scores(rows)
 
 
+def artist_score_statement(artist_id: int) -> tuple[str, tuple]:
+    """Latest exact counts for one artist. The legacy snapshot scan stays in ``load_scores``."""
+    return (_latest_sql("metric_latest.artist_id = ? AND"), (artist_id,))
+
+
 async def load_artist_score(db, artist_id: int) -> dict:
     found = await load_scores(db, [artist_id])
     score = found.get(artist_id)
