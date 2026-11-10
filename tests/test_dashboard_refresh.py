@@ -106,6 +106,124 @@ def test_dashboard_skips_live_fetch_when_snapshots_are_fresh(monkeypatch, tmp_pa
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
 
 
+def test_dashboard_shows_an_honest_empty_state_when_nothing_is_stored(monkeypatch, tmp_path):
+    path = tmp_path / "empty.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    database = SqliteDatabase(str(path))
+
+    async def seed():
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Clairo', 'clairo', 'search', 1, '2026-11-01T00:00:00Z')
+            """
+        )
+
+    asyncio.run(seed())
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    assert page.status_code == 200
+    assert "No exact audience count has been stored yet." in page.text
+    assert "Stored growth could not be read" not in page.text
+    assert "1.2M" not in page.text
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_dashboard_keeps_stored_growth_when_a_later_read_fails(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "clocks.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    stamp = utc_now(datetime.now(timezone.utc) - timedelta(minutes=30))
+    _seed(SqliteDatabase(str(path)), spotify_at=stamp, instagram_at=stamp, apple_at=stamp, crawled_at=stamp)
+    original = SqliteDatabase.query
+
+    async def explode_clocks(self, sql, params=()):
+        if "source_freshness" in sql:
+            raise RuntimeError("D1_ERROR: token=super-secret-value no such column: captured_at")
+        return await original(self, sql, params)
+
+    async def no_live(*args, **kwargs):
+        return {"sources": [], "patterns": {}, "insights": []}
+
+    monkeypatch.setattr(SqliteDatabase, "query", explode_clocks)
+    monkeypatch.setattr(main, "collect_artist", no_live)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    logged = capsys.readouterr().out
+    assert page.status_code == 200
+    assert "2,000,000" in page.text
+    assert "Stored growth could not be read" not in page.text
+    assert "dashboard clocks" in logged
+    assert "no such column: captured_at" in logged
+    assert "super-secret-value" not in logged
+    assert "super-secret-value" not in page.text
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_dashboard_keeps_stored_growth_when_the_read_budget_expires(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "budget.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    stamp = utc_now(datetime.now(timezone.utc) - timedelta(minutes=30))
+    _seed(SqliteDatabase(str(path)), spotify_at=stamp, instagram_at=stamp, apple_at=stamp, crawled_at=stamp)
+    original = SqliteDatabase.query
+
+    async def slow_related(self, sql, params=()):
+        if "related_edges" in sql:
+            await asyncio.sleep(1)
+        return await original(self, sql, params)
+
+    monkeypatch.setattr(SqliteDatabase, "query", slow_related)
+    monkeypatch.setattr(main, "GROWTH_READ_TIMEOUT_S", 0.2)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    logged = capsys.readouterr().out
+    assert page.status_code == 200
+    assert "2,000,000" in page.text
+    assert "Stored growth could not be read" not in page.text
+    assert "TimeoutError" in logged
+    assert "dashboard plan" in logged
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_dashboard_logs_a_failed_growth_read_without_the_secret(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "growth-fail.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    stamp = utc_now(datetime.now(timezone.utc) - timedelta(minutes=30))
+    _seed(SqliteDatabase(str(path)), spotify_at=stamp, instagram_at=stamp, apple_at=stamp, crawled_at=stamp)
+    original = SqliteDatabase.query
+
+    async def explode_snapshots(self, sql, params=()):
+        if "FROM metric_snapshots" in sql and "LIMIT" in sql:
+            raise RuntimeError("D1_ERROR: token=super-secret-value snapshot read failed")
+        return await original(self, sql, params)
+
+    monkeypatch.setattr(SqliteDatabase, "query", explode_snapshots)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/dashboard", params={"artist": "Clairo"})
+    logged = capsys.readouterr().out
+    assert page.status_code == 200
+    assert "Stored growth could not be read on this request." in page.text
+    assert '{"datasets": []}' in page.text
+    assert page.text.count("Stored growth could not be read on this request.") == 1
+    assert "growth snapshots" in logged
+    assert "RuntimeError" in logged
+    assert "super-secret-value" not in logged
+    assert "super-secret-value" not in page.text
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
 def test_dashboard_fetches_only_the_stale_provider(monkeypatch, tmp_path):
     path = tmp_path / "stale.sqlite"
     monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))

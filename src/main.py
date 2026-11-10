@@ -31,8 +31,10 @@ from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
 from analytics import normalize_name, parse_calendar_period
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
+from db import log_read_failure
 from history import (
     ALERTS_EMPTY,
+    GROWTH_READ_ERROR,
     empty_history,
     find_artist,
     find_artist_by_id,
@@ -154,6 +156,34 @@ def _d1_outage(exc: BaseException) -> bool:
     return "D1_ERROR" in text or "exceeded D1" in text or "row read limit" in text
 
 
+def _plan_from_growth(saved: dict, now: datetime, *, youtube_key: bool) -> dict | None:
+    """A plan that keeps audience points already read when a later read is cancelled."""
+    growth = saved.get("growth") if saved else None
+    if not isinstance(growth, dict):
+        return None
+    reason = saved.get("reason") or "No exact audience count has been stored yet."
+    history = empty_history(reason)
+    history["growth"] = growth
+    history["artist_id"] = saved.get("artist_id")
+    history["name"] = saved.get("name")
+    if growth.get("datasets"):
+        history["available"] = True
+        history["reason"] = None
+    else:
+        history["reason"] = reason
+    clocks: dict = {}
+    if not youtube_key:
+        clocks["youtube"] = now
+    cards = cards_from_history(history, clocks, now, [], youtube_key=youtube_key)
+    return {
+        "artist": {"id": saved.get("artist_id"), "name": saved.get("name") or ""},
+        "history": history,
+        "live": [],
+        "cards": cards,
+        "clocks": clocks,
+    }
+
+
 def render_source_cards(sources: list[dict] | None) -> str:
     """Source cards are plain strings. Jinja compiling that loop was the slow template step."""
     parts = ['<div class="grid lg:grid-cols-2 gap-6">']
@@ -264,8 +294,9 @@ async def read_dashboard_history(name: str, env) -> dict:
         )
     try:
         return await asyncio.wait_for(load_dashboard_history(db, name), GROWTH_READ_TIMEOUT_S)
-    except Exception:
-        return empty_history(_unavailable("Stored growth could not be read on this request."))
+    except Exception as exc:
+        log_read_failure("dashboard growth", exc)
+        return empty_history(GROWTH_READ_ERROR)
 
 
 async def get_current_user(request: Request):
@@ -963,14 +994,16 @@ async def dashboard(request: Request, artist: str | None = None):
     youtube_key = bool(env_get(env, "YOUTUBE_API_KEY"))
     db = await _open_read_db(env)
     plan = None
+    kept_growth: dict = {}
     if db is not None:
         try:
             plan = await asyncio.wait_for(
-                load_dashboard_plan(db, query, now, youtube_key=youtube_key),
+                load_dashboard_plan(db, query, now, youtube_key=youtube_key, on_growth=kept_growth.update),
                 GROWTH_READ_TIMEOUT_S,
             )
-        except Exception:
-            plan = None
+        except Exception as exc:
+            log_read_failure("dashboard plan", exc)
+            plan = _plan_from_growth(kept_growth, now, youtube_key=youtube_key)
     if db is None:
         history = empty_history(
             "Growth is stored by the crawler when D1 is bound. This page does not write history."
@@ -978,9 +1011,9 @@ async def dashboard(request: Request, artist: str | None = None):
         bundle = queued_bundle()
         bundle["insights"] = [history["reason"]]
     elif plan is None:
-        history = empty_history(_unavailable("Stored growth could not be read on this request."))
+        history = empty_history(GROWTH_READ_ERROR)
         bundle = queued_bundle()
-        bundle["insights"] = [history["reason"]]
+        bundle["insights"] = ["No provider was fetched on this request."]
     elif plan["artist"] is None:
         history = plan["history"]
         bundle = queued_bundle()

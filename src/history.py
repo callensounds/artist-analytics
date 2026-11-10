@@ -17,7 +17,7 @@ from analytics import (
     release_years,
 )
 from charts import CHARTS_EMPTY, load_artist_charts
-from db import missing_table, parse_utc, utc_now
+from db import log_read_failure, missing_table, parse_utc, utc_now
 from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
@@ -52,6 +52,8 @@ TRACKS_EMPTY = (
     "Nothing here is estimated."
 )
 TRACKS_READ_ERROR = "Data temporarily unavailable. Stored tracks could not be read on this request."
+GROWTH_EMPTY = "No exact audience count has been stored yet."
+GROWTH_READ_ERROR = "Data temporarily unavailable. Stored growth could not be read on this request."
 ALERT_READ_LIMIT = 20
 ALERTS_PAGE_LIMIT = 40
 RELEASE_READ_LIMIT = 50
@@ -1069,7 +1071,8 @@ async def _safe_rows(db, sql: str, params: tuple) -> list[dict] | None:
 async def _read_posting(db, artist_id: int) -> dict:
     try:
         posting_rows = await db.query(EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
+        log_read_failure("posting times", exc)
         return empty_posting_patterns(POSTING_READ_ERROR)
     return build_posting_patterns(posting_rows or [])
 
@@ -1175,23 +1178,55 @@ async def find_artist_by_id(db, artist_id: int) -> dict | None:
     )
 
 
-async def load_history_for_artist(db, artist: dict) -> dict:
-    """Snapshots, related edges, and sightings for one known artists row. No network."""
+async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
+    """Snapshots, related edges, and sightings for one known artists row. No network.
+
+    Audience points are read first. ``on_growth`` runs before the other reads so a
+    later failure or a cancelled budget can still keep the series already stored.
+    """
     artist_id = int(artist["id"])
-    rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
-    related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
-    sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
+    growth_failed = False
+    try:
+        rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
+    except Exception as exc:
+        growth_failed = True
+        rows = []
+        log_read_failure("growth snapshots", exc)
+    history = empty_history(GROWTH_EMPTY)
+    history["artist_id"] = artist_id
+    history["name"] = artist.get("name")
+    history["growth"] = build_growth(rows)
+    if growth_failed:
+        history["reason"] = GROWTH_READ_ERROR
+    elif history["growth"]["datasets"]:
+        history["reason"] = None
+    if on_growth is not None:
+        on_growth(
+            {
+                "artist_id": artist_id,
+                "name": artist.get("name"),
+                "reason": history["reason"],
+                "growth": history["growth"],
+            }
+        )
+    try:
+        related = await db.query(RELATED_SQL, (artist_id, RELATED_READ_LIMIT))
+    except Exception as exc:
+        log_read_failure("related edges", exc)
+        related = []
+    try:
+        sightings = await db.query(SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT))
+    except Exception as exc:
+        log_read_failure("content sightings", exc)
+        sightings = []
     playlists = None
     playlists_failed = False
     try:
         playlists = await db.query(PLAYLIST_SQL, (artist_id, PLAYLIST_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
         playlists_failed = True
-    history = empty_history("No exact audience count has been stored yet.")
+        log_read_failure("playlists", exc)
     history["available"] = bool(rows or related or sightings)
-    history["artist_id"] = artist_id
-    history["name"] = artist.get("name")
-    history["growth"] = build_growth(rows)
     history["related"] = present_related(related)
     history["sightings"] = present_sightings(sightings)
     if playlists_failed:
@@ -1204,8 +1239,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     tracks_failed = False
     try:
         track_rows = await db.query(TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
         tracks_failed = True
+        log_read_failure("tracks", exc)
     if tracks_failed:
         history["tracks"] = []
         history["tracks_reason"] = TRACKS_READ_ERROR
@@ -1218,8 +1254,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         from momentum import MOMENTUM_EMPTY, load_momentum
 
         momentum = await load_momentum(db, artist_id)
-    except Exception:
+    except Exception as exc:
         momentum_failed = True
+        log_read_failure("momentum", exc)
     if momentum_failed:
         history["momentum"] = []
         history["momentum_reason"] = "Data temporarily unavailable. Stored momentum could not be read on this request."
@@ -1230,8 +1267,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     alerts_failed = False
     try:
         alert_rows = await db.query(ALERT_SQL, (artist_id, ALERT_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
         alerts_failed = True
+        log_read_failure("alerts", exc)
     if alerts_failed:
         history["alerts"] = []
         history["alerts_reason"] = "Data temporarily unavailable. Stored alerts could not be read on this request."
@@ -1242,8 +1280,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     releases_failed = False
     try:
         release_rows = await db.query(RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
         releases_failed = True
+        log_read_failure("musicbrainz releases", exc)
     if releases_failed:
         history["releases"] = []
         history["releases_reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
@@ -1255,8 +1294,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     release_sightings_failed = False
     try:
         release_sightings = await db.query(RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT))
-    except Exception:
+    except Exception as exc:
         release_sightings_failed = True
+        log_read_failure("release sightings", exc)
     calendar_rows = [
         {
             "title": release.get("title"),
@@ -1282,8 +1322,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     charts_failed = False
     try:
         chart_rows = await load_artist_charts(db, artist_id)
-    except Exception:
+    except Exception as exc:
         charts_failed = True
+        log_read_failure("chart positions", exc)
     if charts_failed:
         history["charts"] = []
         history["charts_reason"] = "Data temporarily unavailable. Stored chart positions could not be read on this request."
@@ -1294,8 +1335,9 @@ async def load_history_for_artist(db, artist: dict) -> dict:
     score_failed = False
     try:
         score = await load_artist_score(db, artist_id)
-    except Exception:
+    except Exception as exc:
         score_failed = True
+        log_read_failure("audience score", exc)
     if score_failed or score is None:
         history["score_text"] = None
         history["score_components"] = []
@@ -1306,8 +1348,6 @@ async def load_history_for_artist(db, artist: dict) -> dict:
         history["score_components"] = score["components"]
         history["score_formula"] = score["formula"]
         history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
-    if history["growth"]["datasets"]:
-        history["reason"] = None
     return history
 
 

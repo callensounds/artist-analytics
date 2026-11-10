@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Assignment-style secrets sometimes land in a driver message. The value is not logged.
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(password|secret|authorization|cookie|api[_-]?key|bearer|token)\s*[=:]\s*\S+"
+)
 
 # SQL lives next to this module. The Worker bundle is src/, not the repo root.
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
@@ -200,6 +207,26 @@ _MIGRATED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 def missing_table(exc: BaseException) -> bool:
     """True when a summary table is not created yet. A D1 limit error is not this."""
     return "no such table" in str(exc).lower()
+
+
+def log_read_failure(scope: str, exc: BaseException) -> None:
+    """One line when a stored read is swallowed. No SQL parameters, headers, or secrets."""
+    detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+    detail = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[redacted]", detail)
+    if len(detail) > 300:
+        detail = detail[:300]
+    print(
+        json.dumps(
+            {
+                "message": "stored read failed",
+                "scope": " ".join(str(scope).split())[:80],
+                "error": type(exc).__name__,
+                "detail": detail,
+            },
+            default=str,
+        ),
+        flush=True,
+    )
 
 
 def _migrate_key(db):

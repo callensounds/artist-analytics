@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 import main
 from crawl import reset_pool
-from db import LATEST_MIGRATION, MIGRATIONS, SqliteDatabase, migrate, split_sql
+from db import LATEST_MIGRATION, MIGRATIONS, SqliteDatabase, log_read_failure, migrate, split_sql
 from momentum import _MOMENTUM_SQL
 from scores import _latest_sql
 
@@ -17,6 +17,16 @@ def _plan(database: SqliteDatabase, sql: str, params: tuple = ()) -> str:
         return " ".join(str(row.get("detail") or "") for row in rows)
 
     return asyncio.run(run())
+
+
+def test_read_failure_log_names_the_error_and_drops_secrets(capsys):
+    log_read_failure("growth snapshots", RuntimeError("D1_ERROR: token=super-secret-value no such column: captured_at"))
+    line = capsys.readouterr().out
+    assert "stored read failed" in line
+    assert "growth snapshots" in line
+    assert "RuntimeError" in line
+    assert "no such column: captured_at" in line
+    assert "super-secret-value" not in line
 
 
 def test_migration_statements_keep_triggers_intact():

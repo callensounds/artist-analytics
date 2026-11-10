@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from analytics import WEEKDAYS, build_insights, build_patterns, hour_labels, normalize_name
-from db import missing_table, parse_utc
+from db import log_read_failure, missing_table, parse_utc
 
 # Six hours: long enough that a crawled artist is not fetched again on every
 # page view, short enough that a missed crawl still refreshes the same day.
@@ -274,8 +274,12 @@ async def provider_clocks(db, artist: dict) -> dict[str, datetime | None]:
     return clocks
 
 
-async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool) -> dict:
-    """Artist row, history, and the live-provider list. No outbound fetches."""
+async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool, on_growth=None) -> dict:
+    """Artist row, history, and the live-provider list. No outbound fetches.
+
+    ``on_growth`` is invoked as soon as the audience series is built, before the
+    other stored reads. A clock-table error does not discard that series.
+    """
     from history import empty_history, load_history_for_artist
 
     normalized = normalize_name(name)
@@ -286,8 +290,12 @@ async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool
         queued = queued_bundle()
         history = empty_history(queued["reason"])
         return {"artist": None, "history": history, "live": [], "cards": [], "clocks": {}}
-    history = await load_history_for_artist(db, artist)
-    clocks = await provider_clocks(db, artist)
+    history = await load_history_for_artist(db, artist, on_growth=on_growth)
+    try:
+        clocks = await provider_clocks(db, artist)
+    except Exception as exc:
+        log_read_failure("dashboard clocks", exc)
+        clocks = {}
     if not youtube_key:
         clocks["youtube"] = now
     live = choose_live_providers(clocks, now)
