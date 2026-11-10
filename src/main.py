@@ -29,12 +29,15 @@ from crawl import (
 from diag import diagnose
 from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
-from analytics import normalize_name, parse_calendar_period
+from analytics import empty_posting_patterns, empty_release_calendar, normalize_name, parse_calendar_period
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from db import log_read_failure
 from history import (
     ALERTS_EMPTY,
+    CALENDAR_READ_ERROR,
     GROWTH_READ_ERROR,
+    POSTING_READ_ERROR,
+    TRACKS_READ_ERROR,
     empty_history,
     find_artist,
     find_artist_by_id,
@@ -160,9 +163,11 @@ def _d1_outage(exc: BaseException) -> bool:
     return "D1_ERROR" in text or "exceeded D1" in text or "row read limit" in text
 
 
-def _plan_from_growth(saved: dict, now: datetime, *, youtube_key: bool) -> dict | None:
-    """A plan that keeps audience points already read when a later read is cancelled."""
-    growth = saved.get("growth") if saved else None
+def _history_from_saved(saved: dict | None) -> dict | None:
+    """Audience points already read, when a later read is cancelled or fails."""
+    if not isinstance(saved, dict):
+        return None
+    growth = saved.get("growth")
     if not isinstance(growth, dict):
         return None
     reason = saved.get("reason") or "No exact audience count has been stored yet."
@@ -175,6 +180,27 @@ def _plan_from_growth(saved: dict, now: datetime, *, youtube_key: bool) -> dict 
         history["reason"] = None
     else:
         history["reason"] = reason
+    # These reads did not finish. Empty-catalog copy would claim the rows are not stored.
+    unread = "Data temporarily unavailable. Stored {0} could not be read on this request."
+    history["related_reason"] = unread.format("related artists")
+    history["sightings_reason"] = unread.format("timeline rows")
+    history["playlists_reason"] = unread.format("playlists")
+    history["tracks_reason"] = TRACKS_READ_ERROR
+    history["momentum_reason"] = unread.format("momentum")
+    history["alerts_reason"] = unread.format("alerts")
+    history["releases_reason"] = unread.format("MusicBrainz releases")
+    history["posting"] = empty_posting_patterns(POSTING_READ_ERROR)
+    history["calendar"] = empty_release_calendar(CALENDAR_READ_ERROR)
+    history["charts_reason"] = unread.format("chart positions")
+    history["score_reason"] = unread.format("audience counts")
+    return history
+
+
+def _plan_from_growth(saved: dict, now: datetime, *, youtube_key: bool) -> dict | None:
+    """A plan that keeps audience points already read when a later read is cancelled."""
+    history = _history_from_saved(saved)
+    if history is None:
+        return None
     clocks: dict = {}
     if not youtube_key:
         clocks["youtube"] = now
@@ -953,11 +979,18 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
     if not isinstance(loaded, tuple):
         return loaded
     user, artist, db = loaded
+    kept: dict = {}
     try:
-        history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
-    except Exception:
-        history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
-        return user, artist, history
+        history = await asyncio.wait_for(
+            load_history_for_artist(db, artist, on_growth=kept.update),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("artist history", exc)
+        history = _history_from_saved(kept)
+        if history is None:
+            history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
+    # The card has its own short budget. A stalled history read must not skip it.
     history["deezer"] = await _read_deezer_card(db, artist)
     return user, artist, history
 

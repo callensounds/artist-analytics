@@ -520,6 +520,94 @@ def test_deezer_card_timeout_keeps_full_history(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
 
 
+async def _seed_page(database: SqliteDatabase) -> int:
+    artist_id = await _seed_spotify_history(database, deezer_id="27")
+    await database.execute("UPDATE artists SET deezer_nb_album = 2 WHERE id = ?", (artist_id,))
+    await database.execute(
+        """
+        INSERT INTO related_edges
+            (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
+        VALUES (?, 'snail', 'Snail Mail', 'spotify', 1, '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')
+        """,
+        (artist_id,),
+    )
+    await database.execute(
+        """
+        INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+        VALUES (?, 'deezer', 'Fans', 4000, '4000', '2026-11-01T00:00:00Z')
+        """,
+        (artist_id,),
+    )
+    return artist_id
+
+
+def test_artist_page_batches_the_tail_and_deezer_card(monkeypatch, tmp_path):
+    """Each stored read used to be its own D1 round trip. Fourteen of them miss a 1.5s budget.
+
+    Growth stays one indexed read so a cancelled tail can keep it. Everything else
+    on the artist page, including the Deezer card, is one batch and still renders.
+    """
+    path = tmp_path / "batched.sqlite"
+    artist_id = asyncio.run(_seed_page(SqliteDatabase(str(path))))
+    original = SqliteDatabase.query
+    batches = []
+
+    async def slow_query(self, sql, params=()):
+        await asyncio.sleep(0.25)
+        return await original(self, sql, params)
+
+    async def one_batch(self, statements):
+        batches.append(len(statements))
+        await asyncio.sleep(0.25)
+        return [await original(self, sql, params) for sql, params in statements]
+
+    monkeypatch.setattr(SqliteDatabase, "query", slow_query)
+    monkeypatch.setattr(SqliteDatabase, "query_batch", one_batch)
+    monkeypatch.setattr(main, "GROWTH_READ_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(main, "DEEZER_CARD_TIMEOUT_S", 0.5)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "Snail Mail" in page.text
+    assert "4,000" in page.text
+    assert HISTORY_UNAVAILABLE not in page.text
+    assert "Stored Deezer data could not be read" not in page.text
+    assert batches == [14, 3]
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_stalled_history_tail_keeps_growth_and_still_reads_deezer(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "stalled-tail.sqlite"
+    artist_id = asyncio.run(_seed_page(SqliteDatabase(str(path))))
+    original = SqliteDatabase.query
+
+    async def stall_batch(self, statements):
+        if any("related_edges" in sql for sql, _params in statements):
+            await asyncio.sleep(1)
+            raise AssertionError("the history tail should have been cancelled")
+        return [await original(self, sql, params) for sql, params in statements]
+
+    monkeypatch.setattr(SqliteDatabase, "query_batch", stall_batch)
+    monkeypatch.setattr(main, "GROWTH_READ_TIMEOUT_S", 0.2)
+    client = _open_page(monkeypatch, path)
+    page = client.get(f"/artist/{artist_id}")
+    assert page.status_code == 200
+    assert "+63,093 over 6h" in page.text
+    assert "2,063,093" in page.text
+    assert "Snail Mail" not in page.text
+    assert "No related artists have been stored yet." not in page.text
+    assert "Stored related artists could not be read on this request." in page.text
+    assert "4,000" in page.text
+    assert HISTORY_UNAVAILABLE not in page.text
+    logged = capsys.readouterr().out
+    assert "artist history" in logged
+    assert "TimeoutError" in logged
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
 def test_failed_deezer_card_does_not_claim_the_catalog_is_empty():
     failed = present_deezer_card("Daft Punk", {"deezer_id": "27", "deezer_nb_album": 12}, None, [], [], failed=True)
     assert failed["status"] == "unavailable"

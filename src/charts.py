@@ -335,6 +335,28 @@ async def load_stored_chart_dates(db) -> list[str]:
     return sorted(found, reverse=True)[:CHART_DATE_LIMIT]
 
 
+def artist_chart_statements(artist_id: int) -> list[tuple[str, tuple]]:
+    """Summary, points, and the latest stored day for each US chart. One batch."""
+    return [
+        (_ARTIST_CHART_SUMMARY_SQL, (artist_id,)),
+        (_ARTIST_CHART_POINTS_SQL, (artist_id,)),
+        (_SOURCE_LATEST_SQL, (CHART_SOURCES[0],)),
+        (_SOURCE_LATEST_SQL, (CHART_SOURCES[1],)),
+    ]
+
+
+def charts_from_reads(summaries, points, song_latest, album_latest) -> list[dict]:
+    """The same card ``load_artist_charts`` builds, from rows already read."""
+    latest: dict[tuple[str, str], str] = {}
+    for source, rows in ((CHART_SOURCES[0], song_latest), (CHART_SOURCES[1], album_latest)):
+        if not rows:
+            continue
+        day = valid_chart_day((rows[0] or {}).get("chart_date"))
+        if day:
+            latest[(source, "us")] = day
+    return present_chart_history(summaries or [], points or [], latest)
+
+
 async def load_artist_charts(db, artist_id: int) -> list[dict]:
     summaries = await db.query(_ARTIST_CHART_SUMMARY_SQL, (artist_id,))
     points = await db.query(_ARTIST_CHART_POINTS_SQL, (artist_id,))

@@ -134,6 +134,72 @@ def test_latest_rows_and_query_plans_do_not_scan_snapshot_history():
     assert "metric_snapshots" not in fresh_plan
 
 
+def test_d1_query_batch_is_one_round_trip_and_keeps_each_select():
+    import sqlite3
+
+    from db import D1Database
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    calls = {"batch": 0, "all": 0}
+
+    class Statement:
+        def __init__(self, sql):
+            self.sql = sql
+            self.params = ()
+
+        def bind(self, *params):
+            self.params = params
+            return self
+
+        async def all(self):
+            calls["all"] += 1
+            cursor = conn.execute(self.sql, self.params)
+            return {"results": [{key: row[key] for key in row.keys()} for row in cursor.fetchall()]}
+
+        async def run(self):
+            cursor = conn.execute(self.sql, self.params)
+            conn.commit()
+            return {"meta": {"last_row_id": cursor.lastrowid}, "results": []}
+
+    class Binding:
+        def prepare(self, sql):
+            return Statement(sql)
+
+        def batch(self, statements):
+            calls["batch"] += 1
+
+            async def run():
+                found = []
+                for statement in statements:
+                    cursor = conn.execute(statement.sql, statement.params)
+                    found.append({"results": [{key: row[key] for key in row.keys()} for row in cursor.fetchall()]})
+                return found
+
+            return run()
+
+    database = D1Database(Binding())
+
+    async def run():
+        await migrate(database)
+        await database.execute(
+            "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Clairo', 'clairo', 'search', 1, '2026-11-01T00:00:00Z')"
+        )
+        calls["all"] = 0
+        calls["batch"] = 0
+        return await database.query_batch(
+            [
+                ("SELECT name FROM artists WHERE normalized_name = ?", ("clairo",)),
+                ("SELECT COUNT(*) AS n FROM artists", ()),
+            ]
+        )
+
+    rows = asyncio.run(run())
+    assert calls == {"batch": 1, "all": 0}
+    assert rows[0][0]["name"] == "Clairo"
+    assert rows[1][0]["n"] == 1
+
+
 def test_a_second_migrate_checks_one_version(tmp_path):
     path = tmp_path / "once.sqlite"
     first = SqliteDatabase(str(path))
