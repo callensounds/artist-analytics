@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "uv sync",
     "test": "vitest run"
   },
   "devDependencies": {
