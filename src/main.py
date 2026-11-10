@@ -43,7 +43,9 @@ from history import (
     load_alert_feed,
     load_calendar_page,
     load_dashboard_history,
+    load_deezer_card,
     load_history_for_artist,
+    present_deezer_card,
     search_artists,
 )
 from http_client import HttpClient
@@ -121,6 +123,8 @@ def _memory_user(email: str) -> dict | None:
 
 # Overlaps the provider fan-out. A stuck D1 read cannot stretch the page.
 GROWTH_READ_TIMEOUT_S = 1.5
+# One stored Deezer id, then its fans, tracks, and releases. Not part of the history budget.
+DEEZER_CARD_TIMEOUT_S = 0.5
 DATA_UNAVAILABLE = "Data temporarily unavailable."
 
 
@@ -928,6 +932,21 @@ async def _resolve_stored_artist(request: Request, key: str, redirect_suffix: st
     return user, artist, db
 
 
+async def _read_deezer_card(db, artist: dict) -> dict:
+    """After history is loaded. A timeout here keeps that history and says the card could not be read."""
+    try:
+        return await asyncio.wait_for(
+            load_deezer_card(db, int(artist["id"]), artist.get("name"), artist),
+            DEEZER_CARD_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("deezer card", exc)
+        known = {"deezer_id": artist.get("deezer_id"), "deezer_nb_album": artist.get("deezer_nb_album")}
+        if "deezer_id" not in artist and "deezer_nb_album" not in artist:
+            known = None
+        return present_deezer_card(str(artist.get("name") or ""), known, None, [], [], failed=True)
+
+
 async def _load_stored_artist(request: Request, key: str, redirect_suffix: str = ""):
     """Artist row plus stored history, or a Response when the page should stop."""
     loaded = await _resolve_stored_artist(request, key, redirect_suffix)
@@ -935,12 +954,11 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
         return loaded
     user, artist, db = loaded
     try:
-        history = await asyncio.wait_for(
-            load_history_for_artist(db, artist, include_deezer_card=True),
-            GROWTH_READ_TIMEOUT_S,
-        )
+        history = await asyncio.wait_for(load_history_for_artist(db, artist), GROWTH_READ_TIMEOUT_S)
     except Exception:
         history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
+        return user, artist, history
+    history["deezer"] = await _read_deezer_card(db, artist)
     return user, artist, history
 
 
