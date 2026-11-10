@@ -165,6 +165,7 @@ describe("crawler messages", () => {
       { artist_id: 1, provider: "instagram" },
       { artist_id: 1, provider: "tiktok" },
       { artist_id: 1, provider: "apple" },
+      { artist_id: 1, provider: "deezer" },
     ]);
     for (const body of sent) {
       await handleMessage(env, body as { artist_id: number; provider: string }, new Date("2026-10-30T21:00:00Z"));

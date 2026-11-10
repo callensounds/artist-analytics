@@ -131,6 +131,12 @@ def tiktok_handle(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def deezer_artist_id(url: str) -> str | None:
+    """Numeric artist id from a public Deezer artist URL. A language prefix is allowed."""
+    match = re.search(r"deezer\.com/(?:[a-z]{2}/)?artist/(\d+)", url or "", re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def cache_key(platform: str, *parts: str) -> str:
     slug = ":".join(part.strip().casefold() for part in parts if part)
     return f"aa:{CACHE_VERSION}:{platform}:{slug or 'none'}"

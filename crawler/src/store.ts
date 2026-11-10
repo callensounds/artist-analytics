@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS artists (
     youtube_channel_id TEXT,
     instagram_handle TEXT,
     tiktok_handle TEXT,
+    deezer_id TEXT,
+    deezer_nb_album INTEGER,
     origin TEXT NOT NULL DEFAULT 'search',
     tracked INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -250,7 +252,7 @@ export function parseUtc(value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-export const LATEST_MIGRATION = "0011_read_budget.sql";
+export const LATEST_MIGRATION = "0012_deezer.sql";
 
 const MIGRATION_VERSIONS = [
   "0001_crawl.sql",
@@ -263,6 +265,7 @@ const MIGRATION_VERSIONS = [
   "0008_users.sql",
   "0009_itunes_charts.sql",
   "0010_artist_tracks.sql",
+  "0011_read_budget.sql",
   LATEST_MIGRATION,
 ];
 
@@ -400,8 +403,8 @@ function migrateKey(store: Store): object {
   return binding ?? store;
 }
 
-async function ensureColumn(store: Store, column: string, ddl: string): Promise<void> {
-  const columns = await store.all<{ name: string }>("PRAGMA table_info(crawl_state)");
+async function ensureColumn(store: Store, table: string, column: string, ddl: string): Promise<void> {
+  const columns = await store.all<{ name: string }>(`PRAGMA table_info(${table})`);
   if (!columns.some((row) => row.name === column)) {
     await store.batch([{ sql: ddl, params: [] }]);
   }
@@ -422,13 +425,16 @@ export async function migrate(store: Store): Promise<void> {
   for (const statement of SCHEMA.split(";").map((part) => part.trim()).filter(Boolean)) {
     await store.batch([{ sql: statement, params: [] }]);
   }
-  await ensureColumn(store, "apple_blocked_until", "ALTER TABLE crawl_state ADD COLUMN apple_blocked_until TEXT");
+  await ensureColumn(store, "crawl_state", "apple_blocked_until", "ALTER TABLE crawl_state ADD COLUMN apple_blocked_until TEXT");
   await ensureColumn(
     store,
+    "crawl_state",
     "alert_backfill_done",
     "ALTER TABLE crawl_state ADD COLUMN alert_backfill_done INTEGER NOT NULL DEFAULT 0",
   );
-  await ensureColumn(store, "related_tracked", "ALTER TABLE crawl_state ADD COLUMN related_tracked INTEGER");
+  await ensureColumn(store, "crawl_state", "related_tracked", "ALTER TABLE crawl_state ADD COLUMN related_tracked INTEGER");
+  await ensureColumn(store, "artists", "deezer_id", "ALTER TABLE artists ADD COLUMN deezer_id TEXT");
+  await ensureColumn(store, "artists", "deezer_nb_album", "ALTER TABLE artists ADD COLUMN deezer_nb_album INTEGER");
   for (const sql of READ_BUDGET_SQL) {
     await store.batch([{ sql, params: [] }]);
   }
@@ -450,6 +456,7 @@ const AUDIENCE = new Set([
   "tiktok\0Followers",
   "tiktok\0Likes",
   "youtube\0Subscribers",
+  "deezer\0Fans",
 ]);
 
 export interface MetricPoint {
@@ -472,6 +479,8 @@ export interface SavedSource {
   youtubeChannelId?: string | null;
   instagram?: string | null;
   tiktok?: string | null;
+  deezerId?: string | null;
+  deezerAlbumCount?: number | null;
   markCrawled?: boolean;
 }
 
@@ -538,7 +547,9 @@ export async function saveSource(
     snapshots.push([artistId, source.platform, metric.label, metric.exact, String(metric.value ?? metric.exact), stamp]);
   }
   const sightings: unknown[][] = [];
-  for (const item of (source.sightings || []).slice(0, 8)) {
+  const sightingCap = source.platform === "deezer" ? 25 : 8;
+  for (const item of (source.sightings || []).slice(0, sightingCap)) {
+    if (source.platform === "deezer" && item.precision === "time") continue;
     const external = (item.url || `${item.kind}:${item.title}:${item.sortKey}`).slice(0, 300);
     if (!external || !item.title) continue;
     sightings.push([
@@ -561,6 +572,8 @@ export async function saveSource(
           youtube_channel_id = COALESCE(?, youtube_channel_id),
           instagram_handle = COALESCE(?, instagram_handle),
           tiktok_handle = COALESCE(?, tiktok_handle),
+          deezer_id = COALESCE(?, deezer_id),
+          deezer_nb_album = COALESCE(?, deezer_nb_album),
           last_crawled_at = COALESCE(?, last_crawled_at)
         WHERE id = ?`,
       params: [
@@ -570,6 +583,8 @@ export async function saveSource(
         source.youtubeChannelId || null,
         source.instagram || null,
         source.tiktok || null,
+        source.deezerId || null,
+        source.deezerAlbumCount ?? null,
         source.markCrawled === false ? null : stamp,
         artistId,
       ],

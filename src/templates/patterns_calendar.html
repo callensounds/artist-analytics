@@ -47,7 +47,7 @@
         <a href="/artist/{{ history.artist_id }}/calendar" class="text-sm text-emerald-400 hover:underline">All years</a>
         {% endif %}
     </div>
-    <p class="text-xs text-slate-400 mb-3">MusicBrainz and Apple dates land on a UTC day only when that day was published. A month-only date marks the month and is not given a day. Year-only dates, including Spotify years, stay off the day cells.</p>
+    <p class="text-xs text-slate-400 mb-3">MusicBrainz, Apple, and Deezer dates land on a UTC day only when that day was published. Deezer does not publish a time of day, so none is added. A month-only date marks the month and is not given a day. Year-only dates, including Spotify years, stay off the day cells.</p>
     {% if history.calendar.navigation and history.calendar.navigation.decades %}
     <nav class="mb-4" aria-label="Release years">
         <div class="flex flex-wrap items-center justify-between gap-2 text-sm mb-2">

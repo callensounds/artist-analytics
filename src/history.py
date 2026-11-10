@@ -18,6 +18,7 @@ from analytics import (
 )
 from charts import CHARTS_EMPTY, load_artist_charts
 from db import log_read_failure, missing_table, parse_utc, utc_now
+from models import make_item
 from scores import SCORE_EMPTY, SCORE_FORMULA, load_artist_score, load_scores
 
 # Only exact audience counts. Sample sizes and rounded "1.2M" text are not a growth series.
@@ -27,6 +28,7 @@ AUDIENCE = {
     ("instagram", "Followers"): "Instagram followers",
     ("tiktok", "Followers"): "TikTok followers",
     ("youtube", "Subscribers"): "YouTube subscribers",
+    ("deezer", "Fans"): "Deezer fans",
 }
 SNAPSHOT_REPEAT_SECONDS = 3600
 RELATED_RANK_LIMIT = 5
@@ -462,8 +464,25 @@ def empty_history(reason: str) -> dict:
         "score_reason": SCORE_EMPTY,
         "posting": empty_posting_patterns(),
         "calendar": empty_release_calendar(),
+        "deezer": None,
         "artist_id": None,
     }
+
+
+def _deezer_identity(bundle: dict, links: dict) -> tuple[str | None, int | None]:
+    """Deezer id from a confirmed provider match, else a MusicBrainz URL. Album count is not a snapshot."""
+    deezer_id = _blank(links.get("deezer_id"))
+    albums = None
+    for source in bundle.get("sources") or []:
+        if source.get("platform") != "deezer" or source.get("status") == "error":
+            continue
+        source_id = _blank((source.get("links") or {}).get("deezer_id"))
+        if source_id:
+            deezer_id = source_id
+        for metric in source.get("metrics") or []:
+            if metric.get("label") == "Albums" and metric.get("available"):
+                albums = audience_exact(metric)
+    return deezer_id, albums
 
 
 def _links(bundle: dict) -> dict:
@@ -581,6 +600,8 @@ async def remember(
                 youtube_channel_id = COALESCE(?, youtube_channel_id),
                 instagram_handle = COALESCE(?, instagram_handle),
                 tiktok_handle = COALESCE(?, tiktok_handle),
+                deezer_id = COALESCE(?, deezer_id),
+                deezer_nb_album = COALESCE(?, deezer_nb_album),
                 last_crawled_at = COALESCE(?, last_crawled_at)
             WHERE id = ?
             """,
@@ -591,6 +612,7 @@ async def remember(
                 _blank(channel_ids[0] if channel_ids else None),
                 _blank(links.get("instagram")),
                 _blank(links.get("tiktok")),
+                *_deezer_identity(bundle, links),
                 None if musicbrainz_failed else stamp,
                 artist_id,
             ),
@@ -621,8 +643,11 @@ async def remember(
             snapshots += 1
         taken = 0
         for item in source.get("items") or []:
-            if taken >= SIGHTINGS_PER_SOURCE or len(sighting_rows) >= SIGHTING_CAP:
+            sighting_cap = 25 if platform == "deezer" else SIGHTINGS_PER_SOURCE
+            if taken >= sighting_cap or (platform != "deezer" and len(sighting_rows) >= SIGHTING_CAP):
                 break
+            if platform == "deezer" and (item.get("precision") == "time" or item.get("hour_utc") is not None):
+                continue
             external = (item.get("url") or f"{item.get('kind')}:{item.get('title')}:{item.get('sort_key')}")[:300]
             if not external or not item.get("title"):
                 continue
@@ -640,25 +665,31 @@ async def remember(
             )
             taken += 1
     stored_tracks = []
+    track_values = []
     for source in sources:
-        if source.get("status") == "error" or source.get("platform") != "spotify":
+        platform = source.get("platform")
+        if source.get("status") == "error" or platform not in {"spotify", "deezer"}:
             continue
-        stored_tracks.extend(_clean_tracks(source.get("tracks")))
-    stored_tracks = stored_tracks[:TRACK_READ_LIMIT]
-    track_values = [
-        (
-            artist_id,
-            "spotify",
-            track["external_id"],
-            track["name"],
-            track["popularity"],
-            track["album_name"],
-            track["rank"],
-            stamp,
-            stamp,
+        cleaned = _clean_tracks(source.get("tracks"))[:TRACK_READ_LIMIT]
+        if platform == "deezer":
+            for track in cleaned:
+                track["popularity"] = None
+        if platform == "spotify":
+            stored_tracks.extend(cleaned)
+        track_values.extend(
+            (
+                artist_id,
+                platform,
+                track["external_id"],
+                track["name"],
+                track["popularity"],
+                track["album_name"],
+                track["rank"],
+                stamp,
+                stamp,
+            )
+            for track in cleaned
         )
-        for track in stored_tracks
-    ]
     snapshot_values = []
     if stored_tracks:
         previous_scores = await _latest_track_scores(db, artist_id)
@@ -931,7 +962,7 @@ LIMIT ?
 RELEASE_SIGHTING_SQL = """
 SELECT source, title, kind, published_at, precision
 FROM content_sightings
-WHERE artist_id = ? AND source IN ('apple', 'spotify')
+WHERE artist_id = ? AND source IN ('apple', 'spotify', 'deezer')
 ORDER BY published_at DESC, id DESC
 LIMIT ?
 """
@@ -1112,12 +1143,13 @@ async def load_release_calendar(db, artist_id: int, year: int | None = None) -> 
     mb_years = await _safe_rows(db, MB_CALENDAR_YEARS_SQL, (artist_id, CALENDAR_YEAR_LIMIT))
     apple_years = await _sighting_years(db, artist_id, "apple")
     spotify_years = await _sighting_years(db, artist_id, "spotify")
-    if mb_years is None and apple_years is None and spotify_years is None:
+    deezer_years = await _sighting_years(db, artist_id, "deezer")
+    if mb_years is None and apple_years is None and spotify_years is None and deezer_years is None:
         calendar = empty_release_calendar(CALENDAR_READ_ERROR)
         calendar["navigation"] = calendar_navigation([], None, artist_id)
         return calendar
     years = sorted(
-        set(_calendar_year_numbers(mb_years) + (apple_years or []) + (spotify_years or [])),
+        set(_calendar_year_numbers(mb_years) + (apple_years or []) + (spotify_years or []) + (deezer_years or [])),
         reverse=True,
     )
     if not years:
@@ -1132,7 +1164,10 @@ async def load_release_calendar(db, artist_id: int, year: int | None = None) -> 
     spotify_rows = await _safe_rows(
         db, SIGHTING_CALENDAR_PERIOD_SQL, (artist_id, "spotify", start, end, CALENDAR_PERIOD_LIMIT)
     )
-    if mb_rows is None and apple_rows is None and spotify_rows is None:
+    deezer_rows = await _safe_rows(
+        db, SIGHTING_CALENDAR_PERIOD_SQL, (artist_id, "deezer", start, end, CALENDAR_PERIOD_LIMIT)
+    )
+    if mb_rows is None and apple_rows is None and spotify_rows is None and deezer_rows is None:
         calendar = empty_release_calendar(CALENDAR_READ_ERROR)
         calendar["navigation"] = navigation
         calendar["period_year"] = selected
@@ -1144,14 +1179,17 @@ async def load_release_calendar(db, artist_id: int, year: int | None = None) -> 
         calendar_rows.extend(apple_rows)
     if spotify_rows:
         calendar_rows.extend(spotify_rows)
+    if deezer_rows:
+        calendar_rows.extend(deezer_rows)
     calendar = build_release_calendar(calendar_rows, year=selected)
     calendar["navigation"] = navigation
     calendar["row_cap_hit"] = any(
-        rows is not None and len(rows) >= CALENDAR_PERIOD_LIMIT for rows in (mb_rows, apple_rows, spotify_rows)
+        rows is not None and len(rows) >= CALENDAR_PERIOD_LIMIT
+        for rows in (mb_rows, apple_rows, spotify_rows, deezer_rows)
     )
     if calendar["empty_period"]:
         calendar["reason"] = (
-            f"No stored MusicBrainz, Apple, or Spotify release falls in {selected}. "
+            f"No stored MusicBrainz, Apple, Spotify, or Deezer release falls in {selected}. "
             "The years above are the ones with a stored date."
         )
     return calendar
@@ -1178,7 +1216,214 @@ async def find_artist_by_id(db, artist_id: int) -> dict | None:
     )
 
 
-async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
+DEEZER_FANS_SQL = """
+SELECT value, value_text, captured_at
+FROM metric_latest
+WHERE artist_id = ? AND source = 'deezer' AND metric = 'Fans'
+"""
+
+DEEZER_TRACKS_SQL = """
+SELECT external_id, track_name, album_name, rank, last_seen_at
+FROM artist_tracks
+WHERE artist_id = ? AND source = 'deezer'
+  AND last_seen_at = (
+      SELECT MAX(last_seen_at) FROM artist_tracks
+      WHERE artist_id = ? AND source = 'deezer'
+  )
+ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+LIMIT ?
+"""
+
+DEEZER_RELEASES_SQL = """
+SELECT external_id, title, kind, published_at, precision
+FROM content_sightings
+WHERE artist_id = ? AND source = 'deezer'
+ORDER BY published_at DESC, id DESC
+LIMIT ?
+"""
+
+DEEZER_IDENTITY_SQL = "SELECT deezer_id, deezer_nb_album FROM artists WHERE id = ?"
+DEEZER_PAGE_NOTICE = "Stored by the crawler. This page did not call Deezer."
+DEEZER_UNAVAILABLE = (
+    "No Deezer artist is stored for this name. A different name is not shown, and nothing was estimated."
+)
+DEEZER_READ_ERROR = "Data temporarily unavailable. Stored Deezer data could not be read on this request."
+
+
+def _date_only_text(raw: str) -> str:
+    text = (raw or "").strip()
+    if "T" in text:
+        return text.split("T", 1)[0].strip()
+    if " " in text:
+        left, right = text.split(" ", 1)
+        if ":" in right:
+            return left.strip()
+    return text
+
+
+def present_deezer_card(
+    name: str,
+    identity: dict | None,
+    fans: dict | None,
+    tracks: list[dict] | None,
+    releases: list[dict] | None,
+    *,
+    failed: bool = False,
+) -> dict:
+    """Artist-page card from stored rows. A missing count stays unavailable."""
+    deezer_id = str((identity or {}).get("deezer_id") or "").strip()
+    deezer_id = deezer_id if deezer_id.isdigit() else ""
+    fans_number = _whole_number((fans or {}).get("value")) if fans else None
+    albums = _whole_number((identity or {}).get("deezer_nb_album")) if identity else None
+    track_rows = []
+    for row in tracks or []:
+        if not isinstance(row, dict):
+            continue
+        title = " ".join(str(row.get("track_name") or row.get("name") or "").split())
+        external = str(row.get("external_id") or "").strip()
+        if not title or not external:
+            continue
+        rank = _whole_number(row.get("rank"))
+        if rank is not None and (rank < 1 or rank > 100):
+            rank = None
+        album = " ".join(str(row.get("album_name") or "").split())
+        track_rows.append(
+            {
+                "name": title[:200],
+                "rank": rank,
+                "url": f"https://www.deezer.com/track/{external}" if external.isdigit() else None,
+                "album_name": album[:200] or None,
+            }
+        )
+    item_dicts = []
+    for row in releases or []:
+        if not isinstance(row, dict):
+            continue
+        raw = _date_only_text(str(row.get("published_at") or ""))
+        precision = str(row.get("precision") or "")
+        if precision == "time":
+            precision = "day"
+        item = make_item(
+            title=str(row.get("title") or ""),
+            kind=str(row.get("kind") or "album"),
+            raw=raw,
+            precision=precision or None,
+        )
+        if item is None or item.precision == "time" or item.hour_utc is not None:
+            continue
+        external = str(row.get("external_id") or "")
+        album_id = external.rstrip("/").split("/")[-1] if "deezer.com/album/" in external else ""
+        if album_id.isdigit():
+            item.url = f"https://www.deezer.com/album/{album_id}"
+        item_dicts.append(
+            {
+                "title": item.title,
+                "url": item.url,
+                "detail": item.detail or item.kind,
+                "display": item.display,
+                "precision_label": item.precision_label,
+                "weekday": item.weekday,
+                "kind": item.kind,
+                "hour_utc": None,
+            }
+        )
+    has_profile = bool(deezer_id or fans_number is not None or track_rows or item_dicts or albums is not None)
+    if not has_profile:
+        return {
+            "platform": "deezer",
+            "label": "Deezer",
+            "status": "unavailable",
+            "reason": DEEZER_READ_ERROR if failed else DEEZER_UNAVAILABLE,
+            "profile_name": None,
+            "profile_url": None,
+            "metrics": [],
+            "items": [],
+            "tracks": [],
+            "notices": [DEEZER_PAGE_NOTICE],
+        }
+    metrics = []
+    if fans_number is not None:
+        metrics.append(
+            {"label": "Fans", "available": True, "value": f"{fans_number:,}", "exact": fans_number, "reason": None}
+        )
+    elif deezer_id:
+        metrics.append(
+            {
+                "label": "Fans",
+                "available": False,
+                "value": None,
+                "exact": None,
+                "reason": "No fan count has been stored yet.",
+            }
+        )
+    if albums is not None:
+        metrics.append(
+            {"label": "Albums", "available": True, "value": f"{albums:,}", "exact": albums, "reason": None}
+        )
+    elif deezer_id:
+        metrics.append(
+            {
+                "label": "Albums",
+                "available": False,
+                "value": None,
+                "exact": None,
+                "reason": "No album count has been stored yet.",
+            }
+        )
+    notices = [DEEZER_PAGE_NOTICE]
+    if item_dicts:
+        notices.append("Deezer dates have no time of day. No hour was added.")
+    return {
+        "platform": "deezer",
+        "label": "Deezer",
+        "status": "ok",
+        "reason": None,
+        "profile_name": str(name or "").strip()[:120] or None if deezer_id else None,
+        "profile_url": f"https://www.deezer.com/artist/{deezer_id}" if deezer_id else None,
+        "metrics": metrics,
+        "items": item_dicts,
+        "tracks": track_rows[:10],
+        "notices": notices,
+    }
+
+
+def _deezer_read_failed(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "no such column" in text or "no such table" in text:
+        return False
+    log_read_failure("deezer card", exc)
+    return True
+
+
+async def load_deezer_card(db, artist_id: int, name: str | None) -> dict:
+    """Indexed reads only. No Deezer request."""
+    identity = None
+    fans = None
+    tracks: list[dict] = []
+    releases: list[dict] = []
+    failed = False
+    try:
+        identity = await db.query_one(DEEZER_IDENTITY_SQL, (artist_id,))
+    except Exception as exc:
+        failed = _deezer_read_failed(exc) or failed
+    try:
+        fans = await db.query_one(DEEZER_FANS_SQL, (artist_id,))
+    except Exception as exc:
+        failed = _deezer_read_failed(exc) or failed
+    try:
+        tracks = await db.query(DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
+    except Exception as exc:
+        failed = _deezer_read_failed(exc) or failed
+        tracks = []
+    try:
+        releases = await db.query(DEEZER_RELEASES_SQL, (artist_id, 20))
+    except Exception as exc:
+        failed = _deezer_read_failed(exc) or failed
+        releases = []
+    return present_deezer_card(str(name or ""), identity, fans, tracks or [], releases or [], failed=failed)
+
+
+async def load_history_for_artist(db, artist: dict, on_growth=None, *, include_deezer_card: bool = False) -> dict:
     """Snapshots, related edges, and sightings for one known artists row. No network.
 
     Audience points are read first. ``on_growth`` runs before the other reads so a
@@ -1317,7 +1562,7 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
         elif releases_failed:
             history["calendar"]["reason"] = "Data temporarily unavailable. Stored MusicBrainz releases could not be read on this request."
         else:
-            history["calendar"]["reason"] = "Data temporarily unavailable. Stored Apple and Spotify releases could not be read on this request."
+            history["calendar"]["reason"] = "Data temporarily unavailable. Stored Apple, Spotify, and Deezer releases could not be read on this request."
     chart_rows = None
     charts_failed = False
     try:
@@ -1348,6 +1593,12 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
         history["score_components"] = score["components"]
         history["score_formula"] = score["formula"]
         history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
+    if include_deezer_card:
+        try:
+            history["deezer"] = await load_deezer_card(db, artist_id, artist.get("name"))
+        except Exception as exc:
+            log_read_failure("deezer card", exc)
+            history["deezer"] = present_deezer_card(str(artist.get("name") or ""), None, None, [], [], failed=True)
     return history
 
 

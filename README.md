@@ -14,6 +14,7 @@ The product difference is the timestamp itself: exact when a source publishes a 
 | YouTube | Data API v3. The key is sent in the `X-Goog-Api-Key` header. A placeholder such as `[REDACTED]` is not sent. An API rejection is shown as the HTTP status and reason code (`quotaExceeded`, `API_KEY_INVALID`, `API_KEY_HTTP_REFERRER_BLOCKED`), never the key value. | `videoPublishedAt` / `publishedAt`, UTC to the second | `YOUTUBE_API_KEY`, read from the request env. Logged-in `/admin/diag` shows the type, JS typeof, length, and first 4 characters. |
 | Instagram | Public `/<handle>/embed/` page only | `taken_at_timestamp` (Unix seconds, UTC) | None. The handle comes from MusicBrainz. Login redirects are not followed. |
 | TikTok | Public profile JSON, public embed listing, public video pages | `createTime` on the video page (Unix seconds, UTC) | None. The handle comes from MusicBrainz. |
+| Deezer | Public `api.deezer.com` JSON: search, artist, top tracks, and albums. No token. The crawler stores the chosen artist id and reads it back on later runs. The artist page reads that stored card and does not call Deezer. | `release_date` as a year, month, or day. A time is never added. | None. |
 
 Instagram and TikTok handles are never guessed from the artist name. If MusicBrainz has no official URL, that source is unavailable.
 
@@ -119,7 +120,7 @@ Each cron invocation enqueues one `{artist_id, provider: "musicbrainz"}` message
 
 Each cron tick also stores the public US iTunes top songs and top albums charts when that UTC day's newest row is older than 6 hours. The feeds are `https://itunes.apple.com/us/rss/topsongs/limit=100/json` and `https://itunes.apple.com/us/rss/topalbums/limit=100/json`. A feed error is logged and does not stop the artist enqueue. Rows match a tracked artist by the stored Apple artist id, or by an exact case-insensitive `artists.name` when that name belongs to one tracked artist. A different name is not linked. `/charts` and the artist page read `chart_entries` from D1 and do not fetch the feeds. Spotify charts are not collected: there is no public chart JSON that works without a login, and this app does not scrape charts.spotify.com.
 
-The audience score is the sum of log10 of the latest exact stored counts, each term rounded to 2 decimal places. The counts are Spotify monthly listeners, Spotify followers, Instagram followers, TikTok followers, TikTok likes, and YouTube subscribers. A missing source is left out. Zero and rounded text such as 1.2M are left out. Nothing is estimated. The artist page shows the score and each term. `/artists` shows it for the artists on the page. `/scores` ranks tracked artists that have a score. Those latest counts are kept in `metric_latest` (one row per artist, source, and metric) so a page does not scan `metric_snapshots`. The number is still computed from the stored count. It is not estimated.
+The audience score is the sum of log10 of the latest exact stored counts, each term rounded to 2 decimal places. The counts are Spotify monthly listeners, Spotify followers, Instagram followers, TikTok followers, TikTok likes, YouTube subscribers, and Deezer fans. A missing source is left out. Zero and rounded text such as 1.2M are left out. Nothing is estimated. Deezer fan counts are stored by the crawler as `metric_snapshots` rows (`source` `deezer`, metric `Fans`). Album count is the latest `nb_album` on the artists row, not an audience series. The artist page shows the score and each term. `/artists` shows it for the artists on the page. `/scores` ranks tracked artists that have a score. Those latest counts are kept in `metric_latest` (one row per artist, source, and metric) so a page does not scan `metric_snapshots`. The number is still computed from the stored count. It is not estimated.
 
 Migration `0011_read_budget.sql` adds that table, plus `source_freshness`, `audience_artists`, and `chart_freshness`, and the indexes the per-artist history reads use. The crawler applies it on the next scheduled or queue run. To apply it before that run:
 
@@ -128,6 +129,14 @@ npx wrangler d1 execute artist-analytics --remote --file=src/migrations/0011_rea
 ```
 
 Run that file once. If the crawler has already recorded `0011_read_budget.sql` in `schema_migrations`, skip the command.
+
+Migration `0012_deezer.sql` adds `artists.deezer_id` and `artists.deezer_nb_album`. The crawler applies it on the next scheduled or queue run. To apply it before that run:
+
+```bash
+npx wrangler d1 execute artist-analytics --remote --file=src/migrations/0012_deezer.sql
+```
+
+Run that file once. If `0012_deezer.sql` is already in `schema_migrations`, skip the command.
 
 Searching an artist on the dashboard does not write D1. It enqueues one `{name, origin: "search", provider: "musicbrainz"}` message on `CRAWL_QUEUE` (awaited, 150ms timeout, failures ignored) and may read growth with a single indexed query. The MusicBrainz message fans the other providers out. Snapshots and Spotify "Fans also like" edges are written by those provider messages. A fresh artist is acked without another identity crawl, so a burst does not fan the same name out. Related artists in the top 5 are auto-tracked until `RELATED_AUTOTRACK_CAP` (default 25). Set the cap to `0` to keep the edges without tracking anyone new. The public Spotify page's "Fans also like" list is parsed only on the Spotify crawl message, not while rendering the dashboard. Logged-in users can open `/admin` to see runs and refresh one batch.
 
