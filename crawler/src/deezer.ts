@@ -322,3 +322,145 @@ export async function fetchDeezer(name: string, preferredId: string): Promise<Sa
     notices: notes,
   } as SavedSource & { notices?: string[] };
 }
+
+/** One list page. Later pages are not fetched. */
+export const PLAYLIST_LIMIT = 50;
+/** Detail calls per message. Each one is a separate Deezer request. */
+export const PLAYLIST_DETAIL_LIMIT = 8;
+
+// Public editor accounts whose display name does not always contain "Deezer".
+// 637006841 is "Deezer Charts". 1687950 is "Alexandre - Pop & Hits Editor".
+export const DEEZER_EDITORIAL_USER_IDS = new Set(["637006841", "1687950"]);
+
+export interface DeezerPlaylist {
+  id: string;
+  title: string;
+  ownerName: string | null;
+  ownerId: string | null;
+  editorial: boolean;
+  fans: number | null;
+  fansKnown: boolean;
+  nbTracks: number | null;
+  position: null;
+}
+
+export interface DeezerPlaylistFetch {
+  ok: boolean;
+  playlists: DeezerPlaylist[];
+  reason: string | null;
+}
+
+export function isDeezerEditorial(name: string | null | undefined, userId: string | null | undefined): boolean {
+  const id = artistId(userId);
+  if (id && DEEZER_EDITORIAL_USER_IDS.has(id)) return true;
+  const text = String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!text) return false;
+  if (text.includes("deezer")) return true;
+  return /\beditor\b/.test(text);
+}
+
+function hasOwn(row: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(row, key);
+}
+
+function playlistOwner(row: Record<string, unknown>): { id: string; name: string | null } {
+  const user = row.user && typeof row.user === "object" ? row.user : row.creator;
+  if (!user || typeof user !== "object") return { id: "", name: null };
+  const record = user as Record<string, unknown>;
+  const name = String(record.name || "").replace(/\s+/g, " ").trim();
+  return { id: artistId(record.id), name: name ? name.slice(0, 120) : null };
+}
+
+function playlistFromRow(row: Record<string, unknown>): DeezerPlaylist | null {
+  const id = artistId(row.id);
+  const title = String(row.title || "").replace(/\s+/g, " ").trim();
+  if (!id || !title) return null;
+  const owner = playlistOwner(row);
+  const fansKnown = hasOwn(row, "fans");
+  return {
+    id,
+    title: title.slice(0, 200),
+    ownerName: owner.name,
+    ownerId: owner.id || null,
+    editorial: isDeezerEditorial(owner.name, owner.id),
+    fans: fansKnown ? wholeCount(row.fans) : null,
+    fansKnown,
+    nbTracks: hasOwn(row, "nb_tracks") ? wholeCount(row.nb_tracks) : null,
+    position: null,
+  };
+}
+
+export function parseArtistPlaylists(payload: unknown, limit = PLAYLIST_LIMIT): DeezerPlaylist[] {
+  if (!payload || typeof payload !== "object" || errorMessage(payload)) return [];
+  const rows = (payload as { data?: unknown }).data;
+  if (!Array.isArray(rows)) return [];
+  const cap = Number.isInteger(limit) && limit > 0 ? Math.min(limit, PLAYLIST_LIMIT) : PLAYLIST_LIMIT;
+  const found: DeezerPlaylist[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (found.length >= cap) break;
+    if (!row || typeof row !== "object") continue;
+    const parsed = playlistFromRow(row as Record<string, unknown>);
+    if (!parsed || seen.has(parsed.id)) continue;
+    seen.add(parsed.id);
+    found.push(parsed);
+  }
+  return found;
+}
+
+/** Editorial playlists first, then a published track count, then Deezer's list order. */
+export function detailPlaylistIds(playlists: DeezerPlaylist[], limit = PLAYLIST_DETAIL_LIMIT): string[] {
+  const cap = Number.isInteger(limit) && limit > 0 ? limit : PLAYLIST_DETAIL_LIMIT;
+  return playlists
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => !row.fansKnown)
+    .sort((left, right) => {
+      if (left.row.editorial !== right.row.editorial) return left.row.editorial ? -1 : 1;
+      const leftTracks = left.row.nbTracks === null ? -1 : left.row.nbTracks;
+      const rightTracks = right.row.nbTracks === null ? -1 : right.row.nbTracks;
+      if (leftTracks !== rightTracks) return rightTracks - leftTracks;
+      return left.index - right.index;
+    })
+    .slice(0, cap)
+    .map(({ row }) => row.id);
+}
+
+export function applyPlaylistDetail(playlist: DeezerPlaylist, payload: unknown): DeezerPlaylist {
+  if (!payload || typeof payload !== "object" || errorMessage(payload)) return playlist;
+  const record = payload as Record<string, unknown>;
+  const id = artistId(record.id);
+  if (id && id !== playlist.id) return playlist;
+  const next: DeezerPlaylist = { ...playlist, position: null };
+  if (hasOwn(record, "nb_tracks")) {
+    const tracks = wholeCount(record.nb_tracks);
+    if (tracks !== null) next.nbTracks = tracks;
+  }
+  if (hasOwn(record, "fans")) {
+    next.fansKnown = true;
+    next.fans = wholeCount(record.fans);
+  }
+  const owner = playlistOwner(record);
+  if (owner.name && !next.ownerName) next.ownerName = owner.name;
+  if (owner.id && !next.ownerId) next.ownerId = owner.id;
+  if (owner.name || owner.id) next.editorial = isDeezerEditorial(next.ownerName, next.ownerId);
+  return next;
+}
+
+export async function fetchDeezerPlaylists(deezerId: string): Promise<DeezerPlaylistFetch> {
+  const id = artistId(deezerId);
+  if (!id) return { ok: false, playlists: [], reason: "No Deezer artist id is stored." };
+  const page = await readJson(`https://api.deezer.com/artist/${id}/playlists?limit=${PLAYLIST_LIMIT}`);
+  if (!page.ok) return { ok: false, playlists: [], reason: `Deezer playlists returned HTTP ${page.status}.` };
+  const problem = errorMessage(page.json);
+  if (problem) return { ok: false, playlists: [], reason: problem };
+  const playlists = parseArtistPlaylists(page.json);
+  const byId = new Map(playlists.map((row) => [row.id, row]));
+  for (const playlistId of detailPlaylistIds(playlists)) {
+    const detail = await readJson(`https://api.deezer.com/playlist/${playlistId}`);
+    if (!detail.ok) continue;
+    const current = byId.get(playlistId);
+    if (!current) continue;
+    byId.set(playlistId, applyPlaylistDetail(current, detail.json));
+  }
+  return { ok: true, playlists: playlists.map((row) => byId.get(row.id) || row), reason: null };
+}

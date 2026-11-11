@@ -1,13 +1,15 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { handleMessage, runQueue } from "../src/crawl";
+import { RetryableFetch, handleMessage, runQueue } from "../src/crawl";
 import {
   D1_MAX_PARAMS,
+  PLAYLIST_WRITE_CAP,
   type Statement,
   type Store,
   chunkedInsert,
   commitWrites,
   migrate,
+  saveDeezerPlaylists,
   saveMusicBrainzReleases,
   saveSource,
 } from "../src/store";
@@ -326,5 +328,148 @@ describe("chunked inserts", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM artist_tracks WHERE source = 'deezer'").get()).toEqual({ n: 10 });
     const run = db.prepare("SELECT status FROM crawl_runs ORDER BY id DESC LIMIT 1").get() as { status: string };
     expect(run.status).toBe("ok");
+  });
+
+  it("upserts Deezer playlists in chunks and keeps first_seen and unknown fan counts", async () => {
+    const db = new DatabaseSync(":memory:");
+    const seen: Statement[][] = [];
+    const real = sqliteStore(db);
+    const store: Store = {
+      all: (sql, params) => real.all(sql, params),
+      first: (sql, params) => real.first(sql, params),
+      async batch(statements) {
+        seen.push(statements.map((statement) => ({ ...statement, params: [...statement.params] })));
+        await real.batch(statements);
+      },
+    };
+    await migrate(store);
+    const playlists = Array.from({ length: 60 }, (_, index) => ({
+      id: String(1000 + index),
+      title: `List ${index}`,
+      ownerName: index === 0 ? "Deezer Charts" : "Sam",
+      fans: index === 1 ? 0 : index + 1,
+      fansKnown: true,
+      editorial: index === 0,
+    }));
+    const before = seen.length;
+    const written = await saveDeezerPlaylists(store, 7, "Taylor Swift", playlists, new Date("2026-11-01T00:00:00Z"));
+    expect(written).toBe(PLAYLIST_WRITE_CAP);
+    const inserts = seen.slice(before).flat().filter((statement) => statement.sql.includes("playlist_appearances"));
+    expect(inserts.length).toBeGreaterThan(1);
+    assertBudget(inserts);
+    expect(inserts.every((statement) => statement.params.length <= 100)).toBe(true);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 50 });
+    expect(db.prepare("SELECT follower_count, editorial FROM playlist_appearances WHERE playlist_id = '1000'").get()).toEqual({
+      follower_count: 1,
+      editorial: 1,
+    });
+    expect(db.prepare("SELECT follower_count FROM playlist_appearances WHERE playlist_id = '1001'").get()).toEqual({
+      follower_count: 0,
+    });
+    expect(db.prepare("SELECT position FROM playlist_appearances WHERE playlist_id = '1002'").get()).toEqual({ position: null });
+
+    await saveDeezerPlaylists(
+      store,
+      7,
+      "Taylor Swift",
+      [
+        { id: "1000", title: "Renamed", ownerName: null, fans: null, fansKnown: true, editorial: true },
+        { id: "1001", title: "List 1", ownerName: "Sam", fans: null, fansKnown: false, editorial: false },
+      ],
+      new Date("2026-11-11T03:04:05Z"),
+    );
+    const renamed = db.prepare(
+      "SELECT playlist_name, follower_count, first_seen_at, last_seen_at, editorial FROM playlist_appearances WHERE playlist_id = '1000'",
+    ).get();
+    expect(renamed).toEqual({
+      playlist_name: "Renamed",
+      follower_count: null,
+      first_seen_at: "2026-11-01T00:00:00Z",
+      last_seen_at: "2026-11-11T03:04:05Z",
+      editorial: 1,
+    });
+    const kept = db.prepare(
+      "SELECT follower_count, first_seen_at, last_seen_at FROM playlist_appearances WHERE playlist_id = '1001'",
+    ).get();
+    expect(kept).toEqual({
+      follower_count: 0,
+      first_seen_at: "2026-11-01T00:00:00Z",
+      last_seen_at: "2026-11-11T03:04:05Z",
+    });
+    const untouched = db.prepare("SELECT last_seen_at, follower_count FROM playlist_appearances WHERE playlist_id = '1002'").get();
+    expect(untouched).toEqual({ last_seen_at: "2026-11-01T00:00:00Z", follower_count: 3 });
+    expect(db.prepare("SELECT crawled_at FROM playlist_crawls WHERE artist_id = 7 AND source = 'deezer'").get()).toEqual({
+      crawled_at: "2026-11-11T03:04:05Z",
+    });
+  });
+});
+
+describe("deezer playlist messages", () => {
+  it("stores public playlists, retries a busy Deezer, and skips a fresh crawl", async () => {
+    const db = new DatabaseSync(":memory:");
+    const real = sqliteStore(db);
+    const seen: Statement[][] = [];
+    const store: Store = {
+      all: (sql, params) => real.all(sql, params),
+      first: (sql, params) => real.first(sql, params),
+      async batch(statements) {
+        seen.push(statements);
+        assertBudget(statements);
+        await real.batch(statements);
+      },
+    };
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id) VALUES ('Clairo', 'clairo', 'search', 1, '2026-11-01T00:00:00Z', '27')",
+    ).run();
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/playlists")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: 10, title: "Pop Hits", user: { id: 637006841, name: "Deezer Charts" } },
+            { id: 11, title: "Road Trip", user: { id: 99, name: "Sam" } },
+          ],
+        }), { status: 200 });
+      }
+      if (url.endsWith("/10")) return new Response(JSON.stringify({ id: 10, fans: 80, nb_tracks: 20 }), { status: 200 });
+      if (url.endsWith("/11")) return new Response(JSON.stringify({ id: 11, nb_tracks: 5 }), { status: 200 });
+      return new Response("{}", { status: 404 });
+    });
+    const env = { DB: store, CRAWL_QUEUE: { send() {} } };
+    const first = await handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T00:00:00Z"));
+    expect(first.ok).toBe(true);
+    expect(first.detail).toContain("deezer_playlists=ok (2)");
+    const editorial = db.prepare(
+      "SELECT playlist_name, owner_name, follower_count, position, source, editorial, first_seen_at, last_seen_at FROM playlist_appearances WHERE playlist_id = '10'",
+    ).get();
+    expect(editorial).toEqual({
+      playlist_name: "Pop Hits",
+      owner_name: "Deezer Charts",
+      follower_count: 80,
+      position: null,
+      source: "deezer",
+      editorial: 1,
+      first_seen_at: "2026-11-11T00:00:00Z",
+      last_seen_at: "2026-11-11T00:00:00Z",
+    });
+    expect(db.prepare("SELECT follower_count, editorial FROM playlist_appearances WHERE playlist_id = '11'").get()).toEqual({
+      follower_count: null,
+      editorial: 0,
+    });
+    const calls = urls.length;
+    const second = await handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T01:00:00Z"));
+    expect(second.detail).toContain("fresh");
+    expect(urls).toHaveLength(calls);
+
+    urls.length = 0;
+    vi.stubGlobal("fetch", async () => new Response("", { status: 503 }));
+    await expect(
+      handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T05:00:00Z")),
+    ).rejects.toBeInstanceOf(RetryableFetch);
+    expect(db.prepare("SELECT crawled_at FROM playlist_crawls").get()).toEqual({ crawled_at: "2026-11-11T00:00:00Z" });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 2 });
   });
 });

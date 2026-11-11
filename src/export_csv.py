@@ -82,6 +82,24 @@ ORDER BY chart_date DESC, chart_source, position
 LIMIT ?
 """
 
+# idx_playlist_artist_seen. Follower count stays blank in the CSV when it was not stored.
+_PLAYLIST_SQL = """
+SELECT playlist_id, playlist_name, owner_name, follower_count, position,
+       first_seen_at, last_seen_at, source, editorial
+FROM playlist_appearances
+WHERE artist_id = ?
+ORDER BY last_seen_at DESC, id DESC
+LIMIT ?
+"""
+
+_PLAYLIST_SQL_LEGACY = """
+SELECT playlist_id, playlist_name, owner_name, follower_count, position, first_seen_at, last_seen_at
+FROM playlist_appearances
+WHERE artist_id = ?
+ORDER BY last_seen_at DESC, id DESC
+LIMIT ?
+"""
+
 
 def _blank(value) -> str:
     if value is None:
@@ -109,6 +127,14 @@ def _chart_position(value: object) -> int | None:
     return number
 
 
+def _editorial(value: object) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip() == "1":
+        return True
+    return False
+
+
 def render_export_csv(
     metrics: list[dict],
     sightings: list[dict],
@@ -116,6 +142,7 @@ def render_export_csv(
     releases: list[dict] | None = None,
     tracks: list[dict] | None = None,
     charts: list[dict] | None = None,
+    playlists: list[dict] | None = None,
 ) -> str:
     """One CSV. A metric is included only when value is an exact integer."""
     buffer = io.StringIO()
@@ -208,6 +235,29 @@ def render_export_csv(
                 rank=position,
             )
         )
+    for row in playlists or []:
+        playlist_id = str(row.get("playlist_id") or "").strip()
+        title = str(row.get("playlist_name") or row.get("title") or "").strip()
+        if not playlist_id or not title:
+            continue
+        followers = _whole_number(row.get("follower_count"))
+        position = _whole_number(row.get("position"))
+        if position is not None and position < 1:
+            position = None
+        writer.writerow(
+            _row(
+                "playlist",
+                provider=row.get("source") or "",
+                title=title,
+                value="" if followers is None else followers,
+                first_seen_at=row.get("first_seen_at"),
+                last_seen_at=row.get("last_seen_at"),
+                rank="" if position is None else position,
+                to_name=row.get("owner_name"),
+                external_id=playlist_id,
+                kind="editorial" if _editorial(row.get("editorial")) else "",
+            )
+        )
     return buffer.getvalue()
 
 
@@ -225,6 +275,7 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
         charts = await db.query(_CHART_SQL, (artist_id, cap))
     except Exception:
         charts = []
+    playlists = await _playlist_export_rows(db, artist_id, cap)
     return {
         "metrics": metrics,
         "sightings": sightings,
@@ -232,4 +283,18 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
         "releases": releases,
         "tracks": tracks,
         "charts": charts,
+        "playlists": playlists,
     }
+
+
+async def _playlist_export_rows(db, artist_id: int, cap: int) -> list[dict]:
+    try:
+        return await db.query(_PLAYLIST_SQL, (artist_id, cap))
+    except Exception as exc:
+        text = str(exc).lower()
+        if "no such column" not in text and "no such table" not in text:
+            raise
+    try:
+        return await db.query(_PLAYLIST_SQL_LEGACY, (artist_id, cap))
+    except Exception:
+        return []

@@ -43,13 +43,18 @@ SERIES_POINT_CAP = 240
 ARTIST_CALENDAR_MONTHS = 4
 RELATED_READ_LIMIT = 20
 SIGHTING_READ_LIMIT = 20
-PLAYLIST_READ_LIMIT = 20
-# Spotify publishes no playlist-appearance list. Search-by-name is not placement.
-PLAYLIST_UNAVAILABLE = (
-    "Spotify does not publish which playlists include an artist. "
-    "The Web API lists albums and top tracks, and a playlist search only matches names, not track placements. "
-    "This card stays empty until a public source exists."
+PLAYLIST_READ_LIMIT = 50
+PLAYLIST_NEW_DAYS = 7
+PLAYLIST_NOT_CRAWLED = (
+    "Deezer playlists have not been crawled yet. "
+    "The crawler reads public playlists from Deezer. Nothing here is estimated."
 )
+# Spotify still has no placement list. The card keeps this as a note beside the Deezer rows.
+PLAYLIST_SPOTIFY_NOTE = (
+    "Spotify does not publish which playlists include an artist. "
+    "The Web API lists albums and top tracks, and a playlist search only matches names, not track placements."
+)
+PLAYLIST_READ_ERROR = "Data temporarily unavailable. Stored playlists could not be read on this request."
 TRACK_READ_LIMIT = 10
 TRACKS_EMPTY = (
     "No Spotify top tracks have been stored yet. "
@@ -332,9 +337,62 @@ def present_alerts(rows: list[dict]) -> list[dict]:
     return presented
 
 
-def present_playlists(rows: list[dict]) -> list[dict]:
-    """Stored playlist rows. A missing follower count stays missing, not zero."""
+def _editorial(value) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip() == "1":
+        return True
+    return False
+
+
+def _playlist_url(source: str, playlist_id: str) -> str | None:
+    if source == "deezer" and playlist_id.isdigit():
+        return f"https://www.deezer.com/playlist/{playlist_id}"
+    if source in {"", "spotify"} and re.fullmatch(r"[A-Za-z0-9]+", playlist_id):
+        return f"https://open.spotify.com/playlist/{playlist_id}"
+    return None
+
+
+def _as_utc(now: datetime | None) -> datetime:
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _playlist_watermark(rows: list[dict]) -> datetime | None:
+    """Latest Deezer playlist crawl, or the newest stored last_seen when no crawl row exists."""
+    crawled = []
+    seen = []
+    for row in rows or []:
+        crawl = parse_utc(str(row.get("crawled_at") or ""))
+        if crawl is not None:
+            crawled.append(crawl)
+        last = parse_utc(str(row.get("last_seen_at") or ""))
+        if last is not None:
+            seen.append(last)
+    if crawled:
+        return max(crawled)
+    if seen:
+        return max(seen)
+    return None
+
+
+def empty_playlist_counts() -> dict:
+    return {"current": 0, "new": 0, "dropped": 0}
+
+
+def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) -> tuple[list[dict], dict]:
+    """Placements plus counts. A missing follower count stays missing, not zero.
+
+    Current rows were in the latest playlist crawl. New rows are current and were
+    first stored within the last 7 days. Dropped rows have an older last_seen.
+    """
+    moment = _as_utc(now)
+    cutoff = moment - timedelta(days=PLAYLIST_NEW_DAYS)
+    watermark = _playlist_watermark(rows or [])
     presented = []
+    current = new = dropped = 0
     for row in rows or []:
         name = str(row.get("playlist_name") or "").strip()
         playlist_id = str(row.get("playlist_id") or "").strip()
@@ -342,19 +400,51 @@ def present_playlists(rows: list[dict]) -> list[dict]:
             continue
         followers = _whole_number(row.get("follower_count"))
         position = _whole_number(row.get("position"))
+        if position is not None and position < 1:
+            position = None
+        source = str(row.get("source") or "").strip().lower()[:40]
+        first_text = str(row.get("first_seen_at") or "")
+        last_text = str(row.get("last_seen_at") or "")
+        first = parse_utc(first_text)
+        last = parse_utc(last_text)
+        is_current = watermark is not None and last is not None and last >= watermark
+        is_dropped = watermark is not None and last is not None and last < watermark
+        if is_current:
+            current += 1
+            if first is not None and first >= cutoff:
+                new += 1
+        elif is_dropped:
+            dropped += 1
         presented.append(
             {
                 "playlist_id": playlist_id[:80],
                 "name": name[:200],
                 "owner_name": str(row.get("owner_name") or "").strip()[:120],
+                "source": source,
+                "url": _playlist_url(source, playlist_id[:80]),
+                "editorial": _editorial(row.get("editorial")),
                 "follower_count": followers,
                 "follower_text": f"{followers:,}" if followers is not None else None,
                 "position": position,
-                "first_seen_at": str(row.get("first_seen_at") or ""),
-                "last_seen_at": str(row.get("last_seen_at") or ""),
+                "first_seen_at": first_text,
+                "last_seen_at": last_text,
+                "dropped": is_dropped,
+                "current": is_current,
             }
         )
-    return presented
+    return presented, {"current": current, "new": new, "dropped": dropped}
+
+
+def present_playlists(rows: list[dict], now: datetime | None = None) -> list[dict]:
+    """Stored playlist rows. A missing follower count stays missing, not zero."""
+    playlists, _counts = present_playlist_rows(rows, now)
+    return playlists
+
+
+def playlist_counts(rows: list[dict], now: datetime | None = None) -> dict:
+    """Current, new-in-7-days, and dropped counts for one bounded read."""
+    _playlists, counts = present_playlist_rows(rows, now)
+    return counts
 
 
 def present_tracks(rows: list[dict]) -> list[dict]:
@@ -469,7 +559,9 @@ def empty_history(reason: str) -> dict:
         "related": [],
         "sightings": [],
         "playlists": [],
-        "playlists_reason": PLAYLIST_UNAVAILABLE,
+        "playlist_counts": empty_playlist_counts(),
+        "playlists_reason": PLAYLIST_NOT_CRAWLED,
+        "playlists_note": PLAYLIST_SPOTIFY_NOTE,
         "tracks": [],
         "tracks_reason": TRACKS_EMPTY,
         "momentum": [],
@@ -968,8 +1060,11 @@ ORDER BY COALESCE(NULLIF(published_at, ''), first_seen_at) DESC, id DESC
 LIMIT ?
 """
 
+# idx_playlist_artist_seen is (artist_id, last_seen_at). The crawl time is one primary-key lookup.
 PLAYLIST_SQL = """
-SELECT playlist_id, playlist_name, owner_name, follower_count, position, first_seen_at, last_seen_at
+SELECT playlist_id, playlist_name, owner_name, follower_count, position,
+       first_seen_at, last_seen_at, source, editorial,
+       (SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer') AS crawled_at
 FROM playlist_appearances
 WHERE artist_id = ?
 ORDER BY last_seen_at DESC, id DESC
@@ -1575,7 +1670,7 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     labeled = [
         ("related edges", RELATED_SQL, (artist_id, RELATED_READ_LIMIT)),
         ("content sightings", SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT)),
-        ("playlists", PLAYLIST_SQL, (artist_id, PLAYLIST_READ_LIMIT)),
+        ("playlists", PLAYLIST_SQL, (artist_id, artist_id, PLAYLIST_READ_LIMIT)),
         ("tracks", TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT)),
         ("momentum", _MOMENTUM_SQL, (artist_id, cutoff) * 5 + (MOMENTUM_ROW_CAP,)),
         ("alerts", ALERT_SQL, (artist_id, ALERT_READ_LIMIT)),
@@ -1611,10 +1706,12 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     history["sightings"] = present_sightings(sightings)
     if playlists is None:
         history["playlists"] = []
-        history["playlists_reason"] = "Data temporarily unavailable. Stored playlists could not be read on this request."
+        history["playlist_counts"] = empty_playlist_counts()
+        history["playlists_reason"] = PLAYLIST_READ_ERROR
     else:
-        history["playlists"] = present_playlists(playlists)
-        history["playlists_reason"] = None if history["playlists"] else PLAYLIST_UNAVAILABLE
+        history["playlists"], history["playlist_counts"] = present_playlist_rows(playlists, moment)
+        history["playlists_reason"] = None if history["playlists"] else PLAYLIST_NOT_CRAWLED
+    history["playlists_note"] = PLAYLIST_SPOTIFY_NOTE
     if track_rows is None:
         history["tracks"] = []
         history["tracks_reason"] = TRACKS_READ_ERROR

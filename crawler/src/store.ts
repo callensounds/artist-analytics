@@ -215,10 +215,18 @@ CREATE TABLE IF NOT EXISTS playlist_appearances (
     position INTEGER,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    source TEXT,
+    editorial INTEGER,
     UNIQUE (artist_id, playlist_id)
 );
 CREATE INDEX IF NOT EXISTS idx_playlist_artist_seen
     ON playlist_appearances (artist_id, last_seen_at);
+CREATE TABLE IF NOT EXISTS playlist_crawls (
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    crawled_at TEXT NOT NULL,
+    PRIMARY KEY (artist_id, source)
+);
 CREATE TABLE IF NOT EXISTS metric_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     artist_id INTEGER NOT NULL,
@@ -344,7 +352,7 @@ export function parseUtc(value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-export const LATEST_MIGRATION = "0012_deezer.sql";
+export const LATEST_MIGRATION = "0013_deezer_playlists.sql";
 
 const MIGRATION_VERSIONS = [
   "0001_crawl.sql",
@@ -358,6 +366,7 @@ const MIGRATION_VERSIONS = [
   "0009_itunes_charts.sql",
   "0010_artist_tracks.sql",
   "0011_read_budget.sql",
+  "0012_deezer.sql",
   LATEST_MIGRATION,
 ];
 
@@ -527,6 +536,8 @@ export async function migrate(store: Store): Promise<void> {
   await ensureColumn(store, "crawl_state", "related_tracked", "ALTER TABLE crawl_state ADD COLUMN related_tracked INTEGER");
   await ensureColumn(store, "artists", "deezer_id", "ALTER TABLE artists ADD COLUMN deezer_id TEXT");
   await ensureColumn(store, "artists", "deezer_nb_album", "ALTER TABLE artists ADD COLUMN deezer_nb_album INTEGER");
+  await ensureColumn(store, "playlist_appearances", "source", "ALTER TABLE playlist_appearances ADD COLUMN source TEXT");
+  await ensureColumn(store, "playlist_appearances", "editorial", "ALTER TABLE playlist_appearances ADD COLUMN editorial INTEGER");
   for (const sql of READ_BUDGET_SQL) {
     await store.batch([{ sql, params: [] }]);
   }
@@ -868,6 +879,85 @@ export async function saveMusicBrainzReleases(
     ),
     artistName,
   );
+}
+
+export const PLAYLIST_WRITE_CAP = 50;
+
+export interface PlaylistPlacement {
+  id: string;
+  title: string;
+  ownerName: string | null;
+  fans: number | null;
+  fansKnown: boolean;
+  editorial: boolean;
+}
+
+/** Upsert Deezer placements. first_seen_at stays on conflict. A missing fan count is not written as 0. */
+export async function saveDeezerPlaylists(
+  store: Store,
+  artistId: number,
+  artistName: string,
+  playlists: PlaylistPlacement[],
+  now = new Date(),
+): Promise<number> {
+  const stamp = utcNow(now);
+  const seen = new Set<string>();
+  const known: unknown[][] = [];
+  const unchecked: unknown[][] = [];
+  for (const playlist of playlists) {
+    if (known.length + unchecked.length >= PLAYLIST_WRITE_CAP) break;
+    const id = String(playlist.id || "").trim();
+    const title = String(playlist.title || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    if (!/^\d{1,32}$/.test(id) || !title || seen.has(id)) continue;
+    seen.add(id);
+    const owner = String(playlist.ownerName || "").replace(/\s+/g, " ").trim().slice(0, 120) || null;
+    const fans = playlist.fansKnown ? whole(playlist.fans) : null;
+    const row = [artistId, id, title, owner, fans, null, stamp, stamp, "deezer", playlist.editorial ? 1 : 0];
+    if (playlist.fansKnown) known.push(row);
+    else unchecked.push(row);
+  }
+  const kept = known.length + unchecked.length;
+  const detail = `${crawlLabel(artistName)} | deezer_playlists=ok (${kept} playlists)`.slice(0, 2000);
+  const updateKnown = `ON CONFLICT(artist_id, playlist_id) DO UPDATE SET
+      playlist_name = excluded.playlist_name,
+      owner_name = COALESCE(excluded.owner_name, playlist_appearances.owner_name),
+      follower_count = excluded.follower_count,
+      position = COALESCE(excluded.position, playlist_appearances.position),
+      last_seen_at = excluded.last_seen_at,
+      source = excluded.source,
+      editorial = excluded.editorial`;
+  const updateUnchecked = `ON CONFLICT(artist_id, playlist_id) DO UPDATE SET
+      playlist_name = excluded.playlist_name,
+      owner_name = COALESCE(excluded.owner_name, playlist_appearances.owner_name),
+      position = COALESCE(excluded.position, playlist_appearances.position),
+      last_seen_at = excluded.last_seen_at,
+      source = excluded.source,
+      editorial = excluded.editorial`;
+  const insert = `INSERT INTO playlist_appearances (
+      artist_id, playlist_id, playlist_name, owner_name, follower_count, position,
+      first_seen_at, last_seen_at, source, editorial
+    )`;
+  await commitWrites(
+    store,
+    [
+      ...chunkedInsert(insert, known, updateKnown),
+      ...chunkedInsert(insert, unchecked, updateUnchecked),
+      {
+        sql: `INSERT INTO playlist_crawls (artist_id, source, crawled_at) VALUES (?, 'deezer', ?)
+              ON CONFLICT(artist_id, source) DO UPDATE SET crawled_at = excluded.crawled_at`,
+        params: [artistId, stamp],
+      },
+      {
+        sql: `INSERT INTO crawl_runs (
+            started_at, finished_at, status, artists_attempted, artists_ok, artists_error,
+            snapshots_written, edges_written, discovered, detail
+          ) VALUES (?, ?, 'ok', 1, 1, 0, 0, 0, 0, ?)`,
+        params: [stamp, stamp, detail],
+      },
+    ],
+    artistName,
+  );
+  return kept;
 }
 
 async function relatedTracked(store: Store, now: Date): Promise<number> {

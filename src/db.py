@@ -225,7 +225,7 @@ class D1Database:
 
 # Bump this when a new file is added under src/migrations. A database that
 # already has this version skips the per-file probes.
-LATEST_MIGRATION = "0012_deezer.sql"
+LATEST_MIGRATION = "0013_deezer_playlists.sql"
 
 # One successful migrate per database object (or its D1 binding). The next
 # request on that isolate does not read schema_migrations again.
