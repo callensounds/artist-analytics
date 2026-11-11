@@ -13,7 +13,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "workers-py",
+    # 1.17.9 refuses uv older than 0.13.4. Workers Builds currently provides 0.12.23.
+    "workers-py==1.17.8",
     "workers-runtime-sdk",
     "pytest",
     "httpx",
