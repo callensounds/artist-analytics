@@ -33,8 +33,8 @@ import {
 import { backfillAlerts, clearBackfillDone, markAlertChecked, recordAlerts } from "./alerts";
 import { parseReleaseGroups } from "./releases";
 import { ingestItunesCharts } from "./charts";
-import { DeezerBusy, fetchDeezer } from "./deezer";
-import { type SavedSource, type Store, migrate, parseUtc, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
+import { DeezerBusy, fetchDeezer, fetchDeezerPlaylists } from "./deezer";
+import { type SavedSource, type Store, migrate, parseUtc, saveDeezerPlaylists, saveMusicBrainzReleases, saveSource, utcNow } from "./store";
 
 export const RETRY_DELAY_SECONDS = 180;
 export const RETRY_DELAY_MIN_SECONDS = 120;
@@ -89,7 +89,7 @@ export interface CrawlMessage {
   mbid?: string;
 }
 
-const PROVIDERS = new Set(["musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube", "deezer"]);
+const PROVIDERS = new Set(["musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube", "deezer", "deezer_playlists"]);
 
 let mbNext = 0;
 
@@ -213,7 +213,14 @@ async function ensureArtist(store: Store, name: string, origin: string, now: Dat
   return store.first("SELECT * FROM artists WHERE normalized_name = ?", [normalized]);
 }
 
-async function sendFollowups(env: CrawlEnv, artistId: number, links: MbLinks, fresh: Set<string>, blocked: boolean): Promise<void> {
+async function sendFollowups(
+  env: CrawlEnv,
+  artistId: number,
+  links: MbLinks,
+  fresh: Set<string>,
+  blocked: boolean,
+  storedDeezerId = "",
+): Promise<void> {
   const providers: string[] = [];
   if (links.spotify_id && !fresh.has("spotify")) providers.push("spotify");
   if (links.instagram && !fresh.has("instagram")) providers.push("instagram");
@@ -221,6 +228,8 @@ async function sendFollowups(env: CrawlEnv, artistId: number, links: MbLinks, fr
   if (!blocked && !fresh.has("apple")) providers.push("apple");
   if (env.YOUTUBE_API_KEY && !fresh.has("youtube")) providers.push("youtube");
   if (!fresh.has("deezer")) providers.push("deezer");
+  const deezerId = /^\d+$/.test(links.deezer_id) ? links.deezer_id : /^\d+$/.test(storedDeezerId) ? storedDeezerId : "";
+  if (deezerId) providers.push("deezer_playlists");
   for (const provider of providers) {
     await env.CRAWL_QUEUE.send({ artist_id: artistId, provider });
   }
@@ -546,6 +555,45 @@ async function youtube(name: string, channelId: string, apiKey: string): Promise
   };
 }
 
+async function crawlDeezerPlaylists(
+  env: CrawlEnv,
+  row: Record<string, unknown>,
+  now: Date,
+): Promise<{ ok: boolean; detail: string }> {
+  const artistId = Number(row.id);
+  const deezerId = String(row.deezer_id || "");
+  if (!/^\d+$/.test(deezerId)) return { ok: true, detail: `${row.name} | deezer_playlists=unavailable` };
+  const mark = await env.DB.first<{ crawled_at: string }>(
+    "SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer'",
+    [artistId],
+  );
+  const crawled = parseUtc(mark?.crawled_at);
+  if (crawled && now.getTime() - crawled.getTime() < FRESH_SECONDS * 1000) {
+    return { ok: true, detail: `${row.name} | deezer_playlists=ok (fresh)` };
+  }
+  let fetched;
+  try {
+    fetched = await fetchDeezerPlaylists(deezerId);
+  } catch (error) {
+    if (error instanceof DeezerBusy) throw new RetryableFetch(retryDelaySeconds(null), error.message);
+    throw error;
+  }
+  if (!fetched.ok) {
+    const detail = `${row.name} | deezer_playlists=error (${fetched.reason || "Deezer playlists failed."})`.slice(0, 2000);
+    await env.DB.batch([
+      {
+        sql: `INSERT INTO crawl_runs (
+            started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail
+          ) VALUES (?, ?, 'error', 1, 0, 1, ?)`,
+        params: [utcNow(now), utcNow(now), detail],
+      },
+    ]);
+    return { ok: false, detail };
+  }
+  const written = await saveDeezerPlaylists(env.DB, artistId, String(row.name || ""), fetched.playlists, now);
+  return { ok: true, detail: `${row.name} | deezer_playlists=ok (${written})` };
+}
+
 async function knownRow(store: Store, fields: CrawlMessage, now: Date): Promise<Record<string, unknown> | null> {
   if (fields.artist_id !== undefined && fields.artist_id !== null) {
     return store.first("SELECT * FROM artists WHERE id = ? AND tracked = 1", [fields.artist_id]);
@@ -596,10 +644,11 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
       const fresh = await freshSources(env.DB, artistId, now);
       const blocked = await appleBlocked(env.DB, now);
       const links = identity.status === "ok" ? identity.links : emptyLinks();
-      await sendFollowups(env, artistId, links, fresh, blocked);
+      await sendFollowups(env, artistId, links, fresh, blocked, String(row.deezer_id || ""));
     }
     return { ok: identity.status !== "error", detail: `${row.name} | musicbrainz=${identity.status}` };
   }
+  if (provider === "deezer_playlists") return crawlDeezerPlaylists(env, row, now);
   if (provider === "apple" && (await appleBlocked(env.DB, now))) {
     return { ok: true, detail: `${row.name} | apple=ok (skipped during Apple backoff)` };
   }
@@ -633,6 +682,9 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   if (saved.forbidden) await blockApple(env.DB, now);
   const relatedCap = provider === "spotify" ? numberSetting(env.RELATED_AUTOTRACK_CAP, 25, 500) : 0;
   const written = await saveSource(env.DB, row, saved, now, relatedCap);
+  if (provider === "deezer" && saved.deezerId && saved.status !== "error") {
+    await env.CRAWL_QUEUE.send({ artist_id: artistId, provider: "deezer_playlists" });
+  }
   if (written.snapshots > 0 && (provider === "spotify" || provider === "instagram" || provider === "tiktok")) {
     try {
       const alerts = await recordAlerts(env.DB, artistId, now);

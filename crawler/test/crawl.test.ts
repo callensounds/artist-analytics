@@ -8,6 +8,7 @@ import {
   RETRY_DELAY_MIN_SECONDS,
   RetryableFetch,
   handleMessage,
+  messageFields,
   resetMusicBrainzPace,
   retryDelaySeconds,
   runQueue,
@@ -343,6 +344,23 @@ describe("crawler messages", () => {
   });
 });
 
+describe("deezer playlist follow-ups", () => {
+  it("queues a playlist message when a Deezer artist id is already known", async () => {
+    resetMusicBrainzPace();
+    const musicbrainz = JSON.stringify({
+      artists: [{ id: "mb-clairo", name: "Clairo", score: 100, relations: [] }],
+    });
+    const { env, sent, db } = memoryEnv({ "musicbrainz.org": { body: musicbrainz } });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id) VALUES ('Clairo', 'clairo', 'search', 1, ?, '27')",
+    ).run("2020-01-01T00:00:00Z");
+    await handleMessage(env, { artist_id: 1, provider: "musicbrainz" }, new Date("2026-10-30T21:00:00Z"));
+    expect(sent).toContainEqual({ artist_id: 1, provider: "deezer_playlists" });
+    expect(messageFields({ artist_id: 1, provider: "deezer_playlists" }).provider).toBe("deezer_playlists");
+  });
+});
+
 describe("playlist schema", () => {
   it("creates an empty playlist_appearances table", async () => {
     const db = new DatabaseSync(":memory:");
@@ -352,6 +370,13 @@ describe("playlist schema", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 0 });
     const version = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0004_playlist_appearances.sql");
     expect(version).toBeTruthy();
+    const latest = db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0013_deezer_playlists.sql");
+    expect(latest).toBeTruthy();
+    const columns = db.prepare("PRAGMA table_info(playlist_appearances)").all() as { name: string }[];
+    expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining(["source", "editorial"]));
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'playlist_crawls'").get()).toEqual({
+      name: "playlist_crawls",
+    });
   });
 });
 

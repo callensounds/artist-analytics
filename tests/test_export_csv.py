@@ -136,6 +136,52 @@ def test_csv_keeps_exact_values_and_caps_each_section():
     assert release["release_type"] == "Album"
     assert "-01-01" not in release["published_at"]
     assert EXPORT_ROW_CAP == 5000
+    with_playlists = render_export_csv(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+            {
+                "playlist_id": "10",
+                "playlist_name": "Pop Hits",
+                "owner_name": "Deezer Charts",
+                "follower_count": None,
+                "position": None,
+                "first_seen_at": "2026-11-10T15:04:05Z",
+                "last_seen_at": "2026-11-11T15:04:05Z",
+                "source": "deezer",
+                "editorial": 1,
+            },
+            {
+                "playlist_id": "11",
+                "playlist_name": "Road Trip",
+                "owner_name": "Sam",
+                "follower_count": 0,
+                "position": 0,
+                "first_seen_at": "2026-11-02T00:00:00Z",
+                "last_seen_at": "2026-11-11T15:04:05Z",
+                "source": "deezer",
+                "editorial": 0,
+            },
+        ],
+    )
+    parsed_playlists = list(csv.DictReader(io.StringIO(with_playlists)))
+    assert [row["title"] for row in parsed_playlists] == ["Pop Hits", "Road Trip"]
+    assert parsed_playlists[0]["section"] == "playlist"
+    assert parsed_playlists[0]["provider"] == "deezer"
+    assert parsed_playlists[0]["value"] == ""
+    assert parsed_playlists[0]["external_id"] == "10"
+    assert parsed_playlists[0]["to_name"] == "Deezer Charts"
+    assert parsed_playlists[0]["kind"] == "editorial"
+    assert parsed_playlists[0]["first_seen_at"] == "2026-11-10T15:04:05Z"
+    assert parsed_playlists[0]["last_seen_at"] == "2026-11-11T15:04:05Z"
+    assert parsed_playlists[0]["rank"] == ""
+    assert parsed_playlists[1]["value"] == "0"
+    assert parsed_playlists[1]["kind"] == ""
+    assert parsed_playlists[1]["rank"] == ""
 
 
 def test_export_route_reads_d1_only(monkeypatch, tmp_path):
@@ -164,6 +210,15 @@ def test_export_route_reads_d1_only(monkeypatch, tmp_path):
             INSERT INTO content_sightings
                 (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
             VALUES (?, 'apple', 'drop', 'Exact drop', 'release', '2026-08-23T07:00:00Z', 'time', '2026-11-01T00:00:00Z')
+            """,
+            (artist_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO playlist_appearances (
+                artist_id, playlist_id, playlist_name, owner_name, follower_count, position,
+                first_seen_at, last_seen_at, source, editorial
+            ) VALUES (?, '10', 'Pop Hits', 'Deezer Charts', NULL, NULL, '2026-11-10T15:04:05Z', '2026-11-11T15:04:05Z', 'deezer', 1)
             """,
             (artist_id,),
         )
@@ -197,6 +252,13 @@ def test_export_route_reads_d1_only(monkeypatch, tmp_path):
     assert parsed[0]["section"] == "metric"
     assert parsed[0]["value"] == "12"
     assert any(row["section"] == "sighting" and row["precision"] == "time" for row in parsed)
+    playlist = next(row for row in parsed if row["section"] == "playlist")
+    assert playlist["title"] == "Pop Hits"
+    assert playlist["provider"] == "deezer"
+    assert playlist["value"] == ""
+    assert playlist["external_id"] == "10"
+    assert playlist["kind"] == "editorial"
+    assert playlist["first_seen_at"] == "2026-11-10T15:04:05Z"
     assert "1.2M" not in downloaded.text
     slug = client.get("/artist/clairo/export.csv", follow_redirects=False)
     assert slug.status_code == 303

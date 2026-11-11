@@ -847,6 +847,7 @@ async def export_artist_csv(request: Request, key: str):
         rows.get("releases") or [],
         rows.get("tracks") or [],
         rows.get("charts") or [],
+        rows.get("playlists") or [],
     )
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(
