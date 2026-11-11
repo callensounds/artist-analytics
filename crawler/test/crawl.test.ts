@@ -42,14 +42,16 @@ function sqliteStore(db: DatabaseSync): Store {
 function memoryEnv(
   pages: Record<string, { status?: number; body: string; headers?: Record<string, string> }>,
   key?: string,
-): { env: CrawlEnv; sent: unknown[]; db: DatabaseSync } {
+): { env: CrawlEnv; sent: unknown[]; delays: (number | undefined)[]; db: DatabaseSync } {
   const db = new DatabaseSync(":memory:");
   const sent: unknown[] = [];
+  const delays: (number | undefined)[] = [];
   const env: CrawlEnv = {
     DB: sqliteStore(db),
     CRAWL_QUEUE: {
-      send(body) {
+      send(body, options) {
         sent.push(body);
+        delays.push(options?.delaySeconds);
       },
     },
     YOUTUBE_API_KEY: key,
@@ -61,8 +63,17 @@ function memoryEnv(
     const status = page.status ?? 200;
     return new Response(page.body, { status, headers: page.headers });
   });
-  return { env, sent, db };
+  return { env, sent, delays, db };
 }
+
+function immediateTimers() {
+  return vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: TimerHandler) => {
+    if (typeof fn === "function") fn();
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+}
+
+const CYCLE = ["musicbrainz", "spotify", "instagram", "tiktok", "apple", "deezer", "deezer_playlists"];
 
 const pad = "<!--pad-->".repeat(9000);
 
@@ -113,8 +124,10 @@ describe("crawler messages", () => {
     expect(run.artists_attempted).toBe(1);
   });
 
-  it("stores MusicBrainz ids, fans out providers, and writes Spotify, Instagram, and TikTok snapshots", async () => {
+  it("stores MusicBrainz ids and writes Spotify, Instagram, and TikTok in that same message", async () => {
     resetMusicBrainzPace();
+    const timer = immediateTimers();
+    try {
     const spotify =
       pad +
       '<div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>' +
@@ -161,16 +174,7 @@ describe("crawler messages", () => {
     expect(artist.tiktok_handle).toBe("jbrekkie");
     expect(artist.apple_id).toBe("12345");
     expect(artist.musicbrainz_id).toBe("mb-jb");
-    expect(sent).toEqual([
-      { artist_id: 1, provider: "spotify" },
-      { artist_id: 1, provider: "instagram" },
-      { artist_id: 1, provider: "tiktok" },
-      { artist_id: 1, provider: "apple" },
-      { artist_id: 1, provider: "deezer" },
-    ]);
-    for (const body of sent) {
-      await handleMessage(env, body as { artist_id: number; provider: string }, new Date("2026-10-30T21:00:00Z"));
-    }
+    expect(sent).toEqual([]);
     const snaps = db.prepare("SELECT source, metric, value FROM metric_snapshots").all() as { source: string; metric: string; value: number }[];
     const byKey = Object.fromEntries(snaps.map((row) => [`${row.source}:${row.metric}`, row.value]));
     expect(byKey["spotify:Monthly listeners"]).toBe(1473027);
@@ -193,11 +197,14 @@ describe("crawler messages", () => {
     });
     await handleMessage(env, { artist_id: 1, provider: "apple" }, new Date("2026-10-30T21:10:00Z"));
     expect(calls).toEqual([]);
+    } finally {
+      timer.mockRestore();
+    }
   });
 
-  it("retries a dropped connection with 120–300s jitter and does not ack", async () => {
+  it("acks a dropped connection and sends one follow-up with 120–300s jitter", async () => {
     resetMusicBrainzPace();
-    const { env, db } = memoryEnv({});
+    const { env, sent, delays, db } = memoryEnv({});
     vi.stubGlobal("fetch", async () => {
       throw new Error("network down");
     });
@@ -207,17 +214,19 @@ describe("crawler messages", () => {
     );
     const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
     const result = await runQueue([message], env);
-    expect(result).toEqual({ acked: 0, retried: 1 });
-    expect(message.acked).toBe(false);
-    expect(message.delay).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
-    expect(message.delay).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+    expect(result).toEqual({ acked: 1, retried: 0 });
+    expect(message.acked).toBe(true);
+    expect(message.retried).toBe(false);
+    expect(sent).toEqual([{ artist_id: 1, providers: CYCLE }]);
+    expect(delays[0]).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
+    expect(delays[0]).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
     expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
     expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
   });
 
   it("retries MusicBrainz 503 and honors Retry-After without recording an error", async () => {
     resetMusicBrainzPace();
-    const { env, db } = memoryEnv({
+    const { env, sent, delays, db } = memoryEnv({
       "musicbrainz.org": { status: 503, body: "upstream unavailable", headers: { "retry-after": "250" } },
     });
     await migrate(env.DB);
@@ -226,9 +235,11 @@ describe("crawler messages", () => {
     );
     const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
     const result = await runQueue([message], env);
-    expect(result).toEqual({ acked: 0, retried: 1 });
-    expect(message.acked).toBe(false);
-    expect(message.delay).toBe(250);
+    expect(result).toEqual({ acked: 1, retried: 0 });
+    expect(message.acked).toBe(true);
+    expect(message.retried).toBe(false);
+    expect(sent).toEqual([{ artist_id: 1, providers: CYCLE }]);
+    expect(delays).toEqual([250]);
     expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
     expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
   });
@@ -245,8 +256,8 @@ describe("crawler messages", () => {
     expect(jitter).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
   });
 
-  it("retries Spotify 429 and Apple 503, and still acks an Apple 403", async () => {
-    const { env, db } = memoryEnv({
+  it("retries Spotify 429 and Apple 503 with one follow-up each, and still acks an Apple 403", async () => {
+    const { env, sent, delays, db } = memoryEnv({
       "open.spotify.com/artist/": { status: 429, body: "", headers: { "retry-after": "180" } },
     });
     await migrate(env.DB);
@@ -254,8 +265,11 @@ describe("crawler messages", () => {
       "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
     ).run("2020-01-01T00:00:00Z");
     const spotify = queueMessage({ artist_id: 1, provider: "spotify" });
-    expect(await runQueue([spotify], env)).toEqual({ acked: 0, retried: 1 });
-    expect(spotify.delay).toBe(180);
+    expect(await runQueue([spotify], env)).toEqual({ acked: 1, retried: 0 });
+    expect(spotify.acked).toBe(true);
+    expect(spotify.retried).toBe(false);
+    expect(sent).toEqual([{ artist_id: 1, providers: ["spotify"] }]);
+    expect(delays).toEqual([180]);
     expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
 
     vi.stubGlobal("fetch", async (input: string | URL) => {
@@ -264,21 +278,26 @@ describe("crawler messages", () => {
       return new Response("", { status: 404 });
     });
     const appleBusy = queueMessage({ artist_id: 1, provider: "apple" });
-    expect(await runQueue([appleBusy], env)).toEqual({ acked: 0, retried: 1 });
-    expect(appleBusy.delay).toBe(RETRY_DELAY_MIN_SECONDS);
+    expect(await runQueue([appleBusy], env)).toEqual({ acked: 1, retried: 0 });
+    expect(appleBusy.acked).toBe(true);
+    expect(appleBusy.retried).toBe(false);
+    expect(sent[1]).toEqual({ artist_id: 1, providers: ["apple"] });
+    expect(delays[1]).toBe(RETRY_DELAY_MIN_SECONDS);
     expect(db.prepare("SELECT apple_blocked_until FROM crawl_state WHERE id = 1").get()).toBeUndefined();
 
     vi.stubGlobal("fetch", async () => new Response("", { status: 403 }));
     const appleBlocked = queueMessage({ artist_id: 1, provider: "apple" });
     expect(await runQueue([appleBlocked], env)).toEqual({ acked: 1, retried: 0 });
     expect(appleBlocked.acked).toBe(true);
+    expect(appleBlocked.retried).toBe(false);
+    expect(sent).toHaveLength(2);
     const state = db.prepare("SELECT apple_blocked_until FROM crawl_state WHERE id = 1").get() as { apple_blocked_until: string };
     expect(state.apple_blocked_until).toBeTruthy();
   });
 
   it("retries a MusicBrainz body that fails mid-read", async () => {
     resetMusicBrainzPace();
-    const { env, db } = memoryEnv({});
+    const { env, sent, delays, db } = memoryEnv({});
     vi.stubGlobal("fetch", async () => {
       return new Response(
         new ReadableStream({
@@ -295,10 +314,12 @@ describe("crawler messages", () => {
     );
     const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
     await runQueue([message], env);
-    expect(message.acked).toBe(false);
-    expect(message.retried).toBe(true);
-    expect(message.delay).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
-    expect(message.delay).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+    expect(message.acked).toBe(true);
+    expect(message.retried).toBe(false);
+    expect(sent).toEqual([{ artist_id: 1, providers: CYCLE }]);
+    expect(delays[0]).toBeGreaterThanOrEqual(RETRY_DELAY_MIN_SECONDS);
+    expect(delays[0]).toBeLessThanOrEqual(RETRY_DELAY_MAX_SECONDS);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
   });
 
   it("spaces MusicBrainz requests 1.5–2s apart on the isolate", async () => {
@@ -328,25 +349,39 @@ describe("crawler messages", () => {
     }
   });
 
-  it("acks a MusicBrainz 500 as a finished error", async () => {
+  it("acks a MusicBrainz 500 and still crawls the other providers", async () => {
     resetMusicBrainzPace();
-    const { env, db } = memoryEnv({ "musicbrainz.org": { status: 500, body: "nope" } });
+    const timer = immediateTimers();
+    const spotify = '<div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>';
+    const { env, sent, db } = memoryEnv({
+      "musicbrainz.org": { status: 500, body: "nope" },
+      "open.spotify.com/artist/": { body: spotify },
+    });
     await migrate(env.DB);
-    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Broken', 'broken', 'search', 1, ?)").run(
-      "2020-01-01T00:00:00Z",
-    );
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Broken', 'broken', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
+    ).run("2020-01-01T00:00:00Z");
     const message = queueMessage({ artist_id: 1, provider: "musicbrainz" });
-    expect(await runQueue([message], env)).toEqual({ acked: 1, retried: 0 });
-    expect(message.acked).toBe(true);
-    const run = db.prepare("SELECT status FROM crawl_runs").get() as { status: string };
-    expect(run.status).toBe("error");
-    expect(db.prepare("SELECT last_crawled_at FROM artists WHERE id = 1").get()).toEqual({ last_crawled_at: null });
+    try {
+      expect(await runQueue([message], env)).toEqual({ acked: 1, retried: 0 });
+      expect(message.acked).toBe(true);
+      expect(message.retried).toBe(false);
+      expect(sent).toEqual([]);
+      const runs = db.prepare("SELECT status, detail FROM crawl_runs").all() as { status: string; detail: string }[];
+      expect(runs.some((run) => run.status === "error" && run.detail.includes("musicbrainz=error"))).toBe(true);
+      expect(db.prepare("SELECT value FROM metric_snapshots WHERE source = 'spotify' AND metric = 'Monthly listeners'").get()).toEqual({
+        value: 1473027,
+      });
+    } finally {
+      timer.mockRestore();
+    }
   });
 });
 
 describe("deezer playlist follow-ups", () => {
-  it("queues a playlist message when a Deezer artist id is already known", async () => {
+  it("does not enqueue a second deezer_playlists message when the id is already known", async () => {
     resetMusicBrainzPace();
+    const timer = immediateTimers();
     const musicbrainz = JSON.stringify({
       artists: [{ id: "mb-clairo", name: "Clairo", score: 100, relations: [] }],
     });
@@ -355,9 +390,239 @@ describe("deezer playlist follow-ups", () => {
     db.prepare(
       "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id) VALUES ('Clairo', 'clairo', 'search', 1, ?, '27')",
     ).run("2020-01-01T00:00:00Z");
-    await handleMessage(env, { artist_id: 1, provider: "musicbrainz" }, new Date("2026-10-30T21:00:00Z"));
-    expect(sent).toContainEqual({ artist_id: 1, provider: "deezer_playlists" });
-    expect(messageFields({ artist_id: 1, provider: "deezer_playlists" }).provider).toBe("deezer_playlists");
+    try {
+      await handleMessage(env, { artist_id: 1, provider: "musicbrainz" }, new Date("2026-10-30T21:00:00Z"));
+      expect(sent.filter((body) => JSON.stringify(body).includes("deezer_playlists"))).toEqual([]);
+      expect(messageFields({ artist_id: 1, provider: "deezer_playlists" }).provider).toBe("deezer_playlists");
+    } finally {
+      timer.mockRestore();
+    }
+  });
+});
+
+describe("queue budget", () => {
+  it("sends one queue message for an artist cycle and does not duplicate deezer playlists", async () => {
+    resetMusicBrainzPace();
+    const timer = immediateTimers();
+    const urls: string[] = [];
+    const { env, sent, db } = memoryEnv({});
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("release-group")) return new Response(JSON.stringify({ "release-groups": [] }), { status: 200 });
+      if (url.includes("musicbrainz.org")) {
+        return new Response(JSON.stringify({
+          artists: [{
+            id: "mb-budget",
+            name: "Budget",
+            score: 100,
+            relations: [{ url: { resource: "https://open.spotify.com/artist/1111111111111111111111" } }],
+          }],
+        }), { status: 200 });
+      }
+      if (url.includes("open.spotify.com")) {
+        return new Response('<div data-testid="monthly-listeners-label">9,000 monthly listeners</div>', { status: 200 });
+      }
+      if (url.includes("/playlists")) {
+        return new Response(JSON.stringify({
+          data: [{ id: 10, title: "Pop Hits", fans: 3, user: { id: 9, name: "Sam" } }],
+        }), { status: 200 });
+      }
+      if (url.includes("/search/artist")) {
+        return new Response(JSON.stringify({
+          data: [{ id: 27, name: "Budget", nb_fan: 10, link: "https://www.deezer.com/artist/27" }],
+        }), { status: 200 });
+      }
+      if (url.includes("api.deezer.com/artist/27")) {
+        return new Response(JSON.stringify({
+          id: 27,
+          name: "Budget",
+          nb_fan: 10,
+          nb_album: 1,
+          link: "https://www.deezer.com/artist/27",
+        }), { status: 200 });
+      }
+      if (url.includes("api.deezer.com")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      if (url.includes("itunes.apple.com")) return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      return new Response("", { status: 404 });
+    });
+    try {
+      await migrate(env.DB);
+      db.prepare(
+        "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Budget', 'budget', 'search', 1, ?)",
+      ).run("2020-01-01T00:00:00Z");
+      const scheduled = await runScheduled(env, new Date("2026-11-11T12:00:00Z"));
+      expect(scheduled).toMatchObject({ status: "queued", attempted: 1 });
+      expect(sent).toEqual([{ artist_id: 1, provider: "musicbrainz" }]);
+      const message = queueMessage(sent[0]);
+      await runQueue([message], env);
+      expect(sent.length).toBeLessThanOrEqual(2);
+      expect(sent).toHaveLength(1);
+      expect(JSON.stringify(sent)).not.toContain("deezer_playlists");
+      expect(message.acked).toBe(true);
+      expect(message.retried).toBe(false);
+      expect(urls.filter((url) => url.includes("/playlists"))).toHaveLength(1);
+      expect(db.prepare("SELECT playlist_name FROM playlist_appearances WHERE playlist_id = '10'").get()).toEqual({
+        playlist_name: "Pop Hits",
+      });
+      expect(db.prepare("SELECT value FROM metric_snapshots WHERE source = 'spotify'").get()).toEqual({ value: 9000 });
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  it("acks a retryable step and sends one follow-up for the providers still left", async () => {
+    const urls: string[] = [];
+    const { env, sent, delays, db } = memoryEnv({});
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("open.spotify.com")) return new Response("", { status: 429, headers: { "retry-after": "180" } });
+      if (url.includes("api.deezer.com/artist/27")) {
+        return new Response(JSON.stringify({
+          id: 27,
+          name: "Budget",
+          nb_fan: 10,
+          nb_album: 1,
+          link: "https://www.deezer.com/artist/27",
+        }), { status: 200 });
+      }
+      if (url.includes("api.deezer.com")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      if (url.includes("instagram.com")) return new Response("instagram-should-not-run", { status: 200 });
+      return new Response("", { status: 404 });
+    });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id, instagram_handle, deezer_id) VALUES ('Budget', 'budget', 'search', 1, ?, 'abc', 'budget', '27')",
+    ).run("2020-01-01T00:00:00Z");
+    const message = queueMessage({ artist_id: 1, providers: ["deezer", "spotify", "instagram"] });
+    expect(await runQueue([message], env)).toEqual({ acked: 1, retried: 0 });
+    expect(message.acked).toBe(true);
+    expect(message.retried).toBe(false);
+    expect(sent).toEqual([{ artist_id: 1, providers: ["spotify", "instagram"] }]);
+    expect(delays).toEqual([180]);
+    expect(urls.some((url) => url.includes("instagram.com"))).toBe(false);
+    expect(db.prepare("SELECT value FROM metric_snapshots WHERE source = 'deezer' AND metric = 'Fans'").get()).toEqual({ value: 10 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs WHERE status = 'error'").get()).toEqual({ n: 0 });
+  });
+
+  it("still handles a single-provider message, a search message, and an inline MusicBrainz lookup", async () => {
+    resetMusicBrainzPace();
+    const timer = immediateTimers();
+    const urls: string[] = [];
+    const { env, sent, db } = memoryEnv({});
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/artist/mb-inline")) {
+        return new Response(JSON.stringify({
+          name: "Search Artist",
+          relations: [{ url: { resource: "https://open.spotify.com/artist/2222222222222222222222" } }],
+        }), { status: 200 });
+      }
+      if (url.includes("musicbrainz.org/ws/2/artist/?")) {
+        return new Response(JSON.stringify({
+          artists: [{ id: "mb-inline", name: "Search Artist", score: 100 }],
+        }), { status: 200 });
+      }
+      if (url.includes("release-group")) return new Response(JSON.stringify({ "release-groups": [] }), { status: 200 });
+      if (url.includes("open.spotify.com/artist/abc")) {
+        return new Response('<div data-testid="monthly-listeners-label">4,200 monthly listeners</div>', { status: 200 });
+      }
+      if (url.includes("api.deezer.com/artist/27/") || url.endsWith("/artist/27")) {
+        return new Response(JSON.stringify({
+          id: 27,
+          name: "Old Deezer",
+          nb_fan: 8,
+          nb_album: 1,
+          link: "https://www.deezer.com/artist/27",
+        }), { status: 200 });
+      }
+      if (url.includes("/playlists")) return new Response(JSON.stringify({ data: [{ id: 99, title: "Should Not Queue" }] }), { status: 200 });
+      return new Response(JSON.stringify({ results: [], data: [] }), { status: 200 });
+    });
+    try {
+      await migrate(env.DB);
+      db.prepare(
+        "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id, instagram_handle) VALUES ('Old Shape', 'oldshape', 'search', 1, ?, 'abc', 'oldshape')",
+      ).run("2020-01-01T00:00:00Z");
+      db.prepare(
+        "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id) VALUES ('Old Deezer', 'olddeezer', 'search', 1, ?, '27')",
+      ).run("2020-01-01T00:00:00Z");
+      const now = new Date("2026-11-11T12:00:00Z");
+      await handleMessage(env, { artist_id: 1, provider: "spotify" }, now);
+      expect(urls.some((url) => url.includes("instagram.com"))).toBe(false);
+      expect(urls.some((url) => url.includes("open.spotify.com/artist/abc"))).toBe(true);
+      expect(db.prepare("SELECT value FROM metric_snapshots WHERE artist_id = 1 AND source = 'spotify'").get()).toEqual({ value: 4200 });
+
+      urls.length = 0;
+      await handleMessage(env, { artist_id: 2, provider: "deezer" }, now);
+      expect(sent).toEqual([]);
+      expect(urls.some((url) => url.includes("/playlists"))).toBe(false);
+      expect(db.prepare("SELECT value FROM metric_snapshots WHERE artist_id = 2 AND source = 'deezer' AND metric = 'Fans'").get()).toEqual({
+        value: 8,
+      });
+
+      await handleMessage(env, { name: "Search Artist", origin: "search", provider: "musicbrainz" }, now);
+      expect(sent).toEqual([]);
+      const created = db.prepare("SELECT spotify_id FROM artists WHERE normalized_name = 'searchartist'").get() as { spotify_id: string };
+      expect(created.spotify_id).toBe("2222222222222222222222");
+      expect(urls.some((url) => url.includes("/artist/mb-inline"))).toBe(true);
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
+  it("skips a provider whose snapshot is still fresh", async () => {
+    const urls: string[] = [];
+    const { env, db } = memoryEnv({});
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      urls.push(String(input));
+      return new Response("", { status: 500 });
+    });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Fresh Source', 'freshsource', 'search', 1, ?, 'abc')",
+    ).run("2020-01-01T00:00:00Z");
+    const now = new Date("2026-11-11T12:00:00Z");
+    db.prepare("INSERT INTO source_freshness (artist_id, source, captured_at) VALUES (1, 'spotify', ?)").run("2026-11-11T11:00:00Z");
+    const result = await handleMessage(env, { artist_id: 1, provider: "spotify" }, now);
+    expect(result.detail).toContain("fresh");
+    expect(urls).toEqual([]);
+  });
+
+  it("keeps chart ingest and alert backfill when the queue hits the daily write limit", async () => {
+    const { env, db } = memoryEnv({});
+    let sends = 0;
+    env.CRAWL_QUEUE = {
+      send() {
+        sends += 1;
+        throw new Error("You have exceeded the daily write operations limit in Queues free tier (10253)");
+      },
+    };
+    await migrate(env.DB);
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('One', 'one', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    db.prepare("INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Two', 'two', 'search', 1, ?)").run(
+      "2020-01-01T00:00:00Z",
+    );
+    db.prepare(
+      "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at) VALUES (1, 'spotify', 'Followers', 1000, '1000', '2026-11-06T00:00:00Z')",
+    ).run();
+    db.prepare(
+      "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at) VALUES (1, 'spotify', 'Followers', 1020, '1020', '2026-11-06T11:00:00Z')",
+    ).run();
+    const result = await runScheduled(env, new Date("2026-11-06T12:00:00Z"));
+    expect(sends).toBe(1);
+    expect(result.status).toBe("queue_limited");
+    expect(result.attempted).toBe(0);
+    expect(result.backfillArtists).toBe(1);
+    expect(result.backfillAlerts).toBe(1);
+    expect(result.charts.status).toBe("error");
+    const runs = db.prepare("SELECT detail FROM crawl_runs").all() as { detail: string }[];
+    expect(runs.filter((run) => run.detail.includes("daily write operations limit"))).toHaveLength(1);
+    expect(db.prepare("SELECT next_artist_id FROM crawl_state WHERE id = 1").get()).toEqual({ next_artist_id: 0 });
   });
 });
 

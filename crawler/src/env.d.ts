@@ -12,7 +12,7 @@ interface D1Database {
 }
 
 interface Queue {
-  send: (body: unknown) => Promise<unknown>;
+  send: (body: unknown, options?: { delaySeconds?: number }) => Promise<unknown>;
 }
 
 interface ScheduledController {
