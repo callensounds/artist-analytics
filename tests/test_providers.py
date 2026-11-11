@@ -1068,7 +1068,10 @@ def test_musicbrainz_requests_are_spaced_and_identified(monkeypatch):
 
     asyncio.run(run())
     assert len(starts) == 2
-    assert starts[1] - starts[0] >= 0.05
+    gap = starts[1] - starts[0]
+    # The slot is 50ms. asyncio.sleep can wake a few milliseconds early.
+    assert gap >= 0.04
+    assert gap < 0.2
     assert seen_headers[0]["User-Agent"] == MB_USER_AGENT
 
 
