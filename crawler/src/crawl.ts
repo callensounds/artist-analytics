@@ -590,7 +590,7 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
     }, now, 0);
     if (identity.status === "ok" && identity.links._mbid) {
       const releases = await musicbrainzReleases(identity.links._mbid);
-      await saveMusicBrainzReleases(env.DB, artistId, releases, now);
+      await saveMusicBrainzReleases(env.DB, artistId, releases, now, String(row.name || ""));
     }
     if (identity.status === "ok" || identity.status === "unavailable") {
       const fresh = await freshSources(env.DB, artistId, now);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 from datetime import datetime, timezone
 
@@ -643,6 +644,48 @@ def _calendar_item(row: dict, precision: str, moment: datetime | None) -> dict:
     return item
 
 
+def _month_grid_html(month: dict) -> str:
+    """One month grid as a string. Titles are escaped. The template does not loop the cells."""
+    parts = ['<div class="calendar-grid grid grid-cols-7 gap-1 text-left text-sm">']
+    for label in month.get("weekdays") or []:
+        parts.append(f'<div class="text-slate-500 py-1 text-center">{html.escape(str(label))}</div>')
+    for cell in month.get("cells") or []:
+        if not cell.get("in_month"):
+            parts.append('<div class="min-h-16 min-w-0 rounded-md p-1"></div>')
+            continue
+        items = cell.get("items") or []
+        if items:
+            klass = "min-h-16 min-w-0 rounded-md p-1 border border-emerald-500/60 bg-slate-800"
+            day_class = "text-emerald-300 font-medium"
+        else:
+            klass = "min-h-16 min-w-0 rounded-md p-1 border border-slate-700"
+            day_class = "text-slate-500"
+        parts.append(f'<div class="{klass}"><div class="{day_class}">{int(cell["day"])}</div>')
+        for item in items:
+            bits = [str(item.get("source_label") or "")]
+            if item.get("clock"):
+                bits.append(str(item["clock"]))
+            if item.get("precision_label"):
+                bits.append(str(item["precision_label"]))
+            title = html.escape(" · ".join(bit for bit in bits if bit), quote=True)
+            name = html.escape(str(item.get("title") or ""))
+            mbid = str(item.get("mbid") or "")
+            if mbid:
+                href = "https://musicbrainz.org/release-group/" + html.escape(mbid, quote=True)
+                inner = f'<a href="{href}" class="hover:text-emerald-300">{name}</a>'
+            else:
+                inner = name
+            parts.append(f'<div class="break-words text-slate-300" title="{title}">{inner}</div>')
+            if item.get("clock"):
+                parts.append(f'<div class="text-slate-400">{html.escape(str(item["clock"]))}</div>')
+        more = cell.get("more") or 0
+        if more:
+            parts.append(f'<div class="text-slate-500">+{int(more)}</div>')
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def build_release_calendar(
     rows: list[dict] | None,
     *,
@@ -734,16 +777,18 @@ def build_release_calendar(
             while len(cells) % 7:
                 cells.append({"in_month": False, "day": None, "items": [], "more": 0})
         month_only = sorted(bucket["month_only"], key=lambda item: item["title"].casefold())
-        months.append(
-            {
-                "key": f"{year:04d}-{month:02d}",
-                "label": f"{MONTH_NAMES[month]} {year}",
-                "show_grid": show_grid,
-                "weekdays": WEEKDAY_SHORT,
-                "cells": cells,
-                "month_only": month_only,
-            }
-        )
+        month_row = {
+            "key": f"{year:04d}-{month:02d}",
+            "label": f"{MONTH_NAMES[month]} {year}",
+            "show_grid": show_grid,
+            "weekdays": WEEKDAY_SHORT,
+            "cells": cells,
+            "month_only": month_only,
+        }
+        # The artist page used to walk every cell in Jinja. That loop, mostly
+        # empty days, was the bulk of the HTML and the render CPU.
+        month_row["grid_html"] = _month_grid_html(month_row) if show_grid else ""
+        months.append(month_row)
     year_only.sort(key=lambda item: item["title"].casefold())
     year_only.sort(key=lambda item: item["year"], reverse=True)
     available = bool(months or year_only)

@@ -94,29 +94,7 @@
             </ul>
             {% endif %}
             {% if month.show_grid %}
-            <div class="calendar-grid grid grid-cols-7 gap-1 text-left text-sm">
-                {% for label in month.weekdays %}
-                <div class="text-slate-500 py-1 text-center">{{ label }}</div>
-                {% endfor %}
-                {% for cell in month.cells %}
-                <div class="min-h-16 min-w-0 rounded-md p-1 {% if cell.in_month and cell['items'] %}border border-emerald-500/60 bg-slate-800{% elif cell.in_month %}border border-slate-700{% endif %}">
-                    {% if cell.in_month %}
-                    <div class="{% if cell['items'] %}text-emerald-300 font-medium{% else %}text-slate-500{% endif %}">{{ cell.day }}</div>
-                    {% for item in cell['items'] %}
-                    <div class="break-words text-slate-300" title="{{ item.source_label }}{% if item.clock %} · {{ item.clock }}{% endif %} · {{ item.precision_label }}">
-                        {% if item.mbid %}
-                        <a href="https://musicbrainz.org/release-group/{{ item.mbid }}" class="hover:text-emerald-300">{{ item.title }}</a>
-                        {% else %}
-                        {{ item.title }}
-                        {% endif %}
-                    </div>
-                    {% if item.clock %}<div class="text-slate-400">{{ item.clock }}</div>{% endif %}
-                    {% endfor %}
-                    {% if cell.more %}<div class="text-slate-500">+{{ cell.more }}</div>{% endif %}
-                    {% endif %}
-                </div>
-                {% endfor %}
-            </div>
+            {{ month.grid_html|safe }}
             {% endif %}
         </div>
         {% endfor %}
