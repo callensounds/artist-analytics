@@ -37,6 +37,10 @@ RELATED_RANK_LIMIT = 5
 SIGHTINGS_PER_SOURCE = 8
 SIGHTING_CAP = 24
 GROWTH_ROW_LIMIT = 120
+# One growth line. The earliest and latest readings stay so the delta is exact.
+SERIES_POINT_CAP = 240
+# Twelve month grids are most of the artist-page HTML. Older months stay on /calendar.
+ARTIST_CALENDAR_MONTHS = 4
 RELATED_READ_LIMIT = 20
 SIGHTING_READ_LIMIT = 20
 PLAYLIST_READ_LIMIT = 20
@@ -136,6 +140,22 @@ def _epoch_ms(captured: str | None) -> int | None:
     return int(moment.timestamp() * 1000)
 
 
+def downsample_points(points: list[dict], limit: int = SERIES_POINT_CAP) -> list[dict]:
+    """Keep the earliest and latest stored points and an even sample between them.
+
+    Dropped points are omitted. Nothing is interpolated.
+    """
+    count = len(points)
+    if count <= limit or limit < 2:
+        return points
+    last = count - 1
+    chosen = {0, last}
+    step = last / (limit - 1)
+    for index in range(limit):
+        chosen.add(min(last, int(round(index * step))))
+    return [points[index] for index in sorted(chosen)]
+
+
 def build_growth(rows: list[dict]) -> dict:
     """One dataset per source and metric, with only the stored exact readings.
 
@@ -166,6 +186,7 @@ def build_growth(rows: list[dict]) -> dict:
                 points.append(point)
         earliest = points[0]
         latest = points[-1]
+        shown = downsample_points(points)
         if len(points) == 1:
             delta = {
                 "latest": latest["y"],
@@ -192,7 +213,8 @@ def build_growth(rows: list[dict]) -> dict:
                 "platform": key[0],
                 "metric": key[1],
                 "color": SOURCE_COLORS.get(key[0], "#94a3b8"),
-                "data": points,
+                "data": shown,
+                "capped": len(shown) < len(points),
                 "delta": delta,
             }
         )
@@ -506,19 +528,31 @@ def _blank(value) -> str | None:
     return text or None
 
 
-def _value_statements(prefix: str, rows: list[tuple], suffix: str = "") -> list[tuple[str, tuple]]:
-    """Multi-row INSERT statements, each under D1's bound-parameter cap."""
+def _value_statements(prefix: str, rows: list[tuple], suffix: str = "", fixed: tuple = ()) -> list[tuple[str, tuple]]:
+    """Multi-row INSERT statements, each under D1's bound-parameter cap.
+
+    Placeholders in ``prefix`` and ``suffix`` count against the same budget.
+    ``fixed`` is bound in source order around the row values.
+    """
     if not rows:
         return []
     width = len(rows[0])
-    per = max(1, _PARAM_BUDGET // width)
+    outside = prefix.count("?") + suffix.count("?")
+    if len(fixed) != outside:
+        raise ValueError("fixed parameters must match placeholders outside the row")
+    room = _PARAM_BUDGET - outside
+    if width < 1 or width > room:
+        raise ValueError("one row exceeds the D1 parameter budget")
+    per = max(1, room // width)
     marker = "(" + ",".join("?" for _ in range(width)) + ")"
     tail = f" {suffix}" if suffix else ""
+    head = fixed[: prefix.count("?")]
+    foot = fixed[prefix.count("?") :]
     statements = []
     for offset in range(0, len(rows), per):
         chunk = rows[offset : offset + per]
         sql = prefix + " VALUES " + ",".join(marker for _ in chunk) + tail
-        params = tuple(value for row in chunk for value in row)
+        params = head + tuple(value for row in chunk for value in row) + foot
         statements.append((sql, params))
     return statements
 
@@ -1624,7 +1658,7 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     ]
     if not release_sightings_failed:
         calendar_rows.extend(release_sightings or [])
-    history["calendar"] = build_release_calendar(calendar_rows)
+    history["calendar"] = build_release_calendar(calendar_rows, month_cap=ARTIST_CALENDAR_MONTHS)
     if not history["calendar"]["available"] and (releases_failed or release_sightings_failed):
         if releases_failed and release_sightings_failed:
             history["calendar"] = empty_release_calendar(CALENDAR_READ_ERROR)

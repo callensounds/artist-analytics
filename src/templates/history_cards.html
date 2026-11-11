@@ -267,6 +267,9 @@
         <div>
             <p class="text-xs text-slate-400 mb-1">{{ series.label }}</p>
             <div class="relative h-40"><canvas id="growth-{{ loop.index0 }}"></canvas></div>
+            {% if series.capped %}
+            <p class="text-xs text-slate-500 mt-1">Earliest and latest stored readings, with stored readings sampled between them. Nothing is estimated.</p>
+            {% endif %}
         </div>
         {% endif %}
         {% endfor %}

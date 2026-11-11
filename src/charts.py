@@ -33,7 +33,7 @@ CHARTS_PAGE_EMPTY = (
 # One artist page stays on the indexed artist_id range. Titles and points are capped
 # so a long history cannot turn into an unbounded D1 read.
 ARTIST_CHART_TITLE_LIMIT = 40
-ARTIST_CHART_POINT_LIMIT = 400
+ARTIST_CHART_POINT_LIMIT = 240
 CHART_DATE_LIMIT = 90
 
 _CHART_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -184,6 +184,19 @@ def _title_key(source: str, territory: str, title: str) -> tuple[str, str, str]:
     return (source, territory, title)
 
 
+def _cap_series(points: list[dict], limit: int) -> list[dict]:
+    """Keep both ends of a stored line and sample the readings between them."""
+    count = len(points)
+    if count <= limit or limit < 2:
+        return points
+    last = count - 1
+    chosen = {0, last}
+    step = last / (limit - 1)
+    for index in range(limit):
+        chosen.add(min(last, int(round(index * step))))
+    return [points[index] for index in sorted(chosen)]
+
+
 def _series_for(
     points: list[dict] | None,
 ) -> dict[tuple[str, str, str], list[dict]]:
@@ -205,7 +218,8 @@ def _series_for(
             bucket[day] = position
     series: dict[tuple[str, str, str], list[dict]] = {}
     for key, ranks in grouped.items():
-        series[key] = [{"x": _day_ms(day), "y": ranks[day]} for day in sorted(ranks)]
+        points = [{"x": _day_ms(day), "y": ranks[day]} for day in sorted(ranks)]
+        series[key] = _cap_series(points, ARTIST_CHART_POINT_LIMIT)
     return series
 
 

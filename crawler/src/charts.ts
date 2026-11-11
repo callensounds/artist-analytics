@@ -1,6 +1,6 @@
 /** Public iTunes RSS charts. The dashboard reads chart_entries and does not fetch these URLs. */
 
-import { type Statement, type Store, utcNow } from "./store";
+import { type Statement, type Store, chunkedInsert, utcNow } from "./store";
 import { HTTP_USER_AGENT } from "./parse";
 
 export const CHART_TERRITORY = "us";
@@ -195,26 +195,20 @@ async function writeRows(
             WHERE chart_source = ? AND territory = ? AND chart_date = ? AND position > ?`,
       params: [source, CHART_TERRITORY, day, maxPosition],
     },
-  ];
-  const width = 9;
-  const per = 8;
-  for (let offset = 0; offset < values.length; offset += per) {
-    const chunk = values.slice(offset, offset + per);
-    const marks = chunk.map(() => "(" + new Array(width).fill("?").join(",") + ")").join(",");
-    statements.push({
-      sql: `INSERT INTO chart_entries (
+    ...chunkedInsert(
+      `INSERT INTO chart_entries (
               chart_source, territory, chart_date, position, track_or_album_name,
               apple_artist_id, artist_name, artist_id, collected_at
-            ) VALUES ${marks}
-            ON CONFLICT(chart_source, territory, chart_date, position) DO UPDATE SET
+            )`,
+      values,
+      `ON CONFLICT(chart_source, territory, chart_date, position) DO UPDATE SET
               track_or_album_name = excluded.track_or_album_name,
               apple_artist_id = excluded.apple_artist_id,
               artist_name = excluded.artist_name,
               artist_id = excluded.artist_id,
               collected_at = excluded.collected_at`,
-      params: chunk.flat(),
-    });
-  }
+    ),
+  ];
   await store.batch(statements);
   return { written: values.length, linked };
 }

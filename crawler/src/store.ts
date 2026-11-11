@@ -30,6 +30,98 @@ interface D1Like {
   batch: (statements: unknown[]) => Promise<unknown>;
 }
 
+/** D1 rejects a statement with more than 100 bound parameters. */
+export const D1_MAX_PARAMS = 100;
+
+export function statementTable(sql: string): string {
+  const match = /\b(?:INTO|UPDATE|FROM|TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+["'`]?([A-Za-z_][A-Za-z0-9_]*)/i.exec(sql);
+  return match?.[1] ?? "statement";
+}
+
+function placeholderCount(sql: string): number {
+  let count = 0;
+  for (const char of sql) if (char === "?") count += 1;
+  return count;
+}
+
+/**
+ * Multi-row INSERT statements that stay within D1's bound-parameter cap.
+ * Placeholders in `prefix` and `suffix` count against the same cap.
+ * `extra` is bound in source order: prefix placeholders, then each row, then suffix placeholders.
+ */
+export function chunkedInsert(prefix: string, rows: unknown[][], suffix = "", extra: unknown[] = []): Statement[] {
+  if (!rows.length) return [];
+  const width = rows[0].length;
+  const table = statementTable(prefix);
+  for (const row of rows) {
+    if (row.length !== width) throw new Error(`${table}: uneven row`);
+  }
+  const outside = placeholderCount(prefix) + placeholderCount(suffix);
+  if (extra.length !== outside) {
+    throw new Error(`${table}: ${extra.length} fixed parameters for ${outside} placeholders`);
+  }
+  const room = D1_MAX_PARAMS - outside;
+  if (width < 1 || width > room) {
+    throw new Error(`${table}: one row needs ${width + outside} parameters, above ${D1_MAX_PARAMS}`);
+  }
+  const per = Math.floor(room / width);
+  const marker = "(" + new Array(width).fill("?").join(",") + ")";
+  const tail = suffix ? (suffix.startsWith(" ") || suffix.startsWith("\n") ? suffix : ` ${suffix}`) : "";
+  const prefixSlots = placeholderCount(prefix);
+  const head = extra.slice(0, prefixSlots);
+  const foot = extra.slice(prefixSlots);
+  const statements: Statement[] = [];
+  for (let offset = 0; offset < rows.length; offset += per) {
+    const chunk = rows.slice(offset, offset + per);
+    const params = head.slice();
+    for (const row of chunk) params.push(...row);
+    params.push(...foot);
+    statements.push({
+      sql: `${prefix} VALUES ${chunk.map(() => marker).join(",")}${tail}`,
+      params,
+    });
+  }
+  return statements;
+}
+
+export function crawlLabel(name: unknown): string {
+  const text = String(name || "").replace(/\s+/g, " ").trim().slice(0, 120);
+  return text || "artist";
+}
+
+/** One batch. A failure names the artist and the tables in that batch, without parameters. */
+export async function commitWrites(store: Store, statements: Statement[], artist = ""): Promise<void> {
+  if (!statements.length) return;
+  const who = artist ? `${crawlLabel(artist)} | ` : "";
+  for (const statement of statements) {
+    if (statement.params.length > D1_MAX_PARAMS) {
+      const table = statementTable(statement.sql);
+      throw new Error(`${who}${table}: ${statement.params.length} bound parameters exceeds ${D1_MAX_PARAMS}`);
+    }
+  }
+  try {
+    await store.batch(statements);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const tables = blameTables(statements, message);
+    throw new Error(`${who}${tables}: ${message}`);
+  }
+}
+
+function blameTables(statements: Statement[], message: string): string {
+  // SQLite reports the overflow without naming the statement. The statement
+  // with the most bound parameters is the one that hit the cap.
+  if (/too many SQL variables/i.test(message)) {
+    const worst = statements.reduce((best, statement) => (statement.params.length > best.params.length ? statement : best));
+    const names = statements
+      .filter((statement) => statement.params.length === worst.params.length)
+      .map((statement) => statementTable(statement.sql));
+    const count = worst.params.length;
+    return `${[...new Set(names)].join(", ")} (${count} ${count === 1 ? "param" : "params"})`;
+  }
+  return [...new Set(statements.map((statement) => statementTable(statement.sql)))].join(", ");
+}
+
 export function fromD1(db: D1Like): Store {
   const store: Store & { binding?: object } = {
     binding: db,
@@ -590,22 +682,19 @@ export async function saveSource(
       ],
     },
   ];
-  if (snapshots.length) {
-    const marks = snapshots.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
-    statements.push({
-      sql: `INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at) VALUES ${marks}`,
-      params: snapshots.flat(),
-    });
-  }
-  if (sightings.length) {
-    const marks = sightings.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
-    statements.push({
-      sql: `INSERT OR IGNORE INTO content_sightings
-        (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)
-        VALUES ${marks}`,
-      params: sightings.flat(),
-    });
-  }
+  statements.push(
+    ...chunkedInsert(
+      "INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)",
+      snapshots,
+    ),
+  );
+  statements.push(
+    ...chunkedInsert(
+      `INSERT OR IGNORE INTO content_sightings
+        (artist_id, source, external_id, title, kind, published_at, precision, first_seen_at)`,
+      sightings,
+    ),
+  );
   const related = (source.related || []).slice(0, 12);
   let edges = 0;
   let discovered = 0;
@@ -615,17 +704,15 @@ export async function saveSource(
     edges += 1;
     edgeRows.push([artistId, item.spotify_id, item.name.slice(0, 120), "spotify", item.rank, stamp, stamp]);
   }
-  if (edgeRows.length) {
-    const marks = edgeRows.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
-    statements.push({
-      sql: `INSERT INTO related_edges
-        (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)
-        VALUES ${marks}
-        ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
+  statements.push(
+    ...chunkedInsert(
+      `INSERT INTO related_edges
+        (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)`,
+      edgeRows,
+      `ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
           to_name = excluded.to_name, rank = excluded.rank, last_seen_at = excluded.last_seen_at`,
-      params: edgeRows.flat(),
-    });
-  }
+    ),
+  );
   if (relatedCap > 0 && edgeRows.length) {
     let room = relatedCap - (await relatedTracked(store, now));
     const selfId = source.spotifyId || "";
@@ -702,28 +789,26 @@ export async function saveSource(
       trackSnapshots.push([artistId, source.platform, track.externalId, track.popularity, stamp]);
     }
   }
-  if (trackRows.length) {
-    const marks = trackRows.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
-    statements.push({
-      sql: `INSERT INTO artist_tracks (
+  statements.push(
+    ...chunkedInsert(
+      `INSERT INTO artist_tracks (
           artist_id, source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
-        ) VALUES ${marks}
-        ON CONFLICT(artist_id, source, external_id) DO UPDATE SET
+        )`,
+      trackRows,
+      `ON CONFLICT(artist_id, source, external_id) DO UPDATE SET
           track_name = excluded.track_name,
           popularity = COALESCE(excluded.popularity, artist_tracks.popularity),
           album_name = COALESCE(excluded.album_name, artist_tracks.album_name),
           rank = excluded.rank,
           last_seen_at = excluded.last_seen_at`,
-      params: trackRows.flat(),
-    });
-  }
-  if (trackSnapshots.length) {
-    const marks = trackSnapshots.map(() => "(?, ?, ?, ?, ?)").join(", ");
-    statements.push({
-      sql: `INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at) VALUES ${marks}`,
-      params: trackSnapshots.flat(),
-    });
-  }
+    ),
+  );
+  statements.push(
+    ...chunkedInsert(
+      "INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at)",
+      trackSnapshots,
+    ),
+  );
   const wrote = snapshots.length || edges;
   const status = source.status === "error" ? (wrote ? "partial" : "error") : "ok";
   const detail = `${String(row.name || "")} | ${source.platform}=${source.status}${source.reason ? ` (${source.reason.slice(0, 140)})` : ""}`.slice(0, 2000);
@@ -744,7 +829,7 @@ export async function saveSource(
       detail,
     ],
   });
-  await store.batch(statements);
+  await commitWrites(store, statements, String(row.name || ""));
   return { snapshots: snapshots.length, edges, discovered };
 }
 
@@ -753,33 +838,36 @@ export async function saveMusicBrainzReleases(
   artistId: number,
   releases: { mbid: string; title: string; releaseType: string; releasedAt: string; precision: string }[],
   now = new Date(),
+  artistName = "",
 ): Promise<void> {
   if (!releases.length) return;
   const stamp = utcNow(now);
-  const width = 8;
-  const per = 10;
-  for (let offset = 0; offset < releases.length; offset += per) {
-    const chunk = releases.slice(offset, offset + per);
-    const marks = chunk.map(() => "(" + new Array(width).fill("?").join(",") + ")").join(",");
-    const params: unknown[] = [];
-    for (const release of chunk) {
-      params.push(artistId, release.mbid, release.title, release.releaseType, release.releasedAt, release.precision, stamp, stamp);
-    }
-    await store.batch([
-      {
-        sql: `INSERT INTO musicbrainz_releases (
+  const rows = releases.map((release) => [
+    artistId,
+    release.mbid,
+    release.title,
+    release.releaseType,
+    release.releasedAt,
+    release.precision,
+    stamp,
+    stamp,
+  ]);
+  await commitWrites(
+    store,
+    chunkedInsert(
+      `INSERT INTO musicbrainz_releases (
                 artist_id, mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
-              ) VALUES ${marks}
-              ON CONFLICT(artist_id, mbid) DO UPDATE SET
+              )`,
+      rows,
+      `ON CONFLICT(artist_id, mbid) DO UPDATE SET
                 title = excluded.title,
                 release_type = excluded.release_type,
                 released_at = excluded.released_at,
                 precision = excluded.precision,
                 last_seen_at = excluded.last_seen_at`,
-        params,
-      },
-    ]);
-  }
+    ),
+    artistName,
+  );
 }
 
 async function relatedTracked(store: Store, now: Date): Promise<number> {
