@@ -82,9 +82,14 @@ describe("MusicBrainz release dates", () => {
         artists: [{ id: "mb-clairo", name: "Clairo", score: 100, relations: [] }],
       }), { status: 200 });
     });
+    const sent: { body: unknown; delaySeconds?: number }[] = [];
     const env = {
       DB: store,
-      CRAWL_QUEUE: { send() { return undefined; } },
+      CRAWL_QUEUE: {
+        send(body: unknown, options?: { delaySeconds?: number }) {
+          sent.push({ body, delaySeconds: options?.delaySeconds });
+        },
+      },
     };
     try {
       await handleMessage(env, { artist_id: 1, provider: "musicbrainz" });
@@ -98,7 +103,9 @@ describe("MusicBrainz release dates", () => {
         const url = String(input);
         if (url.includes("release-group")) return new Response("busy", { status: 503, headers: { "retry-after": "250" } });
         return new Response(JSON.stringify({
-          artists: [{ id: "mb-clairo", name: "Clairo", score: 100, relations: [] }],
+          id: "mb-clairo",
+          name: "Clairo",
+          relations: [],
         }), { status: 200 });
       });
       const message = {
@@ -113,9 +120,16 @@ describe("MusicBrainz release dates", () => {
         },
       };
       await runQueue([message], env);
-      expect(message.acked).toBe(false);
-      expect(message.retried).toBe(true);
-      expect(message.delay).toBe(250);
+      expect(message.acked).toBe(true);
+      expect(message.retried).toBe(false);
+      expect(sent).toEqual([{
+        body: {
+          artist_id: 1,
+          mbid: "mb-clairo",
+          providers: ["musicbrainz", "spotify", "instagram", "tiktok", "apple", "deezer", "deezer_playlists"],
+        },
+        delaySeconds: 250,
+      }]);
       expect(db.prepare("SELECT COUNT(*) AS n FROM musicbrainz_releases").get()).toEqual({ n: 0 });
     } finally {
       timer.mockRestore();

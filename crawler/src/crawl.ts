@@ -1,6 +1,10 @@
 /**
  * Queue and cron for artist-analytics-crawler.
- * One message is one provider. MusicBrainz stores ids, then fans the others out.
+ * One message is one artist. The consumer runs that artist's providers in order
+ * (MusicBrainz, then socials, Apple, YouTube when a key is set, Deezer, playlists).
+ * A retryable step is persisted up to the failure, the message is acked, and at
+ * most one delayed follow-up carries the remaining providers. message.retry()
+ * is reserved for an unexpected failure, and the consumer's max_retries bounds it.
  */
 
 import {
@@ -46,9 +50,19 @@ const SCAN_WINDOW = 50;
 export const MB_INTERVAL_MIN_MS = 1500;
 export const MB_INTERVAL_MAX_MS = 2000;
 
-/** A 429, 503, or dropped connection. The queue message must be retried, not acked. */
+/**
+ * A 429, 503, or dropped connection. The current message is acked and one
+ * follow-up is sent with `remaining` providers. `message.retry()` is not used,
+ * so a rate limit cannot multiply queue operations.
+ */
 export class RetryableFetch extends Error {
-  constructor(readonly delaySeconds: number, message: string) {
+  constructor(
+    readonly delaySeconds: number,
+    message: string,
+    readonly remaining: string[] = [],
+    readonly artistId?: number,
+    readonly mbid = "",
+  ) {
     super(message);
     this.name = "RetryableFetch";
   }
@@ -70,9 +84,13 @@ function parseRetryAfter(value: string | null, now: number): number | null {
   return Math.ceil((date - now) / 1000);
 }
 
+export interface QueueSendOptions {
+  delaySeconds?: number;
+}
+
 export interface CrawlEnv {
   DB: Store;
-  CRAWL_QUEUE: { send: (body: unknown) => Promise<unknown> | unknown };
+  CRAWL_QUEUE: { send: (body: unknown, options?: QueueSendOptions) => Promise<unknown> | unknown };
   YOUTUBE_API_KEY?: string;
   SPOTIFY_CLIENT_ID?: string;
   SPOTIFY_CLIENT_SECRET?: string;
@@ -86,6 +104,7 @@ export interface CrawlMessage {
   name?: string;
   origin?: string;
   provider?: string;
+  providers?: string[];
   mbid?: string;
 }
 
@@ -175,23 +194,58 @@ export async function enqueueStale(env: CrawlEnv, now = new Date()): Promise<{ s
     if (stale(row, now, staleSeconds)) chosen.push(row);
     if (chosen.length >= limit) break;
   }
+  let sent = 0;
+  let lastSent = cursor;
+  let stopReason = "";
   for (const row of chosen) {
-    await env.CRAWL_QUEUE.send({ artist_id: Number(row.id), provider: "musicbrainz" });
+    try {
+      await env.CRAWL_QUEUE.send({ artist_id: Number(row.id), provider: "musicbrainz" });
+      sent += 1;
+      lastSent = Number(row.id);
+    } catch (error) {
+      stopReason = isQueueDailyLimit(error) ? "daily write operations limit" : "queue send failed";
+      console.log(JSON.stringify({
+        message: "enqueue stopped",
+        error: stopReason,
+        sent,
+      }));
+      break;
+    }
   }
   const stamp = utcNow(now);
-  await env.DB.batch([
-    {
-      sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at) VALUES (1, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET next_artist_id = excluded.next_artist_id, updated_at = excluded.updated_at`,
-      params: [chosen.length || lastId !== cursor ? lastId : 0, stamp],
-    },
-    {
-      sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, cursor, detail)
-            VALUES (?, ?, 'queued', ?, ?, ?)`,
-      params: [stamp, stamp, chosen.length, String(chosen.length || lastId !== cursor ? lastId : cursor), JSON.stringify({ mode: "queue", sent: chosen.length })],
-    },
-  ]);
-  return { status: "queued", attempted: chosen.length };
+  const advanced = chosen.length > 0 || lastId !== cursor;
+  const stateCursor = stopReason ? (sent > 0 ? lastSent : cursor) : advanced ? lastId : 0;
+  const runCursor = stopReason ? (sent > 0 ? lastSent : cursor) : advanced ? lastId : cursor;
+  const detail = stopReason
+    ? JSON.stringify({ mode: "queue", sent, error: stopReason })
+    : JSON.stringify({ mode: "queue", sent });
+  try {
+    await env.DB.batch([
+      {
+        sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at) VALUES (1, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET next_artist_id = excluded.next_artist_id, updated_at = excluded.updated_at`,
+        params: [stateCursor, stamp],
+      },
+      {
+        sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, cursor, detail)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+        params: [stamp, stamp, stopReason ? "error" : "queued", sent, String(runCursor), detail],
+      },
+    ]);
+  } catch (error) {
+    console.log(JSON.stringify({
+      message: "enqueue state write failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  if (stopReason === "daily write operations limit") return { status: "queue_limited", attempted: sent };
+  if (stopReason) return { status: "error", attempted: sent };
+  return { status: "queued", attempted: sent };
+}
+
+function isQueueDailyLimit(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /daily write operations limit/i.test(message);
 }
 
 async function ensureArtist(store: Store, name: string, origin: string, now: Date): Promise<Record<string, unknown> | null> {
@@ -213,26 +267,32 @@ async function ensureArtist(store: Store, name: string, origin: string, now: Dat
   return store.first("SELECT * FROM artists WHERE normalized_name = ?", [normalized]);
 }
 
-async function sendFollowups(
-  env: CrawlEnv,
-  artistId: number,
-  links: MbLinks,
-  fresh: Set<string>,
-  blocked: boolean,
-  storedDeezerId = "",
-): Promise<void> {
-  const providers: string[] = [];
-  if (links.spotify_id && !fresh.has("spotify")) providers.push("spotify");
-  if (links.instagram && !fresh.has("instagram")) providers.push("instagram");
-  if (links.tiktok && !fresh.has("tiktok")) providers.push("tiktok");
-  if (!blocked && !fresh.has("apple")) providers.push("apple");
-  if (env.YOUTUBE_API_KEY && !fresh.has("youtube")) providers.push("youtube");
-  if (!fresh.has("deezer")) providers.push("deezer");
-  const deezerId = /^\d+$/.test(links.deezer_id) ? links.deezer_id : /^\d+$/.test(storedDeezerId) ? storedDeezerId : "";
-  if (deezerId) providers.push("deezer_playlists");
-  for (const provider of providers) {
-    await env.CRAWL_QUEUE.send({ artist_id: artistId, provider });
-  }
+const CYCLE_PROVIDERS = ["musicbrainz", "spotify", "instagram", "tiktok", "apple", "youtube", "deezer", "deezer_playlists"];
+
+function staleSecondsOf(env: CrawlEnv): number {
+  return numberSetting(env.CRAWL_STALE_SECONDS, STALE_SECONDS, 7 * 24 * 3600);
+}
+
+/** One ordered pass. YouTube is omitted unless a key is configured. */
+function cycleProviders(env: CrawlEnv): string[] {
+  return CYCLE_PROVIDERS.filter((provider) => provider !== "youtube" || Boolean(env.YOUTUBE_API_KEY));
+}
+
+function knownProviders(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item)).filter((item) => PROVIDERS.has(item));
+}
+
+/**
+ * A `{providers}` list is a follow-up and runs only those steps.
+ * `{provider: "musicbrainz"}` and a search `{name, origin, provider}` are one artist cycle.
+ * Any other `{provider}` is an in-flight single-provider message.
+ */
+function resolveProviders(env: CrawlEnv, fields: CrawlMessage): { list: string[]; entry: boolean } {
+  if (fields.providers?.length) return { list: fields.providers, entry: false };
+  const provider = fields.provider && PROVIDERS.has(fields.provider) ? fields.provider : "musicbrainz";
+  if (provider === "musicbrainz") return { list: cycleProviders(env), entry: true };
+  return { list: [provider], entry: false };
 }
 
 async function fetchText(url: string, maxBytes: number, headers: Record<string, string> = {}, redirect: RequestRedirect = "manual"): Promise<{ status: number; ok: boolean; text: string }> {
@@ -602,53 +662,75 @@ async function knownRow(store: Store, fields: CrawlMessage, now: Date): Promise<
   return null;
 }
 
-export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = new Date()): Promise<{ ok: boolean; detail: string }> {
-  await migrate(env.DB);
-  const provider = PROVIDERS.has(fields.provider || "") ? fields.provider || "musicbrainz" : "musicbrainz";
-  const row = await knownRow(env.DB, fields, now);
-  if (!row) return { ok: true, detail: "missing artist" };
+async function reloadArtist(store: Store, row: Record<string, unknown>): Promise<void> {
+  const latest = await store.first<Record<string, unknown>>("SELECT * FROM artists WHERE id = ?", [Number(row.id)]);
+  if (latest) Object.assign(row, latest);
+}
+
+async function logStepError(store: Store, detail: string, now: Date): Promise<void> {
+  await store.batch([
+    {
+      sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
+            VALUES (?, ?, 'error', 1, 0, 1, ?)`,
+      params: [utcNow(now), utcNow(now), detail.slice(0, 2000)],
+    },
+  ]);
+}
+
+async function runMusicBrainz(
+  env: CrawlEnv,
+  row: Record<string, unknown>,
+  fields: CrawlMessage,
+  now: Date,
+): Promise<{ ok: boolean; detail: string }> {
   const artistId = Number(row.id);
-  if (provider === "musicbrainz" && !fields.mbid && !stale(row, now, numberSetting(env.CRAWL_STALE_SECONDS, STALE_SECONDS, 7 * 24 * 3600))) {
-    return { ok: true, detail: `${row.name} | musicbrainz=ok (fresh)` };
-  }
-  if (provider === "musicbrainz") {
-    const identity = await musicbrainz(String(row.name), fields.mbid || "");
-    if (identity.links._needs_lookup && identity.links._mbid) {
-      await env.CRAWL_QUEUE.send({ artist_id: artistId, provider: "musicbrainz", mbid: identity.links._mbid });
-      await saveSource(env.DB, row, {
-        platform: "musicbrainz",
-        status: "ok",
-        reason: "lookup queued",
-        markCrawled: false,
-      }, now, 0);
-      return { ok: true, detail: `${row.name} | musicbrainz=ok (lookup queued)` };
+  let mbid = fields.mbid || "";
+  let identity = await musicbrainz(String(row.name), mbid);
+  if (identity.links._needs_lookup && identity.links._mbid) {
+    mbid = identity.links._mbid;
+    try {
+      identity = await musicbrainz(String(row.name), mbid);
+    } catch (error) {
+      if (error instanceof RetryableFetch) {
+        throw new RetryableFetch(error.delaySeconds, error.message, [], undefined, mbid);
+      }
+      throw error;
     }
-    await saveSource(env.DB, row, {
-      platform: "musicbrainz",
-      status: identity.status,
-      reason: identity.reason,
-      musicbrainzId: identity.links._mbid || null,
-      spotifyId: identity.links.spotify_id || null,
-      appleId: identity.links.apple_id || null,
-      youtubeChannelId: identity.links.youtube_channel_ids[0] || null,
-      instagram: identity.links.instagram || null,
-      tiktok: identity.links.tiktok || null,
-      deezerId: identity.links.deezer_id || null,
-      markCrawled: identity.status !== "error",
-    }, now, 0);
-    if (identity.status === "ok" && identity.links._mbid) {
+  }
+  await saveSource(env.DB, row, {
+    platform: "musicbrainz",
+    status: identity.status,
+    reason: identity.reason,
+    musicbrainzId: identity.links._mbid || null,
+    spotifyId: identity.links.spotify_id || null,
+    appleId: identity.links.apple_id || null,
+    youtubeChannelId: identity.links.youtube_channel_ids[0] || null,
+    instagram: identity.links.instagram || null,
+    tiktok: identity.links.tiktok || null,
+    deezerId: identity.links.deezer_id || null,
+    markCrawled: identity.status !== "error",
+  }, now, 0);
+  if (identity.status === "ok" && identity.links._mbid) {
+    try {
       const releases = await musicbrainzReleases(identity.links._mbid);
       await saveMusicBrainzReleases(env.DB, artistId, releases, now, String(row.name || ""));
+    } catch (error) {
+      if (error instanceof RetryableFetch) {
+        throw new RetryableFetch(error.delaySeconds, error.message, [], undefined, identity.links._mbid);
+      }
+      throw error;
     }
-    if (identity.status === "ok" || identity.status === "unavailable") {
-      const fresh = await freshSources(env.DB, artistId, now);
-      const blocked = await appleBlocked(env.DB, now);
-      const links = identity.status === "ok" ? identity.links : emptyLinks();
-      await sendFollowups(env, artistId, links, fresh, blocked, String(row.deezer_id || ""));
-    }
-    return { ok: identity.status !== "error", detail: `${row.name} | musicbrainz=${identity.status}` };
   }
-  if (provider === "deezer_playlists") return crawlDeezerPlaylists(env, row, now);
+  return { ok: identity.status !== "error", detail: `${row.name} | musicbrainz=${identity.status}` };
+}
+
+async function runSource(
+  env: CrawlEnv,
+  row: Record<string, unknown>,
+  provider: string,
+  now: Date,
+): Promise<{ ok: boolean; detail: string }> {
+  const artistId = Number(row.id);
   if (provider === "apple" && (await appleBlocked(env.DB, now))) {
     return { ok: true, detail: `${row.name} | apple=ok (skipped during Apple backoff)` };
   }
@@ -682,9 +764,6 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   if (saved.forbidden) await blockApple(env.DB, now);
   const relatedCap = provider === "spotify" ? numberSetting(env.RELATED_AUTOTRACK_CAP, 25, 500) : 0;
   const written = await saveSource(env.DB, row, saved, now, relatedCap);
-  if (provider === "deezer" && saved.deezerId && saved.status !== "error") {
-    await env.CRAWL_QUEUE.send({ artist_id: artistId, provider: "deezer_playlists" });
-  }
   if (written.snapshots > 0 && (provider === "spotify" || provider === "instagram" || provider === "tiktok")) {
     try {
       const alerts = await recordAlerts(env.DB, artistId, now);
@@ -702,14 +781,70 @@ export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = n
   return { ok: saved.status !== "error", detail: `${row.name} | ${saved.platform}=${saved.status}` };
 }
 
+async function runProvider(
+  env: CrawlEnv,
+  row: Record<string, unknown>,
+  provider: string,
+  fields: CrawlMessage,
+  now: Date,
+): Promise<{ ok: boolean; detail: string }> {
+  if (provider === "musicbrainz") return runMusicBrainz(env, row, fields, now);
+  if (provider === "deezer_playlists") return crawlDeezerPlaylists(env, row, now);
+  return runSource(env, row, provider, now);
+}
+
+export async function handleMessage(env: CrawlEnv, fields: CrawlMessage, now = new Date()): Promise<{ ok: boolean; detail: string }> {
+  await migrate(env.DB);
+  const row = await knownRow(env.DB, fields, now);
+  if (!row) return { ok: true, detail: "missing artist" };
+  const artistId = Number(row.id);
+  const plan = resolveProviders(env, fields);
+  if (plan.entry && !fields.mbid && !stale(row, now, staleSecondsOf(env))) {
+    return { ok: true, detail: `${row.name} | musicbrainz=ok (fresh)` };
+  }
+  const details: string[] = [];
+  let ok = true;
+  for (let index = 0; index < plan.list.length; index += 1) {
+    const provider = plan.list[index];
+    if (index > 0) await reloadArtist(env.DB, row);
+    try {
+      const step = await runProvider(env, row, provider, fields, now);
+      details.push(step.detail);
+      if (!step.ok) ok = false;
+    } catch (error) {
+      if (error instanceof RetryableFetch) {
+        throw new RetryableFetch(
+          error.delaySeconds,
+          error.message,
+          plan.list.slice(index),
+          artistId,
+          error.mbid || fields.mbid || "",
+        );
+      }
+      const text = error instanceof Error ? error.message : String(error);
+      const detail = `${row.name} | ${provider}=error (${text})`.slice(0, 2000);
+      try {
+        await logStepError(env.DB, detail, now);
+      } catch {
+        // A failed run row must not drop the providers that have not run yet.
+      }
+      details.push(detail);
+      ok = false;
+    }
+  }
+  return { ok, detail: details.join("; ").slice(0, 2000) };
+}
+
 export function messageFields(body: unknown): CrawlMessage {
   const record = typeof body === "string" ? safeJson(body) : (body as Record<string, unknown>) || {};
   const provider = String(record.provider || "musicbrainz");
+  const providers = knownProviders(record.providers);
   return {
     artist_id: record.artist_id === undefined || record.artist_id === null ? undefined : Number(record.artist_id),
     name: record.name ? String(record.name) : undefined,
     origin: record.origin ? String(record.origin) : "search",
     provider: PROVIDERS.has(provider) ? provider : "musicbrainz",
+    providers: providers.length ? providers : undefined,
     mbid: record.mbid ? String(record.mbid) : "",
   };
 }
@@ -725,12 +860,33 @@ function safeJson(body: string): Record<string, unknown> {
 export async function runScheduled(env: CrawlEnv, now = new Date()): Promise<{ status: string; attempted: number; backfillArtists: number; backfillAlerts: number; charts: { status: string; written: number; linked: number; errors: string[] } }> {
   const skippedCharts = { status: "skipped", written: 0, linked: 0, errors: [] as string[] };
   if (!env.DB) return { status: "skipped", attempted: 0, backfillArtists: 0, backfillAlerts: 0, charts: skippedCharts };
-  const queued = await enqueueStale(env, now);
+  let queued = { status: "error", attempted: 0 };
+  try {
+    queued = await enqueueStale(env, now);
+  } catch (error) {
+    // A queue failure must not skip chart ingest or alert backfill.
+    console.log(JSON.stringify({
+      message: "enqueue failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    try {
+      const stamp = utcNow(now);
+      await env.DB.batch([
+        {
+          sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
+                VALUES (?, ?, 'error', 0, 0, 1, ?)`,
+          params: [stamp, stamp, "enqueue failed"],
+        },
+      ]);
+    } catch {
+      // The scheduled tick still backfills alerts and ingests charts.
+    }
+  }
   let backfill = { artists: 0, alerts: 0 };
   try {
     backfill = await backfillAlerts(env.DB, now);
   } catch {
-    // The queue send already happened. A backfill miss waits for the next tick.
+    // A backfill miss waits for the next tick.
   }
   let charts = skippedCharts;
   try {
@@ -771,28 +927,81 @@ export async function runQueue(messages: QueueMessage[], env: CrawlEnv): Promise
     first.ack();
     acked += 1;
   } catch (error) {
-    const retryable = error instanceof RetryableFetch;
-    const delay = retryable ? error.delaySeconds : retryDelaySeconds(null);
+    if (error instanceof RetryableFetch) {
+      const followedUp = await deferRetry(env, first, error);
+      if (followedUp) acked += 1;
+      else retried += 1;
+      return { acked, retried };
+    }
+    const delay = retryDelaySeconds(null);
     console.log(JSON.stringify({
-      message: retryable ? "queue message retry" : "queue message failed",
+      message: "queue message failed",
       delaySeconds: delay,
       error: error instanceof Error ? error.message : String(error),
     }));
-    if (!retryable) {
-      try {
-        await env.DB.batch([
-          {
-            sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
-                  VALUES (?, ?, 'error', 1, 0, 1, ?)`,
-            params: [utcNow(), utcNow(), String(error).slice(0, 2000)],
-          },
-        ]);
-      } catch {
-        // The retry still has to happen if the run row cannot be written.
-      }
+    try {
+      await env.DB.batch([
+        {
+          sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
+                VALUES (?, ?, 'error', 1, 0, 1, ?)`,
+          params: [utcNow(), utcNow(), String(error).slice(0, 2000)],
+        },
+      ]);
+    } catch {
+      // The retry still has to happen if the run row cannot be written.
     }
     first.retry({ delaySeconds: delay });
     retried += 1;
   }
   return { acked, retried };
+}
+
+/** Ack the in-flight message and send one delayed follow-up. A daily-limit send is recorded once. */
+async function deferRetry(env: CrawlEnv, message: QueueMessage, error: RetryableFetch): Promise<boolean> {
+  const fields = messageFields(message.body);
+  const artistId = error.artistId ?? fields.artist_id;
+  const remaining = error.remaining.length
+    ? error.remaining
+    : fields.providers?.length
+      ? fields.providers
+      : [fields.provider || "musicbrainz"];
+  const mbid = error.mbid || fields.mbid || "";
+  const delay = error.delaySeconds;
+  console.log(JSON.stringify({
+    message: "queue follow-up",
+    delaySeconds: delay,
+    providers: remaining,
+    error: error.message,
+  }));
+  if (artistId === undefined || artistId === null || Number.isNaN(artistId) || !remaining.length) {
+    message.retry({ delaySeconds: delay });
+    return false;
+  }
+  const body: CrawlMessage = { artist_id: artistId, providers: remaining };
+  if (mbid) body.mbid = mbid;
+  try {
+    await env.CRAWL_QUEUE.send(body, { delaySeconds: delay });
+    message.ack();
+    return true;
+  } catch (sendError) {
+    if (isQueueDailyLimit(sendError)) {
+      console.log(JSON.stringify({ message: "queue follow-up skipped", error: "daily write operations limit" }));
+      try {
+        const stamp = utcNow();
+        await env.DB.batch([
+          {
+            sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, artists_ok, artists_error, detail)
+                  VALUES (?, ?, 'error', 0, 0, 1, ?)`,
+            params: [stamp, stamp, JSON.stringify({ mode: "queue", error: "daily write operations limit" })],
+          },
+        ]);
+      } catch {
+        // The artist stays stale and the next cron retries after the quota resets.
+      }
+      message.ack();
+      return true;
+    }
+    message.retry({ delaySeconds: delay });
+    return false;
+  }
 }

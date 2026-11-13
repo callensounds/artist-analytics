@@ -80,7 +80,7 @@ def test_templates_and_migrations_live_beside_the_worker():
     assert '"queue": "artist-analytics-crawl"' in crawler
     assert '"max_batch_size": 1' in crawler
     assert '"max_concurrency": 1' in crawler
-    assert '"max_retries": 10' in crawler
+    assert '"max_retries": 3' in crawler
     assert '"retry_delay": 180' in crawler
     assert '"dead_letter_queue": "artist-analytics-crawl-dlq"' in crawler
     assert '"crons": ["*/15 * * * *"]' in crawler
