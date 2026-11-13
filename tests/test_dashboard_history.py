@@ -63,6 +63,19 @@ def test_growth_series_are_not_aligned_across_providers():
         assert all(isinstance(point["y"], int) for point in series["data"])
 
 
+def test_sparse_identical_points_are_not_filled_in():
+    growth = build_growth(
+        [
+            {"source": "spotify", "metric": "Followers", "value": 1000, "captured_at": "2026-11-10T00:00:00Z"},
+            {"source": "spotify", "metric": "Followers", "value": 1000, "captured_at": "2026-11-11T00:00:00Z"},
+        ]
+    )
+    series = growth["datasets"][0]
+    assert [point["y"] for point in series["data"]] == [1000, 1000]
+    assert series["delta"]["change"] == 0
+    assert len(series["data"]) == 2
+
+
 def test_single_reading_has_no_invented_trend():
     growth = build_growth(
         [

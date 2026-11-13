@@ -45,6 +45,9 @@ RELATED_READ_LIMIT = 20
 SIGHTING_READ_LIMIT = 20
 PLAYLIST_READ_LIMIT = 50
 PLAYLIST_NEW_DAYS = 7
+# A row refreshed once a day is still current. A row missing for longer than this ages out.
+PLAYLIST_CURRENT_GRACE = timedelta(hours=36)
+TRACK_CURRENT_HOURS = 36
 PLAYLIST_NOT_CRAWLED = (
     "Deezer playlists have not been crawled yet. "
     "The crawler reads public playlists from Deezer. Nothing here is estimated."
@@ -385,12 +388,15 @@ def empty_playlist_counts() -> dict:
 def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) -> tuple[list[dict], dict]:
     """Placements plus counts. A missing follower count stays missing, not zero.
 
-    Current rows were in the latest playlist crawl. New rows are current and were
-    first stored within the last 7 days. Dropped rows have an older last_seen.
+    Current rows were seen within 36 hours of the latest playlist crawl, so a
+    placement refreshed once a day stays current. New rows are current and were
+    first stored within the last 7 days. A row that has been missing longer than
+    that grace is dropped.
     """
     moment = _as_utc(now)
     cutoff = moment - timedelta(days=PLAYLIST_NEW_DAYS)
     watermark = _playlist_watermark(rows or [])
+    current_after = watermark - PLAYLIST_CURRENT_GRACE if watermark is not None else None
     presented = []
     current = new = dropped = 0
     for row in rows or []:
@@ -407,8 +413,8 @@ def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) 
         last_text = str(row.get("last_seen_at") or "")
         first = parse_utc(first_text)
         last = parse_utc(last_text)
-        is_current = watermark is not None and last is not None and last >= watermark
-        is_dropped = watermark is not None and last is not None and last < watermark
+        is_current = current_after is not None and last is not None and last >= current_after
+        is_dropped = current_after is not None and last is not None and last < current_after
         if is_current:
             current += 1
             if first is not None and first >= cutoff:
@@ -1044,6 +1050,7 @@ ORDER BY captured_at DESC, id DESC
 LIMIT ?
 """
 
+# Ordered by rank, not by an exact last_seen match, so a daily refresh stays visible.
 RELATED_SQL = """
 SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at, last_seen_at
 FROM related_edges
@@ -1061,6 +1068,7 @@ LIMIT ?
 """
 
 # idx_playlist_artist_seen is (artist_id, last_seen_at). The crawl time is one primary-key lookup.
+# Current vs dropped is applied in Python with PLAYLIST_CURRENT_GRACE, not in this read.
 PLAYLIST_SQL = """
 SELECT playlist_id, playlist_name, owner_name, follower_count, position,
        first_seen_at, last_seen_at, source, editorial,
@@ -1071,18 +1079,23 @@ ORDER BY last_seen_at DESC, id DESC
 LIMIT ?
 """
 
-TRACK_SQL = """
+# idx_artist_tracks_seen is (artist_id, source, last_seen_at). A track refreshed
+# once a day stays in this window. One that has been off the list longer drops out.
+# strftime keeps the same YYYY-MM-DDTHH:MM:SSZ form as the stored stamps.
+TRACK_SQL = f"""
 SELECT external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
 FROM artist_tracks
 WHERE artist_id = ? AND source = 'spotify'
-  AND last_seen_at = (
-      SELECT MAX(last_seen_at) FROM artist_tracks
+  AND last_seen_at >= (
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+      FROM artist_tracks
       WHERE artist_id = ? AND source = 'spotify'
   )
 ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
 LIMIT ?
 """
 
+# Every stored release group. last_seen_at is not a current/dropped filter.
 RELEASE_SQL = """
 SELECT mbid, title, release_type, released_at, precision, first_seen_at, last_seen_at
 FROM musicbrainz_releases
@@ -1374,12 +1387,13 @@ FROM metric_latest
 WHERE artist_id = ? AND source = 'deezer' AND metric = 'Fans'
 """
 
-DEEZER_TRACKS_SQL = """
+DEEZER_TRACKS_SQL = f"""
 SELECT external_id, track_name, album_name, rank, last_seen_at
 FROM artist_tracks
 WHERE artist_id = ? AND source = 'deezer'
-  AND last_seen_at = (
-      SELECT MAX(last_seen_at) FROM artist_tracks
+  AND last_seen_at >= (
+      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+      FROM artist_tracks
       WHERE artist_id = ? AND source = 'deezer'
   )
 ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC

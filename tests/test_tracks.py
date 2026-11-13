@@ -13,7 +13,7 @@ from cache import MemoryCache
 from crawl import reset_pool
 from db import SqliteDatabase, migrate
 from export_csv import render_export_csv
-from history import TRACKS_EMPTY, load_dashboard_history, popularity_score, present_tracks, remember
+from history import TRACK_SQL, TRACKS_EMPTY, load_dashboard_history, popularity_score, present_tracks, remember
 from http_client import HttpResult
 from providers.spotify import fetch_spotify, parse_api_tracks, parse_popular_tracks
 
@@ -409,3 +409,33 @@ def test_artist_page_lists_stored_tracks_and_does_not_fetch(monkeypatch, tmp_pat
     assert calls == []
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_a_track_refreshed_within_36_hours_stays_and_an_older_one_drops():
+    database = SqliteDatabase(":memory:")
+
+    async def run():
+        await migrate(database)
+        await database.execute(
+            "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('A', 'a', 'search', 1, '2026-11-01T00:00:00Z')"
+        )
+        artist_id = int((await database.query_one("SELECT id FROM artists"))["id"])
+        await database.execute(
+            """
+            INSERT INTO artist_tracks (
+                artist_id, source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+            ) VALUES
+                (?, 'spotify', 'current', 'Current', 10, NULL, 1, '2026-11-01T00:00:00Z', '2026-11-11T12:00:00Z'),
+                (?, 'spotify', 'daily', 'Daily', 20, NULL, 2, '2026-11-01T00:00:00Z', '2026-11-10T00:00:00Z'),
+                (?, 'spotify', 'gone', 'Gone', 30, NULL, 3, '2026-11-01T00:00:00Z', '2026-11-09T12:00:00Z')
+            """,
+            (artist_id, artist_id, artist_id),
+        )
+        rows = await database.query(TRACK_SQL, (artist_id, artist_id, 10))
+        plan = await database.query("EXPLAIN QUERY PLAN " + TRACK_SQL, (artist_id, artist_id, 10))
+        return rows, " ".join(str(row.get("detail") or "") for row in plan)
+
+    rows, plan = asyncio.run(run())
+    assert [row["external_id"] for row in rows] == ["current", "daily"]
+    assert "idx_artist_tracks_seen" in plan
+    assert "SCAN artist_tracks" not in plan

@@ -326,8 +326,7 @@ describe("chunked inserts", () => {
     expect(fans).toEqual({ value: 4000 });
     expect(db.prepare("SELECT COUNT(*) AS n FROM content_sightings WHERE source = 'deezer'").get()).toEqual({ n: 25 });
     expect(db.prepare("SELECT COUNT(*) AS n FROM artist_tracks WHERE source = 'deezer'").get()).toEqual({ n: 10 });
-    const run = db.prepare("SELECT status FROM crawl_runs ORDER BY id DESC LIMIT 1").get() as { status: string };
-    expect(run.status).toBe("ok");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
   });
 
   it("upserts Deezer playlists in chunks and keeps first_seen and unknown fan counts", async () => {
@@ -462,12 +461,14 @@ describe("deezer playlist messages", () => {
     const calls = urls.length;
     const second = await handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T01:00:00Z"));
     expect(second.detail).toContain("fresh");
+    const day = await handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T23:00:00Z"));
+    expect(day.detail).toContain("fresh");
     expect(urls).toHaveLength(calls);
 
     urls.length = 0;
     vi.stubGlobal("fetch", async () => new Response("", { status: 503 }));
     await expect(
-      handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-11T05:00:00Z")),
+      handleMessage(env, { artist_id: 1, provider: "deezer_playlists" }, new Date("2026-11-12T01:00:00Z")),
     ).rejects.toBeInstanceOf(RetryableFetch);
     expect(db.prepare("SELECT crawled_at FROM playlist_crawls").get()).toEqual({ crawled_at: "2026-11-11T00:00:00Z" });
     expect(db.prepare("SELECT COUNT(*) AS n FROM playlist_appearances").get()).toEqual({ n: 2 });
