@@ -100,6 +100,20 @@ ORDER BY last_seen_at DESC, id DESC
 LIMIT ?
 """
 
+# idx_track_stats_lookup starts with artist_id. The series is capped, not sampled.
+_TRACK_STAT_SQL = """
+SELECT s.source AS source, s.external_id AS external_id, s.metric AS metric,
+       s.value AS value, s.captured_at AS captured_at, a.track_name AS track_name
+FROM track_stats AS s
+LEFT JOIN artist_tracks AS a
+  ON a.artist_id = s.artist_id AND a.source = s.source AND a.external_id = s.external_id
+WHERE s.artist_id = ?
+ORDER BY s.captured_at DESC, s.source, s.external_id, s.metric
+LIMIT ?
+"""
+
+_TRACK_STAT_METRICS = {"deezer_rank", "spotify_playcount", "spotify_popularity"}
+
 
 def _blank(value) -> str:
     if value is None:
@@ -143,6 +157,7 @@ def render_export_csv(
     tracks: list[dict] | None = None,
     charts: list[dict] | None = None,
     playlists: list[dict] | None = None,
+    track_stats: list[dict] | None = None,
 ) -> str:
     """One CSV. A metric is included only when value is an exact integer."""
     buffer = io.StringIO()
@@ -258,6 +273,26 @@ def render_export_csv(
                 kind="editorial" if _editorial(row.get("editorial")) else "",
             )
         )
+    for row in track_stats or []:
+        metric = str(row.get("metric") or "").strip()
+        if metric not in _TRACK_STAT_METRICS:
+            continue
+        number = _whole_number(row.get("value"))
+        external = str(row.get("external_id") or "").strip()
+        captured = str(row.get("captured_at") or "").strip()
+        if number is None or not external or not captured:
+            continue
+        writer.writerow(
+            _row(
+                "track_stat",
+                captured_at=captured,
+                provider=row.get("source"),
+                metric=metric,
+                value=number,
+                title=row.get("track_name") or row.get("title"),
+                external_id=external,
+            )
+        )
     return buffer.getvalue()
 
 
@@ -276,6 +311,13 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
     except Exception:
         charts = []
     playlists = await _playlist_export_rows(db, artist_id, cap)
+    try:
+        track_stats = await db.query(_TRACK_STAT_SQL, (artist_id, cap))
+    except Exception as exc:
+        text = str(exc).lower()
+        if "no such column" not in text and "no such table" not in text:
+            raise
+        track_stats = []
     return {
         "metrics": metrics,
         "sightings": sightings,
@@ -284,6 +326,7 @@ async def load_export_rows(db, artist_id: int, limit: int = EXPORT_ROW_CAP) -> d
         "tracks": tracks,
         "charts": charts,
         "playlists": playlists,
+        "track_stats": track_stats,
     }
 
 

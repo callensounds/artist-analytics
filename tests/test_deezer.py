@@ -119,6 +119,11 @@ def test_top_tracks_use_list_order_and_dates_drop_a_clock():
         (1, "One More Time", None),
         (2, "Digital Love", None),
     ]
+    assert [track["deezer_rank"] for track in tracks] == [900000, 800000]
+    assert parse_top_tracks({"data": [{"id": 1, "title": "Quiet", "rank": 0}]})[0]["deezer_rank"] == 0
+    assert parse_top_tracks({"data": [{"id": 2, "title": "Missing"}]})[0]["deezer_rank"] is None
+    assert parse_top_tracks({"data": [{"id": 3, "title": "Bad", "rank": 1.5}]})[0]["deezer_rank"] is None
+    assert parse_top_tracks({"data": [{"id": 4, "title": "No", "rank": False}]})[0]["deezer_rank"] is None
     assert date_only("2001-03-12T00:00:00") == "2001-03-12"
     assert date_only("2001-03-12 00:00:00") == "2001-03-12"
     dated, missing = parse_album_rows(
@@ -157,6 +162,8 @@ def test_fetch_uses_a_stored_id_and_does_not_search():
     assert result.links["deezer_id"] == "27"
     assert result.metrics[0].exact == 4000
     assert result.tracks[0]["rank"] == 1
+    assert result.tracks[0]["deezer_rank"] == 5
+    assert result.tracks[0]["popularity"] is None
     assert result.items[0].precision == "day"
     assert result.items[0].hour_utc is None
     assert not any("/search/" in url for url in http.calls)
@@ -542,10 +549,10 @@ async def _seed_page(database: SqliteDatabase) -> int:
 
 
 def test_artist_page_batches_the_tail_and_deezer_card(monkeypatch, tmp_path):
-    """Each stored read used to be its own D1 round trip. Fourteen of them miss a 1.5s budget.
+    """Each stored read used to be its own D1 round trip. The tail is one batch.
 
     Growth stays one indexed read so a cancelled tail can keep it. Everything else
-    on the artist page, including the Deezer card, is one batch and still renders.
+    on the artist page, including track stats and the Deezer card, is batched and still renders.
     """
     path = tmp_path / "batched.sqlite"
     artist_id = asyncio.run(_seed_page(SqliteDatabase(str(path))))
@@ -573,7 +580,7 @@ def test_artist_page_batches_the_tail_and_deezer_card(monkeypatch, tmp_path):
     assert "4,000" in page.text
     assert HISTORY_UNAVAILABLE not in page.text
     assert "Stored Deezer data could not be read" not in page.text
-    assert batches == [14, 3]
+    assert batches == [15, 3]
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
 

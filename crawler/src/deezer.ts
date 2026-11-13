@@ -110,7 +110,14 @@ export function chooseDeezerArtist(candidates: DeezerArtist[] | null | undefined
   });
 }
 
-export function parseTopTracks(payload: unknown, limit = TRACK_LIMIT): { externalId: string; name: string; popularity: null; album: string | null; rank: number }[] {
+export function parseTopTracks(payload: unknown, limit = TRACK_LIMIT): {
+  externalId: string;
+  name: string;
+  popularity: null;
+  album: string | null;
+  rank: number;
+  deezerRank: number | null;
+}[] {
   if (!payload || typeof payload !== "object" || (payload as { error?: unknown }).error) return [];
   const rows = (payload as { data?: unknown }).data;
   if (!Array.isArray(rows)) return [];
@@ -125,12 +132,15 @@ export function parseTopTracks(payload: unknown, limit = TRACK_LIMIT): { externa
     seen.add(externalId);
     const album = record.album && typeof record.album === "object" ? (record.album as { title?: unknown }).title : "";
     const albumName = String(album || "").replace(/\s+/g, " ").trim();
+    // `rank` on the public track is Deezer's popularity score, not a 1-based position.
+    const score = wholeCount(record.rank);
     tracks.push({
       externalId,
       name: name.slice(0, 200),
       popularity: null,
       album: albumName.slice(0, 200) || null,
       rank: tracks.length + 1,
+      deezerRank: score !== null && Number.isSafeInteger(score) ? score : null,
     });
   }
   return tracks;
