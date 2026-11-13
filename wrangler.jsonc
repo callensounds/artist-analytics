@@ -42,6 +42,25 @@
       }
     ]
   },
+  // Branch previews run `wrangler preview`, which refuses to inherit production
+  // bindings. These resources are empty and are not the live database or crawl queue.
+  "previews": {
+    "d1_databases": [
+      {
+        "binding": "DB",
+        "database_name": "artist-analytics-preview",
+        "database_id": "dea2aa6f-ed92-4ef3-8262-b7d5155c2d1d"
+      }
+    ],
+    "queues": {
+      "producers": [
+        {
+          "binding": "CRAWL_QUEUE",
+          "queue": "artist-analytics-preview"
+        }
+      ]
+    }
+  },
   // CSS is not in Wrangler's default Python module rules. fallthrough keeps
   // the default Text rule that uploads src/templates/**/*.html.
   "rules": [

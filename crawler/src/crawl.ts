@@ -45,6 +45,8 @@ export const RETRY_DELAY_MIN_SECONDS = 120;
 export const RETRY_DELAY_MAX_SECONDS = 300;
 const STALE_SECONDS = 6 * 60 * 60;
 const FRESH_SECONDS = 3 * 60 * 60;
+/** MusicBrainz releases and Deezer playlists move slowly. Metrics stay on the 6h cadence. */
+export const SLOW_SOURCE_MS = 24 * 60 * 60 * 1000;
 const APPLE_BACKOFF_SECONDS = 30 * 60;
 const SCAN_WINDOW = 50;
 export const MB_INTERVAL_MIN_MS = 1500;
@@ -219,19 +221,23 @@ export async function enqueueStale(env: CrawlEnv, now = new Date()): Promise<{ s
   const detail = stopReason
     ? JSON.stringify({ mode: "queue", sent, error: stopReason })
     : JSON.stringify({ mode: "queue", sent });
+  const statements: { sql: string; params: unknown[] }[] = [
+    {
+      sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET next_artist_id = excluded.next_artist_id, updated_at = excluded.updated_at`,
+      params: [stateCursor, stamp],
+    },
+  ];
+  // A tick that queued nobody is not a run. Errors and ticks that sent work stay.
+  if (sent > 0 || stopReason) {
+    statements.push({
+      sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, cursor, detail)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      params: [stamp, stamp, stopReason ? "error" : "queued", sent, String(runCursor), detail],
+    });
+  }
   try {
-    await env.DB.batch([
-      {
-        sql: `INSERT INTO crawl_state (id, next_artist_id, updated_at) VALUES (1, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET next_artist_id = excluded.next_artist_id, updated_at = excluded.updated_at`,
-        params: [stateCursor, stamp],
-      },
-      {
-        sql: `INSERT INTO crawl_runs (started_at, finished_at, status, artists_attempted, cursor, detail)
-              VALUES (?, ?, ?, ?, ?, ?)`,
-        params: [stamp, stamp, stopReason ? "error" : "queued", sent, String(runCursor), detail],
-      },
-    ]);
+    await env.DB.batch(statements);
   } catch (error) {
     console.log(JSON.stringify({
       message: "enqueue state write failed",
@@ -406,7 +412,8 @@ async function musicbrainzReleases(mbid: string) {
   const headers = { Accept: "application/json", "User-Agent": MB_USER_AGENT };
   const url = `https://musicbrainz.org/ws/2/release-group?${new URLSearchParams({ artist: mbid, fmt: "json", limit: "100" })}`;
   const response = await fetchJson(url, headers);
-  if (!response.ok || !response.json || typeof response.json !== "object") return [];
+  // null is a failed read. [] is a real empty catalog. Only a real read sets the daily clock.
+  if (!response.ok || !response.json || typeof response.json !== "object") return null;
   return parseReleaseGroups(response.json);
 }
 
@@ -615,6 +622,15 @@ async function youtube(name: string, channelId: string, apiKey: string): Promise
   };
 }
 
+async function sourceCrawledWithin(store: Store, artistId: number, source: string, now: Date, withinMs: number): Promise<boolean> {
+  const mark = await store.first<{ crawled_at: string }>(
+    "SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = ?",
+    [artistId, source],
+  );
+  const crawled = parseUtc(mark?.crawled_at);
+  return Boolean(crawled && now.getTime() - crawled.getTime() < withinMs);
+}
+
 async function crawlDeezerPlaylists(
   env: CrawlEnv,
   row: Record<string, unknown>,
@@ -623,12 +639,7 @@ async function crawlDeezerPlaylists(
   const artistId = Number(row.id);
   const deezerId = String(row.deezer_id || "");
   if (!/^\d+$/.test(deezerId)) return { ok: true, detail: `${row.name} | deezer_playlists=unavailable` };
-  const mark = await env.DB.first<{ crawled_at: string }>(
-    "SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer'",
-    [artistId],
-  );
-  const crawled = parseUtc(mark?.crawled_at);
-  if (crawled && now.getTime() - crawled.getTime() < FRESH_SECONDS * 1000) {
+  if (await sourceCrawledWithin(env.DB, artistId, "deezer", now, SLOW_SOURCE_MS)) {
     return { ok: true, detail: `${row.name} | deezer_playlists=ok (fresh)` };
   }
   let fetched;
@@ -711,14 +722,17 @@ async function runMusicBrainz(
     markCrawled: identity.status !== "error",
   }, now, 0);
   if (identity.status === "ok" && identity.links._mbid) {
-    try {
-      const releases = await musicbrainzReleases(identity.links._mbid);
-      await saveMusicBrainzReleases(env.DB, artistId, releases, now, String(row.name || ""));
-    } catch (error) {
-      if (error instanceof RetryableFetch) {
-        throw new RetryableFetch(error.delaySeconds, error.message, [], undefined, identity.links._mbid);
+    const releasesFresh = await sourceCrawledWithin(env.DB, artistId, "musicbrainz", now, SLOW_SOURCE_MS);
+    if (!releasesFresh) {
+      try {
+        const releases = await musicbrainzReleases(identity.links._mbid);
+        if (releases) await saveMusicBrainzReleases(env.DB, artistId, releases, now, String(row.name || ""));
+      } catch (error) {
+        if (error instanceof RetryableFetch) {
+          throw new RetryableFetch(error.delaySeconds, error.message, [], undefined, identity.links._mbid);
+        }
+        throw error;
       }
-      throw error;
     }
   }
   return { ok: identity.status !== "error", detail: `${row.name} | musicbrainz=${identity.status}` };

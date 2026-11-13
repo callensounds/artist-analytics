@@ -174,6 +174,38 @@ def test_new_and_dropped_use_the_crawl_time_and_do_not_invent_followers():
     assert counts == {"current": 2, "new": 1, "dropped": 1}
 
 
+def test_a_daily_refresh_stays_current_and_an_older_miss_drops():
+    moment = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
+    crawled = "2026-11-11T12:00:00Z"
+
+    def row(playlist_id, name, last_seen):
+        return {
+            "playlist_id": playlist_id,
+            "playlist_name": name,
+            "owner_name": "Sam",
+            "source": "deezer",
+            "editorial": 0,
+            "follower_count": 10,
+            "position": 1,
+            "first_seen_at": "2026-10-01T00:00:00Z",
+            "last_seen_at": last_seen,
+            "crawled_at": crawled,
+        }
+
+    rows = [
+        row("10", "Still Here", "2026-11-10T00:00:00Z"),
+        row("11", "Just Inside", "2026-11-10T00:00:00Z"),
+        row("12", "Gone", "2026-11-09T23:00:00Z"),
+    ]
+    presented = {item["playlist_id"]: item for item in present_playlists(rows, moment)}
+    assert presented["10"]["current"] is True
+    assert presented["10"]["dropped"] is False
+    assert presented["11"]["current"] is True
+    assert presented["12"]["dropped"] is True
+    assert presented["12"]["current"] is False
+    assert playlist_counts(rows, moment) == {"current": 2, "new": 0, "dropped": 1}
+
+
 def test_playlist_read_uses_the_artist_index_and_the_artist_page_shows_deezer_rows(monkeypatch, tmp_path):
     from db import utc_now
     database = _db()

@@ -49,6 +49,16 @@ def test_one_point_nulls_and_gaps():
     assert window_delta(outside, NOW, 7 * 24 * 3600) is None
 
 
+def test_two_identical_daily_points_are_a_real_flat_window():
+    points = [{"at": _at(20), "value": 1000}, {"at": _at(2), "value": 1000}]
+    day = window_delta(points, NOW, 24 * 3600)
+    assert day["change"] == 0
+    assert day["earliest"] == 1000
+    assert day["latest"] == 1000
+    assert day["percent"] == "0%"
+    assert "bars" not in day
+
+
 def test_build_momentum_omits_short_series_and_ignores_other_metrics():
     rows = [
         {"source": "spotify", "metric": "Followers", "value": 800, "captured_at": "2026-11-02T12:00:00Z"},

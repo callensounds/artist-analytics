@@ -98,6 +98,7 @@ describe("MusicBrainz release dates", () => {
       expect(calls.some((url) => url.includes("release-group"))).toBe(true);
 
       db.prepare("DELETE FROM musicbrainz_releases").run();
+      db.prepare("DELETE FROM playlist_crawls").run();
       db.prepare("UPDATE artists SET last_crawled_at = NULL WHERE id = 1").run();
       vi.stubGlobal("fetch", async (input: string | URL) => {
         const url = String(input);
