@@ -1,6 +1,13 @@
 /** Marker-window parsers. Same needles and caps as the Python providers. */
 
 export const FETCH_BYTES = 260_000;
+/**
+ * open.spotify.com artist HTML. The base64 `initialState` script, which carries
+ * each top track's `playcount`, starts after 250KB and the script ends around
+ * 350KB. FETCH_BYTES cuts that script off, so the Spotify fetch uses this cap.
+ * It is still the same public artist page, not a second request.
+ */
+export const SPOTIFY_PAGE_BYTES = 420_000;
 export const SHELF_WINDOW = 80_000;
 export const MB_USER_AGENT = "AverageAnalytics/1.0 ( callen@callensounds.com )";
 export const HTTP_USER_AGENT = "ArtistAnalytics/0.2 (+https://github.com/callensounds/artist-analytics)";
@@ -384,6 +391,179 @@ export function parseApiTracks(payload: unknown): ParsedTrack[] {
     seen.add(externalId);
     const albumName = track.album && typeof track.album === "object" ? String(track.album.name || "").replace(/\s+/g, " ").trim() : "";
     found.push(trackRow(name, externalId, found.length + 1, popularityScore(track.popularity), albumName || null));
+  }
+  return found;
+}
+
+const PLAYCOUNT_CAP = 40;
+
+function publishedPlaycount(value: unknown): number | null {
+  if (typeof value === "boolean" || value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!/^\d+$/.test(text) || text.length > 15) return null;
+    const number = Number(text);
+    if (!Number.isSafeInteger(number) || number < 0) return null;
+    return number;
+  }
+  return null;
+}
+
+function trackIdFromUri(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const match = /^spotify:track:([A-Za-z0-9]{10,32})$/.exec(value.trim());
+  return match ? match[1] : "";
+}
+
+/** Text inside the first tag that contains marker, through the matching close. */
+function scriptBody(page: string, marker: string): string {
+  const at = page.indexOf(marker);
+  if (at < 0) return "";
+  const open = page.lastIndexOf("<", at);
+  const start = page.indexOf(">", open >= 0 ? open : at);
+  if (start < 0) return "";
+  const end = page.indexOf("</script>", start);
+  if (end < 0) return "";
+  return page.slice(start + 1, end).trim();
+}
+
+function rememberPlaycount(found: Map<string, number>, externalId: string, value: unknown): void {
+  if (found.size >= PLAYCOUNT_CAP || !externalId || found.has(externalId)) return;
+  const count = publishedPlaycount(value);
+  if (count === null) return;
+  found.set(externalId, count);
+}
+
+function collectStatePlaycounts(payload: unknown, found: Map<string, number>): void {
+  if (!payload || typeof payload !== "object") return;
+  const entities = (payload as { entities?: { items?: unknown } }).entities;
+  const items = entities && typeof entities === "object" ? entities.items : null;
+  if (!items || typeof items !== "object") return;
+  for (const value of Object.values(items as Record<string, unknown>)) {
+    if (found.size >= PLAYCOUNT_CAP) return;
+    if (!value || typeof value !== "object") continue;
+    const discography = (value as { discography?: { topTracks?: { items?: unknown } } }).discography;
+    const rows = discography && typeof discography === "object" ? discography.topTracks?.items : null;
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) {
+      if (found.size >= PLAYCOUNT_CAP) return;
+      const track = row && typeof row === "object" ? (row as { track?: unknown }).track : null;
+      if (!track || typeof track !== "object") continue;
+      const record = track as { uri?: unknown; playcount?: unknown };
+      rememberPlaycount(found, trackIdFromUri(record.uri), record.playcount);
+    }
+  }
+}
+
+function nextPlaycountKey(page: string, cursor: number): number {
+  const lower = page.indexOf('"playcount"', cursor);
+  const camel = page.indexOf('"playCount"', cursor);
+  if (lower < 0) return camel;
+  if (camel < 0) return lower;
+  return Math.min(lower, camel);
+}
+
+function enclosingObject(page: string, at: number): { text: string; start: number } {
+  let depth = 0;
+  let start = -1;
+  const floor = Math.max(0, at - 1500);
+  for (let index = at; index >= floor; index--) {
+    const char = page[index];
+    if (char === "}") depth += 1;
+    else if (char === "{") {
+      if (depth === 0) {
+        start = index;
+        break;
+      }
+      depth -= 1;
+    }
+  }
+  if (start < 0) return { text: "", start: -1 };
+  depth = 0;
+  const ceiling = Math.min(page.length, start + 2500);
+  for (let index = start; index < ceiling; index++) {
+    const char = page[index];
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return { text: page.slice(start, index + 1), start };
+    }
+  }
+  return { text: "", start };
+}
+
+function soleTrackId(slice: string): string {
+  const ids = new Set<string>();
+  for (const match of slice.matchAll(/spotify:track:([A-Za-z0-9]{10,32})/g)) ids.add(match[1]);
+  if (ids.size !== 1) return "";
+  return [...ids][0];
+}
+
+function playcountValue(objectText: string, keyAt: number): number | null {
+  const tail = objectText.slice(keyAt);
+  const match = /^"playcount"\s*:\s*/i.exec(tail);
+  if (!match) return null;
+  let index = match[0].length;
+  while (tail[index] === " ") index += 1;
+  if (tail[index] === "{") return null;
+  if (tail[index] === '"') {
+    const end = tail.indexOf('"', index + 1);
+    if (end < 0) return null;
+    return publishedPlaycount(tail.slice(index + 1, end));
+  }
+  const digits = /^(\d+)/.exec(tail.slice(index));
+  if (!digits) return null;
+  const after = tail[index + digits[1].length];
+  if (after === "." || after === "e" || after === "E") return null;
+  return publishedPlaycount(digits[1]);
+}
+
+function collectLiteralPlaycounts(page: string, found: Map<string, number>): void {
+  let cursor = 0;
+  let hits = 0;
+  while (hits < PLAYCOUNT_CAP && found.size < PLAYCOUNT_CAP) {
+    const at = nextPlaycountKey(page, cursor);
+    if (at < 0) return;
+    hits += 1;
+    cursor = at + 11;
+    const object = enclosingObject(page, at);
+    if (!object.text) continue;
+    const keyAt = at - object.start;
+    const count = playcountValue(object.text, keyAt);
+    if (count === null) continue;
+    let externalId = soleTrackId(object.text);
+    if (!externalId && object.start > 0) {
+      const parent = enclosingObject(page, object.start - 1);
+      externalId = soleTrackId(parent.text);
+    }
+    rememberPlaycount(found, externalId, count);
+  }
+}
+
+/**
+ * Play counts the public artist page actually printed.
+ * A visible "1,003,078,256" in the track row is not a `playcount` field and is ignored.
+ * Returns nothing when the field is absent. Never estimates.
+ */
+export function parseSpotifyPlaycounts(page: string): Map<string, number> {
+  const found = new Map<string, number>();
+  if (!page) return found;
+  collectLiteralPlaycounts(page, found);
+  const encoded = scriptBody(page, 'id="initialState"').replace(/\s+/g, "");
+  if (!encoded || encoded.length > 160_000) return found;
+  try {
+    const binary = atob(encoded);
+    if (binary.length > 220_000) return found;
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    collectStatePlaycounts(payload, found);
+  } catch {
+    return found;
   }
   return found;
 }

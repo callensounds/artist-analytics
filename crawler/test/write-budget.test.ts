@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import { parseTopTracks } from "../src/deezer";
 import { evaluateAlerts } from "../src/alerts";
 import { SLOW_SOURCE_MS, handleMessage, resetMusicBrainzPace, runScheduled } from "../src/crawl";
 import {
@@ -334,5 +335,125 @@ describe("slow source cadence and empty cron rows", () => {
     expect(sent).toEqual([]);
     expect(db.prepare("SELECT COUNT(*) AS n FROM crawl_runs").get()).toEqual({ n: 0 });
     expect(db.prepare("SELECT next_artist_id FROM crawl_state WHERE id = 1").get()).toEqual({ next_artist_id: 1 });
+  });
+});
+
+describe("track_stats write budget", () => {
+  it("writes one row per track metric per UTC day and skips an unchanged value", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    let statReads = 0;
+    const read = store.all;
+    store.all = async (sql, params) => {
+      if (String(sql).includes("track_stats")) statReads += 1;
+      return read(sql, params);
+    };
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Daft Punk', 'daftpunk', 'search', 1, '2026-11-01T00:00:00Z')",
+    ).run();
+    const parsed = parseTopTracks({
+      data: [
+        { id: 11, title: "One More Time", rank: 896666, album: { title: "Discovery" } },
+        { id: 12, title: "Digital Love", rank: 800000, album: { title: "Discovery" } },
+        ...Array.from({ length: 12 }, (_, index) => ({ id: 100 + index, title: `Extra ${index}`, rank: 1000 + index })),
+      ],
+    });
+    const tracks = parsed.map((track) => ({
+      externalId: track.externalId,
+      name: track.name,
+      popularity: track.popularity,
+      album: track.album,
+      rank: track.rank,
+      deezerRank: track.deezerRank,
+    }));
+    const start = new Date("2026-11-13T00:00:00Z");
+    await saveSource(store, { id: 1, name: "Daft Punk" }, { platform: "deezer", status: "ok", tracks }, start, 0);
+    expect(statReads).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 10 });
+    expect(db.prepare("SELECT value FROM track_stats WHERE external_id = '11'").get()).toEqual({ value: 896666 });
+    expect(db.prepare("SELECT rank, popularity FROM artist_tracks WHERE external_id = '11'").get()).toEqual({
+      rank: 1,
+      popularity: null,
+    });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 0 });
+
+    store.changes.length = 0;
+    statReads = 0;
+    const changedRank = tracks.map((track) => (track.externalId === "11" ? { ...track, deezerRank: 900000 } : track));
+    await saveSource(
+      store,
+      { id: 1, name: "Daft Punk" },
+      { platform: "deezer", status: "ok", tracks: changedRank },
+      new Date("2026-11-13T06:00:00Z"),
+      0,
+    );
+    expect(statReads).toBe(1);
+    expect(changed(store, "track_stats")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 10 });
+    expect(db.prepare("SELECT value FROM track_stats WHERE external_id = '11'").get()).toEqual({ value: 896666 });
+
+    store.changes.length = 0;
+    await saveSource(store, { id: 1, name: "Daft Punk" }, { platform: "deezer", status: "ok", tracks }, new Date("2026-11-14T00:00:00Z"), 0);
+    expect(changed(store, "track_stats")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 10 });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "Daft Punk" },
+      { platform: "deezer", status: "ok", tracks: changedRank },
+      new Date("2026-11-14T01:00:00Z"),
+      0,
+    );
+    expect(changed(store, "track_stats")).toBe(1);
+    expect(db.prepare("SELECT value, captured_at FROM track_stats WHERE external_id = '11' ORDER BY captured_at").all()).toEqual([
+      { value: 896666, captured_at: "2026-11-13T00:00:00Z" },
+      { value: 900000, captured_at: "2026-11-14T01:00:00Z" },
+    ]);
+  });
+
+  it("stores a Spotify play count only when the field was present", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    let statReads = 0;
+    const read = store.all;
+    store.all = async (sql, params) => {
+      if (String(sql).includes("track_stats")) statReads += 1;
+      return read(sql, params);
+    };
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('A', 'a', 'search', 1, '2026-11-01T00:00:00Z')",
+    ).run();
+    const track = { externalId: "0dpyzcT3RMNNSd2xKBf35I", name: "Be Sweet", popularity: null, album: null, rank: 1 };
+    const start = new Date("2026-11-13T00:00:00Z");
+    await saveSource(store, { id: 1, name: "A" }, { platform: "spotify", status: "ok", tracks: [track] }, start, 0);
+    expect(statReads).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT popularity FROM artist_tracks").get()).toEqual({ popularity: null });
+
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...track, playcount: 113493783 }] },
+      start,
+      0,
+    );
+    expect(db.prepare("SELECT metric, value FROM track_stats").get()).toEqual({
+      metric: "spotify_playcount",
+      value: 113493783,
+    });
+    expect(db.prepare("SELECT popularity FROM artist_tracks").get()).toEqual({ popularity: null });
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks: [{ ...track, playcount: 113493800 }] },
+      new Date("2026-11-13T08:00:00Z"),
+      0,
+    );
+    expect(changed(store, "track_stats")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 1 });
   });
 });

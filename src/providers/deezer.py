@@ -155,11 +155,13 @@ def parse_top_tracks(payload, limit: int = TRACK_LIMIT) -> list[dict]:
         seen.add(external)
         album = row.get("album") if isinstance(row.get("album"), dict) else {}
         album_name = " ".join(str(album.get("title") or "").split())
+        # Deezer's `rank` is a public popularity score. The list position is separate.
         tracks.append(
             {
                 "external_id": external,
                 "name": name[:200],
                 "rank": len(tracks) + 1,
+                "deezer_rank": whole_count(row.get("rank")),
                 "album_name": album_name[:200] or None,
                 "popularity": None,
                 "url": f"https://www.deezer.com/track/{external}",

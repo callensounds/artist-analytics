@@ -38,7 +38,12 @@ describe("deezer matching", () => {
     const tracks = parseTopTracks({
       data: [{ id: 11, title: "One More Time", rank: 900000, album: { title: "Discovery" } }],
     });
-    expect(tracks[0]).toMatchObject({ rank: 1, popularity: null, name: "One More Time" });
+    expect(tracks[0]).toMatchObject({ rank: 1, popularity: null, deezerRank: 900000, name: "One More Time" });
+    expect(parseTopTracks({ data: [{ id: 1, title: "Quiet", rank: 0 }] })[0].deezerRank).toBe(0);
+    expect(parseTopTracks({ data: [{ id: 2, title: "Missing" }] })[0].deezerRank).toBeNull();
+    expect(parseTopTracks({ data: [{ id: 3, title: "Bad", rank: 1.5 }] })[0].deezerRank).toBeNull();
+    expect(parseTopTracks({ data: [{ id: 4, title: "No", rank: false }] })[0].deezerRank).toBeNull();
+    expect(parseTopTracks({ data: [{ id: 5, title: "Text", rank: "896666" }] })[0].deezerRank).toBe(896666);
     expect(dateOnly("2001-03-12T00:00:00")).toBe("2001-03-12");
     const parsed = parseAlbumRows({
       data: [{ id: 302127, title: "Discovery", release_date: "2001-03-12T07:00:00", record_type: "album" }],

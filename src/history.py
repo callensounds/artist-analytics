@@ -66,6 +66,12 @@ TRACKS_EMPTY = (
     "Nothing here is estimated."
 )
 TRACKS_READ_ERROR = "Data temporarily unavailable. Stored tracks could not be read on this request."
+TRACK_STATS_EMPTY = (
+    "Track stats are not yet collected. "
+    "A Deezer rank score or a Spotify play count appears here only after a crawl stores the number that source published. "
+    "Nothing here is estimated."
+)
+TRACK_STATS_READ_ERROR = "Data temporarily unavailable. Stored track stats could not be read on this request."
 GROWTH_EMPTY = "No exact audience count has been stored yet."
 GROWTH_READ_ERROR = "Data temporarily unavailable. Stored growth could not be read on this request."
 ALERT_READ_LIMIT = 20
@@ -109,6 +115,26 @@ def popularity_score(value) -> int | None:
     """A stored 0–100 score. Missing stays missing, and a play count is not a score."""
     number = _whole_number(value)
     if number is None or number > 100:
+        return None
+    return number
+
+
+# SQLite and the crawler share JavaScript's safe integer range. A bigger figure would round.
+_MAX_STAT = 9_007_199_254_740_991
+TRACK_STAT_METRICS = ("deezer_rank", "spotify_playcount", "spotify_popularity")
+
+
+def stat_integer(value) -> int | None:
+    """A published non-negative integer. Commas and floats are not a stored stat."""
+    if isinstance(value, bool) or value is None or isinstance(value, float):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        return None
+    if number < 0 or number > _MAX_STAT:
         return None
     return number
 
@@ -507,6 +533,8 @@ def _clean_tracks(raw) -> list[dict]:
                 "popularity": popularity_score(item.get("popularity")),
                 "album_name": album[:200] or None,
                 "rank": rank,
+                "deezer_rank": stat_integer(item.get("deezer_rank")),
+                "playcount": stat_integer(item.get("playcount")),
             }
         )
     return cleaned
@@ -570,6 +598,8 @@ def empty_history(reason: str) -> dict:
         "playlists_note": PLAYLIST_SPOTIFY_NOTE,
         "tracks": [],
         "tracks_reason": TRACKS_EMPTY,
+        "track_stats": [],
+        "track_stats_reason": TRACK_STATS_EMPTY,
         "momentum": [],
         "momentum_reason": None,
         "alerts": [],
@@ -653,6 +683,52 @@ def _value_statements(prefix: str, rows: list[tuple], suffix: str = "", fixed: t
         params = head + tuple(value for row in chunk for value in row) + foot
         statements.append((sql, params))
     return statements
+
+
+async def _latest_track_stat_map(db, artist_id: int, pairs: list[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
+    """One indexed lookup per track metric, packed into a single statement."""
+    if not pairs:
+        return {}
+    parts = []
+    params: list = []
+    seen = set()
+    for source, external_id, metric in pairs:
+        key = (source, external_id, metric)
+        if key in seen or metric not in TRACK_STAT_METRICS:
+            continue
+        seen.add(key)
+        parts.append(
+            "SELECT source, external_id, metric, value, captured_at FROM ("
+            "SELECT source, external_id, metric, value, captured_at FROM track_stats "
+            "WHERE artist_id = ? AND source = ? AND external_id = ? AND metric = ? "
+            "ORDER BY captured_at DESC LIMIT 1)"
+        )
+        params.extend((artist_id, source, external_id, metric))
+    if not parts:
+        return {}
+    rows = await db.query(" UNION ALL ".join(parts), tuple(params))
+    found = {}
+    for row in rows:
+        found[(row.get("source"), row.get("external_id"), row.get("metric"))] = row
+    return found
+
+
+async def _track_stat_rows(db, artist_id: int, candidates: list[tuple], stamp: str) -> list[tuple]:
+    """At most one row per track and metric per UTC day, and none when the value is unchanged."""
+    if not candidates:
+        return []
+    prior = await _latest_track_stat_map(db, artist_id, [(item[0], item[1], item[2]) for item in candidates])
+    day = stamp[:10]
+    rows = []
+    for source, external_id, metric, value in candidates:
+        previous = prior.get((source, external_id, metric))
+        if previous:
+            previous_day = str(previous.get("captured_at") or "")[:10]
+            previous_value = stat_integer(previous.get("value"))
+            if previous_day == day or previous_value == value:
+                continue
+        rows.append((artist_id, source, external_id, metric, value, stamp))
+    return rows
 
 
 async def _latest_track_scores(db, artist_id: int) -> dict[str, dict]:
@@ -798,6 +874,7 @@ async def remember(
             taken += 1
     stored_tracks = []
     track_values = []
+    stat_candidates = []
     for source in sources:
         platform = source.get("platform")
         if source.get("status") == "error" or platform not in {"spotify", "deezer"}:
@@ -806,8 +883,13 @@ async def remember(
         if platform == "deezer":
             for track in cleaned:
                 track["popularity"] = None
+                if track["deezer_rank"] is not None:
+                    stat_candidates.append((platform, track["external_id"], "deezer_rank", track["deezer_rank"]))
         if platform == "spotify":
             stored_tracks.extend(cleaned)
+            for track in cleaned:
+                if track["playcount"] is not None:
+                    stat_candidates.append((platform, track["external_id"], "spotify_playcount", track["playcount"]))
         track_values.extend(
             (
                 artist_id,
@@ -835,6 +917,7 @@ async def remember(
                 if prior_at and moment - prior_at < timedelta(seconds=SNAPSHOT_REPEAT_SECONDS):
                     continue
             snapshot_values.append((artist_id, "spotify", track["external_id"], score, stamp))
+    stat_values = await _track_stat_rows(db, artist_id, stat_candidates, stamp)
     statements.extend(
         _value_statements(
             """
@@ -859,6 +942,12 @@ async def remember(
             INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at)
             """.strip(),
             snapshot_values,
+        )
+    )
+    statements.extend(
+        _value_statements(
+            "INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at)",
+            stat_values,
         )
     )
     statements.extend(
@@ -1094,6 +1183,171 @@ WHERE artist_id = ? AND source = 'spotify'
 ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
 LIMIT ?
 """
+
+# One read for the current top tracks: latest value, the newest value on or
+# before the cutoff, and the first stored value. idx_track_stats_lookup is
+# (artist_id, source, external_id, metric, captured_at).
+TRACK_STATS_SQL = f"""
+WITH current_tracks AS (
+    SELECT source, external_id, track_name, rank AS list_rank
+    FROM (
+        SELECT source, external_id, track_name, rank
+        FROM artist_tracks
+        WHERE artist_id = ? AND source = 'deezer'
+          AND last_seen_at >= (
+              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+              FROM artist_tracks
+              WHERE artist_id = ? AND source = 'deezer'
+          )
+        ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+        LIMIT 12
+    )
+    UNION ALL
+    SELECT source, external_id, track_name, rank AS list_rank
+    FROM (
+        SELECT source, external_id, track_name, rank
+        FROM artist_tracks
+        WHERE artist_id = ? AND source = 'spotify'
+          AND last_seen_at >= (
+              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+              FROM artist_tracks
+              WHERE artist_id = ? AND source = 'spotify'
+          )
+        ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+        LIMIT 12
+    )
+)
+SELECT source, external_id, metric, value, captured_at, track_name, list_rank,
+       rn_latest, rn_first, rn_ago
+FROM (
+    SELECT stats.source AS source,
+           stats.external_id AS external_id,
+           stats.metric AS metric,
+           stats.value AS value,
+           stats.captured_at AS captured_at,
+           current_tracks.track_name AS track_name,
+           current_tracks.list_rank AS list_rank,
+           ROW_NUMBER() OVER (
+               PARTITION BY stats.source, stats.external_id, stats.metric
+               ORDER BY stats.captured_at DESC
+           ) AS rn_latest,
+           ROW_NUMBER() OVER (
+               PARTITION BY stats.source, stats.external_id, stats.metric
+               ORDER BY stats.captured_at ASC
+           ) AS rn_first,
+           ROW_NUMBER() OVER (
+               PARTITION BY stats.source, stats.external_id, stats.metric
+               ORDER BY CASE WHEN stats.captured_at <= ? THEN 0 ELSE 1 END, stats.captured_at DESC
+           ) AS rn_ago
+    FROM track_stats AS stats
+    JOIN current_tracks
+      ON current_tracks.source = stats.source
+     AND current_tracks.external_id = stats.external_id
+    WHERE stats.artist_id = ?
+) AS ranked
+WHERE rn_latest = 1
+   OR rn_first = 1
+   OR (rn_ago = 1 AND captured_at <= ?)
+LIMIT 80
+"""
+
+
+def _stat_flag(value) -> bool:
+    return value == 1 or value == "1"
+
+
+def present_track_stats(rows: list[dict] | None, cutoff: str) -> list[dict]:
+    """Latest Deezer rank and Spotify play count, plus the change since a real earlier row."""
+    grouped: dict[tuple[str, str, str], dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("source") or "")
+        external = str(row.get("external_id") or "").strip()
+        metric = str(row.get("metric") or "")
+        if source not in {"deezer", "spotify"} or metric not in TRACK_STAT_METRICS or not external:
+            continue
+        value = stat_integer(row.get("value"))
+        captured = str(row.get("captured_at") or "")
+        if value is None or not captured:
+            continue
+        slot = grouped.setdefault((source, external, metric), {})
+        item = {
+            "value": value,
+            "captured_at": captured,
+            "name": " ".join(str(row.get("track_name") or "").split())[:200],
+            "list_rank": _whole_number(row.get("list_rank")),
+        }
+        if item["list_rank"] is not None and (item["list_rank"] < 1 or item["list_rank"] > 100):
+            item["list_rank"] = None
+        if _stat_flag(row.get("rn_latest")):
+            slot["latest"] = item
+        if _stat_flag(row.get("rn_first")):
+            slot["first"] = item
+        if _stat_flag(row.get("rn_ago")) and captured <= cutoff:
+            slot["ago"] = item
+    presented = []
+    for (source, external, metric), slot in grouped.items():
+        latest = slot.get("latest")
+        if not latest or not latest["name"]:
+            continue
+        ago = slot.get("ago")
+        first = slot.get("first")
+        baseline = None
+        used_first = False
+        if ago and ago["captured_at"] < latest["captured_at"]:
+            baseline = ago
+        elif first and first["captured_at"] < latest["captured_at"]:
+            baseline = first
+            used_first = True
+        if baseline is None:
+            change = "No earlier value"
+        else:
+            delta = latest["value"] - baseline["value"]
+            day = baseline["captured_at"][:10]
+            if delta > 0:
+                change = f"+{delta:,} since {day}"
+            else:
+                change = f"{delta:,} since {day}"
+            if used_first:
+                change = f"{change} (first stored value)"
+        if source == "deezer" and external.isdigit():
+            url = f"https://www.deezer.com/track/{external}"
+        elif re.fullmatch(r"[A-Za-z0-9]{10,32}", external):
+            url = f"https://open.spotify.com/track/{external}"
+        else:
+            url = None
+        labels = {
+            "deezer_rank": "Rank score",
+            "spotify_playcount": "Plays",
+            "spotify_popularity": "Popularity",
+        }
+        presented.append(
+            {
+                "name": latest["name"],
+                "url": url,
+                "source": source,
+                "source_label": "Deezer" if source == "deezer" else "Spotify",
+                "metric": metric,
+                "metric_label": labels[metric],
+                "value": latest["value"],
+                "value_text": f"{latest['value']:,}",
+                "change_text": change,
+                "captured_at": latest["captured_at"],
+                "list_rank": latest["list_rank"],
+            }
+        )
+    presented.sort(
+        key=lambda item: (
+            0 if item["source"] == "deezer" else 1,
+            item["list_rank"] is None,
+            item["list_rank"] or 0,
+            item["name"].casefold(),
+            item["metric"],
+        )
+    )
+    return presented
+
 
 # Every stored release group. last_seen_at is not a current/dropped filter.
 RELEASE_SQL = """
@@ -1691,6 +1945,11 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
         ("musicbrainz releases", RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT)),
         ("posting times", EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT)),
         ("release sightings", RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT)),
+        (
+            "track stats",
+            TRACK_STATS_SQL,
+            (artist_id, artist_id, artist_id, artist_id, cutoff, artist_id, cutoff),
+        ),
     ]
     body_count = len(labeled)
     labeled.extend(("chart positions", sql, params) for sql, params in charts)
@@ -1699,8 +1958,9 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     raw = await read_many(db, [(sql, params) for _scope, sql, params in labeled])
     loaded = [
         _logged_rows(scope, value)
-        for (scope, _sql, _params), value in zip(labeled[:body_count], raw[:body_count])
+        for (scope, _sql, _params), value in zip(labeled[: body_count - 1], raw[: body_count - 1])
     ]
+    stat_raw = raw[body_count - 1] if len(raw) >= body_count else RuntimeError("track stats were not read")
     chart_values = [
         _logged_rows(scope, value)
         for (scope, _sql, _params), value in zip(labeled[body_count:-1], raw[body_count:-1])
@@ -1732,6 +1992,17 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     else:
         history["tracks"] = present_tracks(track_rows)
         history["tracks_reason"] = None if history["tracks"] else TRACKS_EMPTY
+    if isinstance(stat_raw, BaseException):
+        if missing_table(stat_raw):
+            history["track_stats"] = []
+            history["track_stats_reason"] = TRACK_STATS_EMPTY
+        else:
+            log_read_failure("track stats", stat_raw)
+            history["track_stats"] = []
+            history["track_stats_reason"] = TRACK_STATS_READ_ERROR
+    else:
+        history["track_stats"] = present_track_stats(list(stat_raw or []), cutoff)
+        history["track_stats_reason"] = None if history["track_stats"] else TRACK_STATS_EMPTY
     if momentum_rows is None:
         history["momentum"] = []
         history["momentum_reason"] = "Data temporarily unavailable. Stored momentum could not be read on this request."

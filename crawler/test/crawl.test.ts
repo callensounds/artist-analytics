@@ -14,7 +14,7 @@ import {
   runQueue,
   runScheduled,
 } from "../src/crawl";
-import { listenerSlices, mergeApiTracks, parseInstagram, parseMonthlyListeners, parsePopularTracks, parseRelatedArtists, leadingInt, tiktokVideos } from "../src/parse";
+import { listenerSlices, mergeApiTracks, parseInstagram, parseMonthlyListeners, parsePopularTracks, parseRelatedArtists, parseSpotifyPlaycounts, leadingInt, tiktokVideos } from "../src/parse";
 import { type Store, migrate, saveSource } from "../src/store";
 import { resetSpotifyToken } from "../src/crawl";
 
@@ -661,6 +661,47 @@ describe("spotify tracks", () => {
     const named = parsePopularTracks("Popular\nExample Song\n9,876,543\nPopular releases\n");
     expect(named[0]).toMatchObject({ externalId: "name:examplesong", popularity: null, name: "Example Song" });
     expect(JSON.stringify(named)).not.toContain("9876543");
+    expect(parseSpotifyPlaycounts(page).size).toBe(0);
+    expect(parseSpotifyPlaycounts("Popular\nExample Song\n9,876,543\nPopular releases\n").size).toBe(0);
+  });
+
+  it("reads a playcount field and ignores a visible count and a truncated script", () => {
+    const literal = `
+      <span>Popular</span>
+      <span>113,493,783</span>
+      {"uri":"spotify:track:0dpyzcT3RMNNSd2xKBf35I","name":"Be Sweet","playcount":113493783}
+      {"uri":"spotify:track:0O4sIQ728ugLlwBVaxF8UM","playcount":"not-a-count"}
+      {"playcount":12}
+    `;
+    expect(parseSpotifyPlaycounts(literal).get("0dpyzcT3RMNNSd2xKBf35I")).toBe(113493783);
+    expect(parseSpotifyPlaycounts(literal).has("0O4sIQ728ugLlwBVaxF8UM")).toBe(false);
+    expect([...parseSpotifyPlaycounts(literal).values()]).toEqual([113493783]);
+    const state = {
+      entities: {
+        items: {
+          "spotify:artist:abc": {
+            discography: {
+              topTracks: {
+                items: [
+                  { track: { uri: "spotify:track:0dpyzcT3RMNNSd2xKBf35I", name: "Be Sweet", playcount: "113493783" } },
+                  { track: { uri: "spotify:track:0O4sIQ728ugLlwBVaxF8UM", name: "No Score" } },
+                  { track: { uri: "spotify:track:aaaaaaaaaaaaaaaaaaaaaa", name: "Float", playcount: 1.5 } },
+                  { track: { uri: "spotify:track:bbbbbbbbbbbbbbbbbbbbbb", name: "Zero", playcount: 0 } },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+    const encoded = Buffer.from(JSON.stringify(state)).toString("base64");
+    const page = `<span>113,493,783</span><script id="initialState" type="text/plain">${encoded}</script>`;
+    const counts = parseSpotifyPlaycounts(page);
+    expect(counts.get("0dpyzcT3RMNNSd2xKBf35I")).toBe(113493783);
+    expect(counts.get("bbbbbbbbbbbbbbbbbbbbbb")).toBe(0);
+    expect(counts.has("0O4sIQ728ugLlwBVaxF8UM")).toBe(false);
+    expect(counts.has("aaaaaaaaaaaaaaaaaaaaaa")).toBe(false);
+    expect(parseSpotifyPlaycounts(`<script id="initialState" type="text/plain">${encoded.slice(0, 20)}`)).toEqual(new Map());
   });
 
   it("merges a Web API score onto the public track and leaves a missing score null", () => {
@@ -710,6 +751,7 @@ describe("spotify tracks", () => {
       { external_id: "0O4sIQ728ugLlwBVaxF8UM", track_name: "No Score", popularity: null, album_name: null, rank: 2 },
     ]);
     expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 0 });
     expect(urls.some((url) => url.includes("api.spotify.com") || url.includes("accounts.spotify.com"))).toBe(false);
   });
 
@@ -800,6 +842,53 @@ describe("spotify tracks", () => {
     );
     expect(db.prepare("SELECT popularity, album_name FROM artist_tracks").get()).toEqual({ popularity: 72, album_name: "Jubilee" });
     expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 1 });
+  });
+
+  it("stores a playcount from initialState and does not write it again the same day", async () => {
+    resetSpotifyToken();
+    const state = Buffer.from(
+      JSON.stringify({
+        entities: {
+          items: {
+            "spotify:artist:abc": {
+              discography: {
+                topTracks: {
+                  items: [{ track: { uri: "spotify:track:0dpyzcT3RMNNSd2xKBf35I", name: "Be Sweet", playcount: "113493783" } }],
+                },
+              },
+            },
+          },
+        },
+      }),
+    ).toString("base64");
+    const html = `
+      <div data-testid="monthly-listeners-label">1,473,027 monthly listeners</div>
+      <span>Popular</span>
+      <div aria-labelledby="listrow-title-track-spotify:track:0dpyzcT3RMNNSd2xKBf35I-0" aria-label="Be Sweet">
+        <span>113,493,783</span>
+      </div>
+      <h2>Popular releases</h2>
+      <script id="initialState" type="text/plain">${state}</script>
+    `;
+    const { env, db } = memoryEnv({ "open.spotify.com/artist/": { body: html } });
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("open.spotify.com/artist/")) return new Response(html, { status: 200 });
+      return new Response("nope", { status: 500 });
+    });
+    await migrate(env.DB);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Japanese Breakfast', 'japanesebreakfast', 'search', 1, ?, '7MoIc5s9KXolCBH1fy9kkw')",
+    ).run("2020-01-01T00:00:00Z");
+    await handleMessage(env, { artist_id: 1, provider: "spotify" }, new Date("2026-11-13T00:00:00Z"));
+    expect(db.prepare("SELECT metric, value FROM track_stats").get()).toEqual({ metric: "spotify_playcount", value: 113493783 });
+    expect(db.prepare("SELECT popularity FROM artist_tracks").get()).toEqual({ popularity: null });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_snapshots").get()).toEqual({ n: 0 });
+    const later = html.replace("113493783", "113500000");
+    vi.stubGlobal("fetch", async () => new Response(later, { status: 200 }));
+    await handleMessage(env, { artist_id: 1, provider: "spotify" }, new Date("2026-11-13T06:00:00Z"));
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 1 });
+    expect(db.prepare("SELECT value FROM track_stats").get()).toEqual({ value: 113493783 });
   });
 });
 

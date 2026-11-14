@@ -316,6 +316,16 @@ CREATE TABLE IF NOT EXISTS track_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_track_snapshots_lookup
     ON track_snapshots (artist_id, source, external_id, captured_at);
+CREATE TABLE IF NOT EXISTS track_stats (
+    artist_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    metric TEXT NOT NULL CHECK (metric IN ('deezer_rank', 'spotify_playcount', 'spotify_popularity')),
+    value INTEGER NOT NULL,
+    captured_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_track_stats_lookup
+    ON track_stats (artist_id, source, external_id, metric, captured_at);
 CREATE TABLE IF NOT EXISTS crawl_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
@@ -365,7 +375,7 @@ export function seenCutoff(now: Date): string {
   return utcNow(new Date(now.getTime() - SEEN_KEEP_ALIVE_MS));
 }
 
-export const LATEST_MIGRATION = "0013_deezer_playlists.sql";
+export const LATEST_MIGRATION = "0014_track_stats.sql";
 
 const MIGRATION_VERSIONS = [
   "0001_crawl.sql",
@@ -380,6 +390,7 @@ const MIGRATION_VERSIONS = [
   "0010_artist_tracks.sql",
   "0011_read_budget.sql",
   "0012_deezer.sql",
+  "0013_deezer_playlists.sql",
   LATEST_MIGRATION,
 ];
 
@@ -588,7 +599,17 @@ export interface SavedSource {
   metrics?: MetricPoint[];
   sightings?: { title: string; url: string; kind: string; sortKey: string; precision: string }[];
   related?: { name: string; spotify_id: string; rank: number }[];
-  tracks?: { externalId: string; name: string; popularity: number | null; album: string | null; rank: number | null }[];
+  tracks?: {
+    externalId: string;
+    name: string;
+    popularity: number | null;
+    album: string | null;
+    rank: number | null;
+    /** Deezer's public `rank` score. Not the 1-based list position. */
+    deezerRank?: number | null;
+    /** Spotify play count from the public page. Never a guessed figure. */
+    playcount?: number | null;
+  }[];
   musicbrainzId?: string | null;
   spotifyId?: string | null;
   appleId?: string | null;
@@ -605,8 +626,35 @@ function popularityScore(value: unknown): number | null {
   return value;
 }
 
+/** A published non-negative integer. Commas, floats, and bools are not counts. */
+export function publishedInteger(value: unknown): number | null {
+  if (typeof value === "boolean" || value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return value;
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!/^\d+$/.test(text) || text.length > 15) return null;
+    const number = Number(text);
+    if (!Number.isSafeInteger(number) || number < 0) return null;
+    return number;
+  }
+  return null;
+}
+
+const TRACK_STAT_METRICS = new Set(["deezer_rank", "spotify_playcount", "spotify_popularity"]);
+
 function cleanTracks(raw: SavedSource["tracks"]) {
-  const found: { externalId: string; name: string; popularity: number | null; album: string | null; rank: number | null }[] = [];
+  const found: {
+    externalId: string;
+    name: string;
+    popularity: number | null;
+    album: string | null;
+    rank: number | null;
+    deezerRank: number | null;
+    playcount: number | null;
+  }[] = [];
   const seen = new Set<string>();
   for (const track of raw || []) {
     if (found.length >= 10) break;
@@ -619,7 +667,63 @@ function cleanTracks(raw: SavedSource["tracks"]) {
         ? track.rank
         : null;
     const album = (track.album || "").replace(/\s+/g, " ").trim().slice(0, 200);
-    found.push({ externalId, name, popularity: popularityScore(track.popularity), album: album || null, rank });
+    found.push({
+      externalId,
+      name,
+      popularity: popularityScore(track.popularity),
+      album: album || null,
+      rank,
+      deezerRank: publishedInteger(track.deezerRank),
+      playcount: publishedInteger(track.playcount),
+    });
+  }
+  return found;
+}
+
+function utcDay(stamp: string): string {
+  return stamp.length >= 10 ? stamp.slice(0, 10) : "";
+}
+
+/**
+ * Latest stored stat for each track the crawl is about to write.
+ * One statement, one indexed LIMIT 1 per track, not one round trip per track.
+ */
+async function latestTrackStats(
+  store: Store,
+  artistId: number,
+  source: string,
+  stats: { externalId: string; metric: string }[],
+): Promise<Map<string, { value: number; capturedAt: string }>> {
+  const found = new Map<string, { value: number; capturedAt: string }>();
+  const parts: string[] = [];
+  const params: unknown[] = [];
+  const seen = new Set<string>();
+  for (const stat of stats) {
+    if (!TRACK_STAT_METRICS.has(stat.metric)) continue;
+    const key = `${stat.externalId}\0${stat.metric}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    parts.push(
+      `SELECT external_id, metric, value, captured_at FROM (
+         SELECT external_id, metric, value, captured_at
+         FROM track_stats
+         WHERE artist_id = ? AND source = ? AND external_id = ? AND metric = ?
+         ORDER BY captured_at DESC
+         LIMIT 1
+       )`,
+    );
+    params.push(artistId, source, stat.externalId, stat.metric);
+  }
+  if (!parts.length) return found;
+  const rows = await store.all<{ external_id: string; metric: string; value: unknown; captured_at: unknown }>(
+    parts.join(" UNION ALL "),
+    params,
+  );
+  for (const row of rows) {
+    const value = publishedInteger(row.value);
+    const capturedAt = typeof row.captured_at === "string" ? row.captured_at : "";
+    if (value === null || !capturedAt) continue;
+    found.set(`${row.external_id}\0${row.metric}`, { value, capturedAt });
   }
   return found;
 }
@@ -857,6 +961,32 @@ export async function saveSource(
     ...chunkedInsert(
       "INSERT INTO track_snapshots (artist_id, source, external_id, popularity, captured_at)",
       trackSnapshots,
+    ),
+  );
+  // Deezer's rank score and a Spotify play count. Popularity stays in track_snapshots.
+  // At most one row per track and metric per UTC day, and none when the value is unchanged.
+  const statCandidates: { externalId: string; metric: string; value: number }[] = [];
+  for (const track of tracks) {
+    if (source.platform === "deezer" && track.deezerRank !== null) {
+      statCandidates.push({ externalId: track.externalId, metric: "deezer_rank", value: track.deezerRank });
+    } else if (source.platform === "spotify" && track.playcount !== null) {
+      statCandidates.push({ externalId: track.externalId, metric: "spotify_playcount", value: track.playcount });
+    }
+  }
+  const statRows: unknown[][] = [];
+  if (statCandidates.length) {
+    const priorStats = await latestTrackStats(store, artistId, source.platform, statCandidates);
+    const day = utcDay(stamp);
+    for (const stat of statCandidates) {
+      const previous = priorStats.get(`${stat.externalId}\0${stat.metric}`);
+      if (previous && (utcDay(previous.capturedAt) === day || previous.value === stat.value)) continue;
+      statRows.push([artistId, source.platform, stat.externalId, stat.metric, stat.value, stamp]);
+    }
+  }
+  statements.push(
+    ...chunkedInsert(
+      "INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at)",
+      statRows,
     ),
   );
   const wrote = snapshots.length || edges;

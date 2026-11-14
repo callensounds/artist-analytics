@@ -186,6 +186,8 @@ def _history_from_saved(saved: dict | None) -> dict | None:
     history["sightings_reason"] = unread.format("timeline rows")
     history["playlists_reason"] = unread.format("playlists")
     history["tracks_reason"] = TRACKS_READ_ERROR
+    history["track_stats"] = []
+    history["track_stats_reason"] = "Data temporarily unavailable. Stored track stats could not be read on this request."
     history["momentum_reason"] = unread.format("momentum")
     history["alerts_reason"] = unread.format("alerts")
     history["releases_reason"] = unread.format("MusicBrainz releases")
@@ -848,6 +850,7 @@ async def export_artist_csv(request: Request, key: str):
         rows.get("tracks") or [],
         rows.get("charts") or [],
         rows.get("playlists") or [],
+        rows.get("track_stats") or [],
     )
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(

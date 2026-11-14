@@ -8,7 +8,6 @@
  */
 
 import {
-  FETCH_BYTES,
   HTTP_USER_AGENT,
   MB_USER_AGENT,
   type MbLinks,
@@ -28,6 +27,8 @@ import {
   parseMonthlyListeners,
   parsePopularTracks,
   parseRelatedArtists,
+  parseSpotifyPlaycounts,
+  SPOTIFY_PAGE_BYTES,
   parseSpotifyFollowers,
   sanitizeQuery,
   shelfWindow,
@@ -477,7 +478,7 @@ async function enrichTracks(artistId: string, tracks: ReturnType<typeof parsePop
 }
 
 async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
-  const page = await fetchText(`https://open.spotify.com/artist/${artistId}`, FETCH_BYTES);
+  const page = await fetchText(`https://open.spotify.com/artist/${artistId}`, SPOTIFY_PAGE_BYTES);
   if (page.status === 403) {
     return { platform: "spotify", status: "unavailable", reason: "Spotify blocked the public artist page (HTTP 403).", markCrawled: true };
   }
@@ -487,6 +488,7 @@ async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
   const followers = parseSpotifyFollowers(lines);
   const related = parseRelatedArtists(page.text);
   const albums = parseDiscography(lines);
+  const playcounts = parseSpotifyPlaycounts(page.text);
   const tracks = await enrichTracks(artistId, parsePopularTracks(page.text), env);
   return {
     platform: "spotify",
@@ -508,6 +510,7 @@ async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
       popularity: track.popularity,
       album: track.album,
       rank: track.rank,
+      playcount: playcounts.get(track.externalId) ?? null,
     })),
     related,
     spotifyId: artistId,
