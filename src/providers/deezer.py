@@ -244,6 +244,7 @@ def build_deezer_result(
     matched: str = "fans",
     notices: list[str] | None = None,
     partial: str | None = None,
+    tracks_confirmed: bool = False,
 ) -> SourceResult:
     if not artist or not artist.get("id"):
         return unavailable("deezer", "Deezer", UNMATCHED)
@@ -273,6 +274,7 @@ def build_deezer_result(
         ],
         items=items,
         tracks=list(tracks or []),
+        tracks_confirmed=bool(tracks_confirmed),
         links={"deezer_id": str(artist["id"])},
         notices=notes,
         cacheable=False,
@@ -334,15 +336,17 @@ async def _search(http, name: str, deadline: float) -> tuple[list[dict], str | N
     return parse_search_artists(payload), None
 
 
-async def _top_and_albums(http, artist_id: str, deadline: float) -> tuple[list[dict], list[dict], str | None]:
+async def _top_and_albums(http, artist_id: str, deadline: float) -> tuple[list[dict], list[dict], str | None, bool]:
     notes = []
     tracks: list[dict] = []
     albums: list[dict] = []
     missing: list[str] = []
+    tracks_confirmed = False
     try:
         result, payload = await _get_json(http, f"{API}/artist/{artist_id}/top", {"limit": str(TRACK_LIMIT)}, deadline)
         if result.ok and not _error_message(payload):
             tracks = parse_top_tracks(payload)
+            tracks_confirmed = True
         else:
             notes.append("Deezer top tracks were not available.")
     except DeezerBusy:
@@ -377,7 +381,7 @@ async def _top_and_albums(http, artist_id: str, deadline: float) -> tuple[list[d
             continue
         extra, _missing = parse_album_rows(payload if isinstance(payload, dict) else {})
         filled.extend(extra)
-    return tracks, filled, " ".join(notes) or None
+    return tracks, filled, " ".join(notes) or None, tracks_confirmed
 
 
 async def fetch_deezer(name: str, links: dict | None, http, cache=None) -> SourceResult:
@@ -416,11 +420,18 @@ async def fetch_deezer(name: str, links: dict | None, http, cache=None) -> Sourc
                 return unavailable("deezer", "Deezer", UNMATCHED)
             else:
                 artist = chosen
-        tracks, albums, partial = await _top_and_albums(http, artist["id"], deadline)
+        tracks, albums, partial, tracks_confirmed = await _top_and_albums(http, artist["id"], deadline)
     except DeezerBusy:
         raise
     except TransportError as exc:
         return errored("deezer", "Deezer", str(exc) or FAILED)
     except Exception:
         return errored("deezer", "Deezer", FAILED)
-    return build_deezer_result(artist, tracks=tracks, albums=albums, matched=matched, partial=partial)
+    return build_deezer_result(
+        artist,
+        tracks=tracks,
+        albums=albums,
+        matched=matched,
+        partial=partial,
+        tracks_confirmed=tracks_confirmed,
+    )

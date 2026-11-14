@@ -512,7 +512,9 @@ async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
       rank: track.rank,
       playcount: playcounts.get(track.externalId) ?? null,
     })),
+    tracksConfirmed: tracks.length > 0,
     related,
+    relatedConfirmed: related.length > 0,
     spotifyId: artistId,
     markCrawled: true,
   };

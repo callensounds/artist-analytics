@@ -111,7 +111,7 @@ def test_snapshots_repeat_only_after_an_hour_and_edges_keep_first_seen():
         database.query_one("SELECT first_seen_at, last_seen_at, rank FROM related_edges WHERE to_spotify_id = 'olivia'")
     )
     assert edge["first_seen_at"] == utc_now(start)
-    assert edge["last_seen_at"] == utc_now(start + timedelta(hours=2))
+    assert edge["last_seen_at"] == utc_now(start)
     related_people = asyncio.run(
         database.query("SELECT name FROM artists WHERE origin = 'related' ORDER BY name")
     )

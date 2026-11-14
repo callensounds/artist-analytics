@@ -414,7 +414,7 @@ def test_deezer_card_queries_hit_indexes_and_history_does_not_run_them():
     assert _card_sql().isdisjoint(seen)
 
     fans = _plan(database, DEEZER_FANS_SQL, (artist_id,))
-    tracks = _plan(database, DEEZER_TRACKS_SQL, (artist_id, artist_id, 10))
+    tracks = _plan(database, DEEZER_TRACKS_SQL, (artist_id, artist_id, artist_id, 10))
     releases = _plan(database, DEEZER_RELEASES_SQL, (artist_id, 20))
     assert "metric_latest" in fans and "SCAN metric_latest" not in fans
     assert "idx_artist_tracks_seen" in tracks and "SCAN artist_tracks" not in tracks

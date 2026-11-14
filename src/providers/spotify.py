@@ -624,6 +624,8 @@ async def _fetch_public(artist_id: str, http, cache, *, include_related: bool = 
             ],
             tracks=tracks,
             related=related,
+            tracks_confirmed=bool(tracks),
+            related_confirmed=bool(include_related and related),
             items=items[:40],
             notices=notices,
         )

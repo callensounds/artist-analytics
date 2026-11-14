@@ -253,7 +253,7 @@ class D1Database:
 
 # Bump this when a new file is added under src/migrations. A database that
 # already has this version skips the per-file probes.
-LATEST_MIGRATION = "0014_track_stats.sql"
+LATEST_MIGRATION = "0015_seen_without_rewrite.sql"
 
 # One successful migrate per database object (or its D1 binding). The next
 # request on that isolate does not read schema_migrations again.
@@ -358,7 +358,15 @@ async def migrate(db) -> None:
         if applied:
             continue
         for statement in split_sql(path.read_text()):
-            await db.execute(statement)
+            try:
+                await db.execute(statement)
+            except Exception as exc:
+                # 0015 can already be applied on prod before this worker starts.
+                # SQLite has no ADD COLUMN IF NOT EXISTS. A second ADD is a no-op.
+                message = str(exc).lower()
+                if statement.lstrip().upper().startswith("ALTER TABLE") and "duplicate column name" in message:
+                    continue
+                raise
         await db.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (path.name, utc_now()),

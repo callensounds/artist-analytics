@@ -104,10 +104,24 @@ async def load_related_graph(db, artist_id: int) -> dict | None:
         return None
     rows = await db.query(
         """
-        SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at, last_seen_at
+        SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at,
+               CASE
+                 WHEN related_edges.removed_at IS NULL
+                  AND freshness.absences_marked_at IS NOT NULL
+                  AND freshness.absences_marked_at > related_edges.last_seen_at
+                 THEN freshness.absences_marked_at
+                 ELSE related_edges.last_seen_at
+               END AS last_seen_at
         FROM related_edges
-        WHERE from_artist_id = ? AND to_artist_id IS NOT NULL
-        ORDER BY rank ASC, last_seen_at DESC
+        LEFT JOIN playlist_crawls AS freshness
+          ON freshness.artist_id = related_edges.from_artist_id
+         AND freshness.source = 'spotify_related'
+        WHERE related_edges.from_artist_id = ? AND related_edges.to_artist_id IS NOT NULL
+          AND (
+            related_edges.removed_at IS NULL
+            OR freshness.absences_marked_at IS NULL
+          )
+        ORDER BY related_edges.rank ASC, last_seen_at DESC
         LIMIT ?
         """,
         (int(artist["id"]), NEIGHBOR_CAP),
@@ -143,6 +157,7 @@ async def load_related_graph(db, artist_id: int) -> dict | None:
             FROM related_edges
             WHERE from_artist_id IN ({marks})
               AND to_artist_id IN ({member_marks})
+              AND removed_at IS NULL
             ORDER BY rank ASC, last_seen_at DESC
             LIMIT ?
             """,

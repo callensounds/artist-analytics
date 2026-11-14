@@ -199,6 +199,7 @@ CREATE TABLE IF NOT EXISTS related_edges (
     rank INTEGER NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    removed_at TEXT,
     PRIMARY KEY (from_artist_id, to_spotify_id, source)
 );
 CREATE INDEX IF NOT EXISTS idx_related_from_artist
@@ -217,6 +218,7 @@ CREATE TABLE IF NOT EXISTS playlist_appearances (
     last_seen_at TEXT NOT NULL,
     source TEXT,
     editorial INTEGER,
+    removed_at TEXT,
     UNIQUE (artist_id, playlist_id)
 );
 CREATE INDEX IF NOT EXISTS idx_playlist_artist_seen
@@ -225,6 +227,7 @@ CREATE TABLE IF NOT EXISTS playlist_crawls (
     artist_id INTEGER NOT NULL,
     source TEXT NOT NULL,
     crawled_at TEXT NOT NULL,
+    absences_marked_at TEXT,
     PRIMARY KEY (artist_id, source)
 );
 CREATE TABLE IF NOT EXISTS metric_alerts (
@@ -302,6 +305,7 @@ CREATE TABLE IF NOT EXISTS artist_tracks (
     rank INTEGER,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    removed_at TEXT,
     PRIMARY KEY (artist_id, source, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_artist_tracks_seen
@@ -362,8 +366,13 @@ export function parseUtc(value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-/** An unchanged row is rewritten only when last_seen_at is at least this old. */
-export const SEEN_KEEP_ALIVE_MS = 24 * 60 * 60 * 1000;
+/**
+ * Unchanged playlist, track, and related rows are rewritten only after this long.
+ * A row missing from a confirmed crawl is marked removed_at instead.
+ */
+export const SEEN_KEEP_ALIVE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Release rows are not a current/dropped list. A daily touch stays enough. */
+export const RELEASE_KEEP_ALIVE_MS = 24 * 60 * 60 * 1000;
 /**
  * An audience value identical to metric_latest is stored again only after this
  * long, so a flat series still has one real point per day. A different value
@@ -371,11 +380,11 @@ export const SEEN_KEEP_ALIVE_MS = 24 * 60 * 60 * 1000;
  */
 export const SNAPSHOT_REPEAT_MS = 24 * 60 * 60 * 1000;
 
-export function seenCutoff(now: Date): string {
-  return utcNow(new Date(now.getTime() - SEEN_KEEP_ALIVE_MS));
+export function seenCutoff(now: Date, keepAliveMs = SEEN_KEEP_ALIVE_MS): string {
+  return utcNow(new Date(now.getTime() - keepAliveMs));
 }
 
-export const LATEST_MIGRATION = "0014_track_stats.sql";
+export const LATEST_MIGRATION = "0015_seen_without_rewrite.sql";
 
 const MIGRATION_VERSIONS = [
   "0001_crawl.sql",
@@ -391,6 +400,7 @@ const MIGRATION_VERSIONS = [
   "0011_read_budget.sql",
   "0012_deezer.sql",
   "0013_deezer_playlists.sql",
+  "0014_track_stats.sql",
   LATEST_MIGRATION,
 ];
 
@@ -562,6 +572,15 @@ export async function migrate(store: Store): Promise<void> {
   await ensureColumn(store, "artists", "deezer_nb_album", "ALTER TABLE artists ADD COLUMN deezer_nb_album INTEGER");
   await ensureColumn(store, "playlist_appearances", "source", "ALTER TABLE playlist_appearances ADD COLUMN source TEXT");
   await ensureColumn(store, "playlist_appearances", "editorial", "ALTER TABLE playlist_appearances ADD COLUMN editorial INTEGER");
+  await ensureColumn(store, "playlist_appearances", "removed_at", "ALTER TABLE playlist_appearances ADD COLUMN removed_at TEXT");
+  await ensureColumn(store, "artist_tracks", "removed_at", "ALTER TABLE artist_tracks ADD COLUMN removed_at TEXT");
+  await ensureColumn(store, "related_edges", "removed_at", "ALTER TABLE related_edges ADD COLUMN removed_at TEXT");
+  await ensureColumn(
+    store,
+    "playlist_crawls",
+    "absences_marked_at",
+    "ALTER TABLE playlist_crawls ADD COLUMN absences_marked_at TEXT",
+  );
   for (const sql of READ_BUDGET_SQL) {
     await store.batch([{ sql, params: [] }]);
   }
@@ -610,6 +629,10 @@ export interface SavedSource {
     /** Spotify play count from the public page. Never a guessed figure. */
     playcount?: number | null;
   }[];
+  /** True after a real read of that list, including a successful empty Deezer top. */
+  tracksConfirmed?: boolean;
+  /** True when the Spotify related list was actually parsed and non-empty. */
+  relatedConfirmed?: boolean;
   musicbrainzId?: string | null;
   spotifyId?: string | null;
   appleId?: string | null;
@@ -727,6 +750,40 @@ async function latestTrackStats(
     found.set(key, { value, capturedAt });
   }
   return found;
+}
+
+function markAbsent(
+  table: string,
+  artistColumn: string,
+  artistId: number,
+  sourceSql: string,
+  sourceParams: unknown[],
+  keyColumn: string,
+  keys: string[],
+  stamp: string,
+): Statement {
+  const params: unknown[] = [stamp, artistId, ...sourceParams];
+  let keySql = "";
+  if (keys.length) {
+    keySql = ` AND ${keyColumn} NOT IN (${keys.map(() => "?").join(",")})`;
+    params.push(...keys);
+  }
+  return {
+    sql: `UPDATE ${table} SET removed_at = ? WHERE ${artistColumn} = ?${sourceSql} AND removed_at IS NULL${keySql}`,
+    params,
+  };
+}
+
+function absencesMarked(artistId: number, source: string, stamp: string): Statement {
+  return {
+    sql: `INSERT INTO playlist_crawls (artist_id, source, crawled_at, absences_marked_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(artist_id, source) DO UPDATE SET
+            absences_marked_at = excluded.absences_marked_at
+          WHERE playlist_crawls.absences_marked_at IS NULL
+             OR playlist_crawls.absences_marked_at < excluded.absences_marked_at`,
+    params: [artistId, source, stamp, stamp],
+  };
 }
 
 function whole(value: unknown): number | null {
@@ -854,9 +911,11 @@ export async function saveSource(
         (from_artist_id, to_spotify_id, to_name, source, rank, first_seen_at, last_seen_at)`,
       edgeRows,
       `ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
-          to_name = excluded.to_name, rank = excluded.rank, last_seen_at = excluded.last_seen_at
+          to_name = excluded.to_name, rank = excluded.rank, last_seen_at = excluded.last_seen_at,
+          removed_at = NULL
         WHERE excluded.to_name IS NOT related_edges.to_name
            OR excluded.rank IS NOT related_edges.rank
+           OR related_edges.removed_at IS NOT NULL
            OR related_edges.last_seen_at <= ?`,
       [cutoff],
     ),
@@ -876,7 +935,7 @@ export async function saveSource(
         statements.push({
           sql: `UPDATE related_edges SET to_artist_id = ?
                 WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
-                  AND to_artist_id IS NOT ?`,
+                  AND (to_artist_id IS NULL OR to_artist_id IS NOT ?)`,
           params: [existing.id, artistId, item.spotify_id, existing.id],
         });
         continue;
@@ -949,11 +1008,13 @@ export async function saveSource(
           popularity = COALESCE(excluded.popularity, artist_tracks.popularity),
           album_name = COALESCE(excluded.album_name, artist_tracks.album_name),
           rank = excluded.rank,
-          last_seen_at = excluded.last_seen_at
+          last_seen_at = excluded.last_seen_at,
+          removed_at = NULL
         WHERE excluded.track_name IS NOT artist_tracks.track_name
            OR (excluded.popularity IS NOT NULL AND excluded.popularity IS NOT artist_tracks.popularity)
            OR (excluded.album_name IS NOT NULL AND excluded.album_name IS NOT artist_tracks.album_name)
            OR excluded.rank IS NOT artist_tracks.rank
+           OR artist_tracks.removed_at IS NOT NULL
            OR artist_tracks.last_seen_at <= ?`,
       [cutoff],
     ),
@@ -990,6 +1051,34 @@ export async function saveSource(
       statRows,
     ),
   );
+  const tracksConfirmed =
+    source.tracksConfirmed === true && source.status === "ok" && (source.platform === "spotify" || source.platform === "deezer");
+  const relatedConfirmed = source.relatedConfirmed === true && source.status === "ok" && source.platform === "spotify";
+  if (tracksConfirmed) {
+    statements.push(
+      markAbsent(
+        "artist_tracks",
+        "artist_id",
+        artistId,
+        " AND source = ?",
+        [source.platform],
+        "external_id",
+        tracks.map((track) => track.externalId),
+        stamp,
+      ),
+    );
+    statements.push(absencesMarked(artistId, `${source.platform}_tracks`, stamp));
+  }
+  if (relatedConfirmed) {
+    const seenIds: string[] = [];
+    for (const item of related) {
+      if (item.spotify_id && item.name && !seenIds.includes(item.spotify_id)) seenIds.push(item.spotify_id);
+    }
+    statements.push(
+      markAbsent("related_edges", "from_artist_id", artistId, " AND source = ?", ["spotify"], "to_spotify_id", seenIds, stamp),
+    );
+    statements.push(absencesMarked(artistId, "spotify_related", stamp));
+  }
   const wrote = snapshots.length || edges;
   const status = source.status === "error" ? (wrote ? "partial" : "error") : "ok";
   const detail = `${String(row.name || "")} | ${source.platform}=${source.status}${source.reason ? ` (${source.reason.slice(0, 140)})` : ""}`.slice(0, 2000);
@@ -1015,7 +1104,7 @@ export async function saveMusicBrainzReleases(
   artistName = "",
 ): Promise<void> {
   const stamp = utcNow(now);
-  const cutoff = seenCutoff(now);
+  const cutoff = seenCutoff(now, RELEASE_KEEP_ALIVE_MS);
   const rows = releases.map((release) => [
     artistId,
     release.mbid,
@@ -1073,7 +1162,8 @@ export interface PlaylistPlacement {
 }
 
 /** Upsert Deezer placements. first_seen_at stays on conflict. A missing fan count is not written as 0.
- *  An unchanged row is rewritten only when last_seen_at is at least a day old.
+ *  An unchanged row is rewritten only when last_seen_at is at least 7 days old.
+ *  Playlists missing from this confirmed list are marked removed_at.
  */
 export async function saveDeezerPlaylists(
   store: Store,
@@ -1107,13 +1197,15 @@ export async function saveDeezerPlaylists(
       position = COALESCE(excluded.position, playlist_appearances.position),
       last_seen_at = excluded.last_seen_at,
       source = excluded.source,
-      editorial = excluded.editorial
+      editorial = excluded.editorial,
+      removed_at = NULL
     WHERE excluded.playlist_name IS NOT playlist_appearances.playlist_name
        OR (excluded.owner_name IS NOT NULL AND excluded.owner_name IS NOT playlist_appearances.owner_name)
        OR excluded.follower_count IS NOT playlist_appearances.follower_count
        OR (excluded.position IS NOT NULL AND excluded.position IS NOT playlist_appearances.position)
        OR excluded.source IS NOT playlist_appearances.source
        OR excluded.editorial IS NOT playlist_appearances.editorial
+       OR playlist_appearances.removed_at IS NOT NULL
        OR playlist_appearances.last_seen_at <= ?`;
   const updateUnchecked = `ON CONFLICT(artist_id, playlist_id) DO UPDATE SET
       playlist_name = excluded.playlist_name,
@@ -1121,27 +1213,45 @@ export async function saveDeezerPlaylists(
       position = COALESCE(excluded.position, playlist_appearances.position),
       last_seen_at = excluded.last_seen_at,
       source = excluded.source,
-      editorial = excluded.editorial
+      editorial = excluded.editorial,
+      removed_at = NULL
     WHERE excluded.playlist_name IS NOT playlist_appearances.playlist_name
        OR (excluded.owner_name IS NOT NULL AND excluded.owner_name IS NOT playlist_appearances.owner_name)
        OR (excluded.position IS NOT NULL AND excluded.position IS NOT playlist_appearances.position)
        OR excluded.source IS NOT playlist_appearances.source
        OR excluded.editorial IS NOT playlist_appearances.editorial
+       OR playlist_appearances.removed_at IS NOT NULL
        OR playlist_appearances.last_seen_at <= ?`;
   const insert = `INSERT INTO playlist_appearances (
       artist_id, playlist_id, playlist_name, owner_name, follower_count, position,
       first_seen_at, last_seen_at, source, editorial
     )`;
+  const absent = markAbsent(
+    "playlist_appearances",
+    "artist_id",
+    artistId,
+    " AND (source = 'deezer' OR source IS NULL)",
+    [],
+    "playlist_id",
+    [...seen],
+    stamp,
+  );
   await commitWrites(
     store,
     [
       ...chunkedInsert(insert, known, updateKnown, [cutoff]),
       ...chunkedInsert(insert, unchecked, updateUnchecked, [cutoff]),
+      absent,
       {
-        sql: `INSERT INTO playlist_crawls (artist_id, source, crawled_at) VALUES (?, 'deezer', ?)
-              ON CONFLICT(artist_id, source) DO UPDATE SET crawled_at = excluded.crawled_at
-              WHERE playlist_crawls.crawled_at < excluded.crawled_at`,
-        params: [artistId, stamp],
+        sql: `INSERT INTO playlist_crawls (artist_id, source, crawled_at, absences_marked_at)
+              VALUES (?, 'deezer', ?, ?)
+              ON CONFLICT(artist_id, source) DO UPDATE SET
+                crawled_at = excluded.crawled_at,
+                absences_marked_at = excluded.absences_marked_at
+              WHERE playlist_crawls.crawled_at < excluded.crawled_at
+                 OR playlist_crawls.absences_marked_at IS NULL
+                 OR playlist_crawls.absences_marked_at < excluded.absences_marked_at`,
+        params: [artistId, stamp, stamp],
       },
     ],
     artistName,

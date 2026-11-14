@@ -211,7 +211,7 @@ def test_playlist_read_uses_the_artist_index_and_the_artist_page_shows_deezer_ro
     database = _db()
 
     async def plan():
-        rows = await database.query("EXPLAIN QUERY PLAN " + PLAYLIST_SQL, (1, 1, 50))
+        rows = await database.query("EXPLAIN QUERY PLAN " + PLAYLIST_SQL, (1, 1, 1, 50))
         return " ".join(str(row.get("detail") or "") for row in rows)
 
     detail = asyncio.run(plan())
