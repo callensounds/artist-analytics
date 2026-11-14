@@ -3,6 +3,7 @@
 import asyncio
 import csv
 import io
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -11,7 +12,7 @@ import main
 from crawl import reset_pool
 from db import SqliteDatabase, migrate, utc_now
 from export_csv import load_export_rows, render_export_csv
-from history import TRACK_STATS_SQL, present_track_stats, remember
+from history import TRACK_STATS_SQL, _latest_track_stat_map, present_track_stats, remember
 
 
 def _plan(database: SqliteDatabase, sql: str, params: tuple) -> str:
@@ -269,3 +270,108 @@ def test_export_rows_include_track_stats():
 
     rows = asyncio.run(run())
     assert rows["track_stats"][0]["value"] == 10
+
+
+def test_latest_track_stat_read_has_no_compound_select():
+    database = SqliteDatabase(":memory:")
+    start = datetime(2026, 11, 13, tzinfo=timezone.utc)
+    tracks = [
+        {
+            "external_id": str(index + 1),
+            "name": f"Track {index + 1}",
+            "rank": index + 1,
+            "deezer_rank": 1000 + index,
+            "album_name": "Album",
+            "popularity": None,
+        }
+        for index in range(12)
+    ]
+
+    async def run():
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Kendrick Lamar', 'kendricklamar', 'search', 1, '2026-11-01T00:00:00Z')
+            """
+        )
+        artist = await database.query_one("SELECT * FROM artists")
+        artist_id = int(artist["id"])
+        for track in tracks:
+            external = track["external_id"]
+            value = track["deezer_rank"]
+            # Latest row is inserted first, and an older row has the larger value.
+            await database.execute(
+                """
+                INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at)
+                VALUES (?, 'deezer', ?, 'deezer_rank', ?, '2026-11-12T00:00:00Z')
+                """,
+                (artist_id, external, value),
+            )
+            await database.execute(
+                """
+                INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at)
+                VALUES (?, 'deezer', ?, 'deezer_rank', ?, '2026-11-10T00:00:00Z')
+                """,
+                (artist_id, external, value + 500),
+            )
+            await database.execute(
+                """
+                INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at)
+                VALUES (?, 'deezer', ?, 'deezer_rank', ?, '2026-11-01T00:00:00Z')
+                """,
+                (artist_id, external, value - 50),
+            )
+        queries = []
+        original = database.query
+
+        async def spy(sql, params=()):
+            if "FROM track_stats" in sql and "MAX(" in sql:
+                queries.append((sql, params))
+            return await original(sql, params)
+
+        database.query = spy
+        pairs = [("deezer", track["external_id"], "deezer_rank") for track in tracks]
+        found = await _latest_track_stat_map(database, artist_id, pairs)
+        bundle = {"sources": [{"platform": "deezer", "status": "ok", "tracks": tracks, "metrics": []}]}
+        await remember(database, "Kendrick Lamar", bundle, now=start, related_cap=0, artist_row=artist)
+        unchanged = await database.query_one("SELECT COUNT(*) AS n FROM track_stats")
+        changed_tracks = [{**track, "deezer_rank": 1100} if track["external_id"] == "1" else track for track in tracks]
+        await remember(
+            database,
+            "Kendrick Lamar",
+            {"sources": [{"platform": "deezer", "status": "ok", "tracks": changed_tracks, "metrics": []}]},
+            now=start + timedelta(days=1),
+            related_cap=0,
+            artist_row=artist,
+        )
+        written = await database.query(
+            "SELECT value, captured_at FROM track_stats WHERE external_id = '1' ORDER BY captured_at"
+        )
+        others = await database.query_one("SELECT COUNT(*) AS n FROM track_stats WHERE external_id = '2'")
+        database.query = original
+        return queries, found, unchanged, written, others
+
+    queries, found, unchanged, written, others = asyncio.run(run())
+    assert len(queries) == 3
+    for sql, params in queries:
+        assert re.search(r"\b(UNION|INTERSECT|EXCEPT)\b", sql, re.I) is None
+        assert len(params) < 100
+    first_ids = [value for value in queries[0][1] if isinstance(value, str) and value.isdigit()]
+    assert first_ids == [str(index + 1) for index in range(12)]
+    assert len(found) == 12
+    for track in tracks:
+        row = found[("deezer", track["external_id"], "deezer_rank")]
+        assert row["value"] == track["deezer_rank"]
+        assert row["captured_at"] == "2026-11-12T00:00:00Z"
+    plan = _plan(database, queries[0][0], queries[0][1])
+    assert "idx_track_stats_lookup" in plan
+    assert "SCAN track_stats" not in plan
+    assert unchanged["n"] == 36
+    assert written == [
+        {"value": 950, "captured_at": "2026-11-01T00:00:00Z"},
+        {"value": 1500, "captured_at": "2026-11-10T00:00:00Z"},
+        {"value": 1000, "captured_at": "2026-11-12T00:00:00Z"},
+        {"value": 1100, "captured_at": "2026-11-14T00:00:00Z"},
+    ]
+    assert others["n"] == 3

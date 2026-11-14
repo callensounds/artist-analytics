@@ -686,30 +686,41 @@ def _value_statements(prefix: str, rows: list[tuple], suffix: str = "", fixed: t
 
 
 async def _latest_track_stat_map(db, artist_id: int, pairs: list[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
-    """One indexed lookup per track metric, packed into a single statement."""
-    if not pairs:
-        return {}
-    parts = []
-    params: list = []
-    seen = set()
+    """Latest row per track metric. One indexed statement per source, not a UNION.
+
+    SQLite returns ``value`` from the row that holds ``MAX(captured_at)``.
+    A UNION of per-track LIMIT 1 reads exceeds D1's compound SELECT term limit.
+    """
+    ids_by_source: dict[str, list[str]] = {}
+    metrics_by_source: dict[str, list[str]] = {}
+    wanted: set[tuple[str, str, str]] = set()
     for source, external_id, metric in pairs:
         key = (source, external_id, metric)
-        if key in seen or metric not in TRACK_STAT_METRICS:
+        if key in wanted or metric not in TRACK_STAT_METRICS:
             continue
-        seen.add(key)
-        parts.append(
-            "SELECT source, external_id, metric, value, captured_at FROM ("
-            "SELECT source, external_id, metric, value, captured_at FROM track_stats "
-            "WHERE artist_id = ? AND source = ? AND external_id = ? AND metric = ? "
-            "ORDER BY captured_at DESC LIMIT 1)"
+        wanted.add(key)
+        external_ids = ids_by_source.setdefault(source, [])
+        if external_id not in external_ids:
+            external_ids.append(external_id)
+        metrics = metrics_by_source.setdefault(source, [])
+        if metric not in metrics:
+            metrics.append(metric)
+    found: dict[tuple[str, str, str], dict] = {}
+    for source, external_ids in ids_by_source.items():
+        metrics = metrics_by_source[source]
+        rows = await db.query(
+            "SELECT source, external_id, metric, value, MAX(captured_at) AS captured_at "
+            "FROM track_stats "
+            "WHERE artist_id = ? AND source = ? "
+            f"AND metric IN ({','.join('?' * len(metrics))}) "
+            f"AND external_id IN ({','.join('?' * len(external_ids))}) "
+            "GROUP BY external_id, metric",
+            (artist_id, source, *metrics, *external_ids),
         )
-        params.extend((artist_id, source, external_id, metric))
-    if not parts:
-        return {}
-    rows = await db.query(" UNION ALL ".join(parts), tuple(params))
-    found = {}
-    for row in rows:
-        found[(row.get("source"), row.get("external_id"), row.get("metric"))] = row
+        for row in rows:
+            key = (row.get("source"), row.get("external_id"), row.get("metric"))
+            if key in wanted:
+                found[key] = row
     return found
 
 
