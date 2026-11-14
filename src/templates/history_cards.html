@@ -1,5 +1,5 @@
 {% if history.artist_id %}
-<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+<section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1">
         <h2 class="font-semibold">Growth alerts</h2>
         <a href="/alerts" class="text-xs text-emerald-400 hover:underline">All alerts</a>
@@ -18,7 +18,7 @@
     <p class="text-slate-400 text-sm">{{ history.alerts_reason or "No growth alerts yet." }}</p>
     {% endif %}
 </section>
-<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+<section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <h2 class="font-semibold mb-1">Momentum</h2>
     <p class="text-xs text-slate-400 mb-3">Exact stored counts. Each change is the latest reading minus the earliest in that window. The span is the time between those two readings. A window with one reading is left off.</p>
     {% if history.momentum %}
@@ -47,14 +47,14 @@
     <p class="text-slate-400 text-sm">{{ history.momentum_reason or "Not enough stored readings in the last 24 hours or 7 days. One reading is not a trend." }}</p>
     {% endif %}
 </section>
-<section class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+<section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <div class="flex flex-wrap items-baseline justify-between gap-2 mb-1">
         <h2 class="font-semibold">Audience score</h2>
         <a href="/scores" class="text-xs text-emerald-400 hover:underline">Ranked scores</a>
     </div>
     <p class="text-xs text-slate-400 mb-3">{{ history.score_formula }}</p>
     {% if history.score_text %}
-    <p class="text-2xl font-mono text-emerald-300">{{ history.score_text }}</p>
+    <p class="stat-value">{{ history.score_text }}</p>
     <ul class="mt-3 space-y-1 text-sm">
         {% for part in history.score_components %}
         <li class="flex flex-wrap items-baseline justify-between gap-2">
@@ -111,7 +111,7 @@
         {% if row.series|length > 1 %}
         <div>
             <p class="text-xs text-slate-400 mb-1">{{ row.title }} · {{ row.chart_label }}</p>
-            <div class="relative h-40"><canvas id="itunes-{{ loop.index0 }}"></canvas></div>
+            <div class="chart-frame relative h-40"><canvas id="itunes-{{ loop.index0 }}"></canvas></div>
             {% if row.series_capped %}
             <p class="text-xs text-slate-500 mt-1">Newest stored dates. Peak and days use every stored date.</p>
             {% endif %}
@@ -290,7 +290,7 @@
 {% include "patterns_calendar.html" %}
 {% endif %}
 
-<section id="growthChart" class="bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
+<section id="growthChart" class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <h2 class="font-semibold mb-1">Audience growth</h2>
     <p class="text-xs text-slate-400 mb-3">Exact counts only, captured in UTC. Each metric has its own scale. A line connects stored readings and does not fill hours that were not crawled. One reading is not a trend.</p>
     {% if history.growth.datasets %}
@@ -307,7 +307,7 @@
         {% if series.data|length > 1 %}
         <div>
             <p class="text-xs text-slate-400 mb-1">{{ series.label }}</p>
-            <div class="relative h-40"><canvas id="growth-{{ loop.index0 }}"></canvas></div>
+            <div class="chart-frame relative h-40"><canvas id="growth-{{ loop.index0 }}"></canvas></div>
             {% if series.capped %}
             <p class="text-xs text-slate-500 mt-1">Earliest and latest stored readings, with stored readings sampled between them. Nothing is estimated.</p>
             {% endif %}

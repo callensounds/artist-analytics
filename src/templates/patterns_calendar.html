@@ -47,7 +47,30 @@
         <a href="/artist/{{ history.artist_id }}/calendar" class="text-sm text-emerald-400 hover:underline">All years</a>
         {% endif %}
     </div>
-    <p class="text-xs text-slate-400 mb-3">MusicBrainz, Apple, and Deezer dates land on a UTC day only when that day was published. Deezer does not publish a time of day, so none is added. A month-only date marks the month and is not given a day. Year-only dates, including Spotify years, stay off the day cells.</p>
+    <p class="text-xs text-slate-400 mb-3">MusicBrainz, Apple, and Deezer dates land on a UTC day only when that day was published. A clock is shown as HH:MM UTC, and only when that source published one. Deezer does not publish a time of day, so none is added. A month-only date marks the month and is not given a day. Year-only dates, including Spotify years, stay off the day cells.</p>
+    {% if history.calendar.month_nav %}
+    {% set nav = history.calendar.month_nav %}
+    <nav class="month-nav" aria-label="Release month">
+        {% if nav.prev_href %}
+        <a class="month-nav-link" href="{{ nav.prev_href }}">{{ nav.prev_label }}</a>
+        {% else %}
+        <span class="month-nav-link is-disabled">{{ nav.prev_label }}</span>
+        {% endif %}
+        <div class="month-nav-current">
+            <span class="month-nav-label"{% if nav.is_current %} aria-current="page"{% endif %}>{{ nav.label }}</span>
+            <span class="month-nav-zone">{{ nav.timezone }}</span>
+            <a class="month-nav-today" href="{{ nav.today_href }}">{{ nav.today_label }}</a>
+        </div>
+        {% if nav.next_href %}
+        <a class="month-nav-link" href="{{ nav.next_href }}">{{ nav.next_label }}</a>
+        {% else %}
+        <span class="month-nav-link is-disabled">{{ nav.next_label }}</span>
+        {% endif %}
+    </nav>
+    {% endif %}
+    {% if history.calendar.month_empty %}
+    <p class="calendar-empty-note">No stored release falls in {{ history.calendar.month_nav.label }}. A missing day or time was not filled in.</p>
+    {% endif %}
     {% if history.calendar.navigation and history.calendar.navigation.decades %}
     <nav class="mb-4" aria-label="Release years">
         <div class="flex flex-wrap items-center justify-between gap-2 text-sm mb-2">
@@ -81,7 +104,7 @@
     {% endif %}
     {% if history.calendar.available %}
     {% if history.calendar.months %}
-    <div class="grid lg:grid-cols-2 gap-4 min-w-0">
+    <div class="calendar-months{% if history.calendar.focused_month %} calendar-months-single{% endif %} grid lg:grid-cols-2 gap-4 min-w-0">
         {% for month in history.calendar.months %}
         <div class="min-w-0 bg-slate-900/50 rounded-xl p-3">
             <h3 class="text-sm font-medium mb-2">{{ month.label }}</h3>
