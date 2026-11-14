@@ -288,6 +288,26 @@ export interface ParsedTrack {
 }
 
 const TRACK_CAP = 10;
+const RELATED_CAP = 12;
+
+/**
+ * The stored top list is complete when it filled the cap, or the popular
+ * section actually ended. A short slice with no end marker is a truncated page.
+ */
+export function popularListComplete(page: string, parsedCount: number): boolean {
+  if (parsedCount >= TRACK_CAP) return true;
+  const start = popularStart(page);
+  if (start < 0) return false;
+  return page.indexOf("Popular releases", start + 7) >= 0;
+}
+
+/** Same rule for "Fans also like": a full cap, or the section closed at Appears On. */
+export function relatedListComplete(page: string, parsedCount: number): boolean {
+  if (parsedCount >= RELATED_CAP) return true;
+  const start = page.indexOf("Fans also like");
+  if (start < 0) return false;
+  return page.indexOf("Appears On", start) > start;
+}
 
 export function nameTrackId(name: string): string {
   const normalized = (name || "").toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 80);
@@ -596,7 +616,7 @@ export function parseRelatedArtists(page: string): RelatedArtist[] {
   const seen = new Set<string>();
   let cursor = 0;
   const marker = 'href="/artist/';
-  while (found.length < 12) {
+  while (found.length < RELATED_CAP) {
     const at = chunk.indexOf(marker, cursor);
     if (at < 0) break;
     let endId = at + marker.length;

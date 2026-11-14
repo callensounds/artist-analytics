@@ -163,6 +163,7 @@ describe("deezer playlists", () => {
     expect(details).toHaveLength(8);
     expect(details[0]).toContain("/playlist/109");
     expect(details.some((url) => url.endsWith("/107") || url.endsWith("/108"))).toBe(false);
+    expect(fetched.complete).toBe(false);
     expect(fetched.playlists.find((row) => row.id === "109")).toMatchObject({ fans: 80, fansKnown: true, editorial: true, position: null });
     expect(fetched.playlists.find((row) => row.id === "107")).toMatchObject({ fans: null, fansKnown: false });
     expect(urls.filter((url) => url.includes("/playlists"))).toHaveLength(1);
@@ -176,6 +177,7 @@ describe("deezer playlists", () => {
     vi.stubGlobal("fetch", async () => new Response("nope", { status: 500 }));
     const failed = await fetchDeezerPlaylists("27");
     expect(failed.ok).toBe(false);
+    expect(failed.complete).toBe(false);
     expect(failed.playlists).toEqual([]);
     expect(failed.reason).toContain("500");
   });
