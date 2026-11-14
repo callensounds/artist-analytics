@@ -177,6 +177,115 @@ describe("conditional keep-alive upserts", () => {
     });
     expect(db.prepare("SELECT rank FROM related_edges").get()).toEqual({ rank: 3 });
   });
+
+  it("does not rewrite a confirmed list two days later, and marks only the row that disappeared", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('A', 'a', 'search', 1, '2026-11-01T00:00:00Z')",
+    ).run();
+    const tracks = [
+      { externalId: "kept", name: "Kept", popularity: 10, album: "Album", rank: 1 },
+      { externalId: "gone", name: "Gone", popularity: 20, album: "Album", rank: 2 },
+    ];
+    const related = [
+      { name: "Kept Pal", spotify_id: "kept-pal", rank: 1 },
+      { name: "Gone Pal", spotify_id: "gone-pal", rank: 2 },
+    ];
+    const first = new Date("2026-11-11T00:00:00Z");
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks, related, tracksConfirmed: true, relatedConfirmed: true },
+      first,
+      0,
+    );
+    await saveDeezerPlaylists(
+      store,
+      1,
+      "A",
+      [
+        { id: "10", title: "Pop Hits", ownerName: "Deezer", fans: 80, fansKnown: true, editorial: true },
+        { id: "12", title: "Old Mix", ownerName: "Sam", fans: 40, fansKnown: true, editorial: false },
+      ],
+      first,
+    );
+
+    store.changes.length = 0;
+    const again = new Date("2026-11-13T00:00:00Z");
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks, related, tracksConfirmed: true, relatedConfirmed: true },
+      again,
+      0,
+    );
+    await saveDeezerPlaylists(
+      store,
+      1,
+      "A",
+      [
+        { id: "10", title: "Pop Hits", ownerName: "Deezer", fans: 80, fansKnown: true, editorial: true },
+        { id: "12", title: "Old Mix", ownerName: "Sam", fans: 40, fansKnown: true, editorial: false },
+      ],
+      again,
+    );
+    expect(changed(store, "artist_tracks")).toBe(0);
+    expect(changed(store, "related_edges")).toBe(0);
+    expect(changed(store, "playlist_appearances")).toBe(0);
+    expect(db.prepare("SELECT last_seen_at FROM artist_tracks WHERE external_id = 'kept'").get()).toEqual({
+      last_seen_at: "2026-11-11T00:00:00Z",
+    });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      {
+        platform: "spotify",
+        status: "ok",
+        tracks: [tracks[0]],
+        related: [related[0]],
+        tracksConfirmed: true,
+        relatedConfirmed: true,
+      },
+      new Date("2026-11-13T06:00:00Z"),
+      0,
+    );
+    await saveDeezerPlaylists(
+      store,
+      1,
+      "A",
+      [{ id: "10", title: "Pop Hits", ownerName: "Deezer", fans: 90, fansKnown: true, editorial: true }],
+      new Date("2026-11-13T06:00:00Z"),
+    );
+    expect(changed(store, "artist_tracks")).toBe(1);
+    expect(changed(store, "related_edges")).toBe(1);
+    expect(changed(store, "playlist_appearances")).toBe(2);
+    expect(db.prepare("SELECT removed_at FROM artist_tracks WHERE external_id = 'gone'").get()).toEqual({
+      removed_at: "2026-11-13T06:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at, last_seen_at FROM artist_tracks WHERE external_id = 'kept'").get()).toEqual({
+      removed_at: null,
+      last_seen_at: "2026-11-11T00:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'gone-pal'").get()).toEqual({
+      removed_at: "2026-11-13T06:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'kept-pal'").get()).toEqual({
+      removed_at: null,
+    });
+    expect(db.prepare("SELECT removed_at, follower_count FROM playlist_appearances WHERE playlist_id = '12'").get()).toEqual({
+      removed_at: "2026-11-13T06:00:00Z",
+      follower_count: 40,
+    });
+    expect(db.prepare("SELECT removed_at, follower_count, last_seen_at FROM playlist_appearances WHERE playlist_id = '10'").get()).toEqual({
+      removed_at: null,
+      follower_count: 90,
+      last_seen_at: "2026-11-13T06:00:00Z",
+    });
+  });
 });
 
 describe("snapshot dedupe", () => {

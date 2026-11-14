@@ -49,10 +49,24 @@ LIMIT ?
 """
 
 _EDGE_SQL = """
-SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at, last_seen_at
+SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at,
+       CASE
+         WHEN related_edges.removed_at IS NULL
+          AND freshness.absences_marked_at IS NOT NULL
+          AND freshness.absences_marked_at > related_edges.last_seen_at
+         THEN freshness.absences_marked_at
+         ELSE related_edges.last_seen_at
+       END AS last_seen_at
 FROM related_edges
-WHERE from_artist_id = ?
-ORDER BY rank ASC, last_seen_at DESC
+LEFT JOIN playlist_crawls AS freshness
+  ON freshness.artist_id = related_edges.from_artist_id
+ AND freshness.source = 'spotify_related'
+WHERE related_edges.from_artist_id = ?
+  AND (
+    related_edges.removed_at IS NULL
+    OR freshness.absences_marked_at IS NULL
+  )
+ORDER BY related_edges.rank ASC, last_seen_at DESC
 LIMIT ?
 """
 
@@ -65,10 +79,25 @@ LIMIT ?
 """
 
 _TRACK_SQL = """
-SELECT source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
-FROM artist_tracks
-WHERE artist_id = ?
-ORDER BY last_seen_at DESC, CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+SELECT t.source AS source, t.external_id AS external_id, t.track_name AS track_name,
+       t.popularity AS popularity, t.album_name AS album_name, t.rank AS rank,
+       t.first_seen_at AS first_seen_at,
+       CASE
+         WHEN t.removed_at IS NULL
+          AND f.absences_marked_at IS NOT NULL
+          AND f.absences_marked_at > t.last_seen_at
+         THEN f.absences_marked_at
+         ELSE t.last_seen_at
+       END AS last_seen_at
+FROM artist_tracks AS t
+LEFT JOIN playlist_crawls AS f
+  ON f.artist_id = t.artist_id AND f.source = t.source || '_tracks'
+WHERE t.artist_id = ?
+  AND (
+    t.removed_at IS NULL
+    OR f.absences_marked_at IS NULL
+  )
+ORDER BY last_seen_at DESC, CASE WHEN t.rank IS NULL THEN 1 ELSE 0 END, t.rank ASC, t.track_name ASC
 LIMIT ?
 """
 
@@ -84,11 +113,25 @@ LIMIT ?
 
 # idx_playlist_artist_seen. Follower count stays blank in the CSV when it was not stored.
 _PLAYLIST_SQL = """
-SELECT playlist_id, playlist_name, owner_name, follower_count, position,
-       first_seen_at, last_seen_at, source, editorial
-FROM playlist_appearances
-WHERE artist_id = ?
-ORDER BY last_seen_at DESC, id DESC
+SELECT p.playlist_id AS playlist_id, p.playlist_name AS playlist_name,
+       p.owner_name AS owner_name, p.follower_count AS follower_count, p.position AS position,
+       p.first_seen_at AS first_seen_at,
+       CASE
+         WHEN p.removed_at IS NULL
+          AND c.absences_marked_at IS NOT NULL
+          AND c.absences_marked_at > p.last_seen_at
+         THEN c.absences_marked_at
+         ELSE p.last_seen_at
+       END AS last_seen_at,
+       p.source AS source, p.editorial AS editorial
+FROM playlist_appearances AS p
+LEFT JOIN playlist_crawls AS c
+  ON c.artist_id = p.artist_id AND c.source = 'deezer'
+WHERE p.artist_id = ?
+ORDER BY
+  CASE WHEN p.removed_at IS NULL AND c.absences_marked_at IS NOT NULL THEN 0 ELSE 1 END,
+  p.last_seen_at DESC,
+  p.id DESC
 LIMIT ?
 """
 

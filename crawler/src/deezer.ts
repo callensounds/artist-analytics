@@ -269,11 +269,14 @@ export async function fetchDeezer(name: string, preferredId: string): Promise<Sa
     ? "Using the Deezer artist id already stored for this artist."
     : "Matched by exact name. Among those, the artist with the most Deezer fans was kept."];
   let tracks: SavedSource["tracks"] = [];
+  let tracksConfirmed = false;
   let albums: { id: string; title: string; kind: string; releaseDate: string; url: string }[] = [];
   try {
     const top = await readJson(`https://api.deezer.com/artist/${artist.id}/top?limit=${TRACK_LIMIT}`);
-    if (top.ok && !errorMessage(top.json)) tracks = parseTopTracks(top.json);
-    else notes.push("Deezer top tracks were not available.");
+    if (top.ok && !errorMessage(top.json)) {
+      tracks = parseTopTracks(top.json);
+      tracksConfirmed = true;
+    } else notes.push("Deezer top tracks were not available.");
   } catch (error) {
     if (error instanceof DeezerBusy) throw error;
     notes.push("Deezer top tracks timed out.");
@@ -326,6 +329,7 @@ export async function fetchDeezer(name: string, preferredId: string): Promise<Sa
     metrics: [countMetric("Fans", artist.nbFan), countMetric("Albums", artist.nbAlbum)],
     sightings,
     tracks,
+    tracksConfirmed,
     deezerId: artist.id,
     deezerAlbumCount: artist.nbAlbum,
     markCrawled: true,

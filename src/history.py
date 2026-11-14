@@ -47,8 +47,12 @@ SIGHTING_READ_LIMIT = 20
 PLAYLIST_READ_LIMIT = 50
 PLAYLIST_NEW_DAYS = 7
 # A row refreshed once a day is still current. A row missing for longer than this ages out.
+# This window is only the fallback until a crawl records absences_marked_at.
 PLAYLIST_CURRENT_GRACE = timedelta(hours=36)
 TRACK_CURRENT_HOURS = 36
+# Unchanged playlist, track, and related rows are rewritten only after this long.
+# A disappeared row is marked removed_at on that crawl instead of bumping every seen row.
+SEEN_KEEP_ALIVE = timedelta(days=7)
 PLAYLIST_NOT_CRAWLED = (
     "Deezer playlists have not been crawled yet. "
     "The crawler reads public playlists from Deezer. Nothing here is estimated."
@@ -390,6 +394,11 @@ def _as_utc(now: datetime | None) -> datetime:
     return moment.astimezone(timezone.utc)
 
 
+def seen_cutoff(moment: datetime) -> str:
+    """Unchanged rows older than this are rewritten. Newer ones are left alone."""
+    return utc_now(_as_utc(moment) - SEEN_KEEP_ALIVE)
+
+
 def _playlist_watermark(rows: list[dict]) -> datetime | None:
     """Latest Deezer playlist crawl, or the newest stored last_seen when no crawl row exists."""
     crawled = []
@@ -412,21 +421,27 @@ def empty_playlist_counts() -> dict:
     return {"current": 0, "new": 0, "dropped": 0}
 
 
+def _stamp(value) -> str:
+    return str(value or "").strip()
+
+
 def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) -> tuple[list[dict], dict]:
     """Placements plus counts. A missing follower count stays missing, not zero.
 
-    Current rows were seen within 36 hours of the latest playlist crawl, so a
-    placement refreshed once a day stays current. New rows are current and were
-    first stored within the last 7 days. A row that has been missing longer than
-    that grace is dropped.
+    After a crawl sets absences_marked_at, a row is current when it was in that
+    crawl (removed_at is empty). Until then, a row seen within 36 hours of the
+    latest playlist crawl stays current, so a daily refresh still shows.
+    New rows are current and were first stored within the last 7 days.
     """
     moment = _as_utc(now)
     cutoff = moment - timedelta(days=PLAYLIST_NEW_DAYS)
-    watermark = _playlist_watermark(rows or [])
+    stored = rows or []
+    watermark = _playlist_watermark(stored)
     current_after = watermark - PLAYLIST_CURRENT_GRACE if watermark is not None else None
+    marked = any(_stamp(row.get("absences_marked_at")) for row in stored)
     presented = []
     current = new = dropped = 0
-    for row in rows or []:
+    for row in stored:
         name = str(row.get("playlist_name") or "").strip()
         playlist_id = str(row.get("playlist_id") or "").strip()
         if not name or not playlist_id:
@@ -440,8 +455,17 @@ def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) 
         last_text = str(row.get("last_seen_at") or "")
         first = parse_utc(first_text)
         last = parse_utc(last_text)
-        is_current = current_after is not None and last is not None and last >= current_after
-        is_dropped = current_after is not None and last is not None and last < current_after
+        removed = bool(_stamp(row.get("removed_at")))
+        if marked:
+            is_dropped = removed
+            is_current = not removed
+        else:
+            is_current = current_after is not None and last is not None and last >= current_after
+            is_dropped = current_after is not None and last is not None and last < current_after
+        shown_last = last_text
+        confirmed = _stamp(row.get("absences_marked_at"))
+        if is_current and confirmed > shown_last:
+            shown_last = confirmed
         if is_current:
             current += 1
             if first is not None and first >= cutoff:
@@ -460,7 +484,7 @@ def present_playlist_rows(rows: list[dict] | None, now: datetime | None = None) 
                 "follower_text": f"{followers:,}" if followers is not None else None,
                 "position": position,
                 "first_seen_at": first_text,
-                "last_seen_at": last_text,
+                "last_seen_at": shown_last,
                 "dropped": is_dropped,
                 "current": is_current,
             }
@@ -686,6 +710,51 @@ def _value_statements(prefix: str, rows: list[tuple], suffix: str = "", fixed: t
     return statements
 
 
+def _mark_absent(
+    table: str,
+    artist_column: str,
+    artist_id: int,
+    source: str | None,
+    key_column: str,
+    keys: list[str],
+    stamp: str,
+) -> tuple[str, tuple]:
+    """One indexed update of rows this crawl did not see. Seen rows are not touched."""
+    params: list = [stamp, artist_id]
+    source_sql = ""
+    if source is not None:
+        source_sql = " AND source = ?"
+        params.append(source)
+    key_sql = ""
+    if keys:
+        key_sql = f" AND {key_column} NOT IN ({','.join('?' for _ in keys)})"
+        params.extend(keys)
+    sql = (
+        f"UPDATE {table} SET removed_at = ? "
+        f"WHERE {artist_column} = ?{source_sql} AND removed_at IS NULL{key_sql}"
+    )
+    return sql, tuple(params)
+
+
+def _absences_marked(artist_id: int, source: str, stamp: str) -> tuple[str, tuple]:
+    """Record that this list was classified. crawled_at is set once and then left alone.
+
+    The source key is not a provider name: spotify_tracks and spotify_related are
+    separate clocks, so classifying tracks does not make related edges look new.
+    """
+    return (
+        """
+        INSERT INTO playlist_crawls (artist_id, source, crawled_at, absences_marked_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(artist_id, source) DO UPDATE SET
+            absences_marked_at = excluded.absences_marked_at
+        WHERE playlist_crawls.absences_marked_at IS NULL
+           OR playlist_crawls.absences_marked_at < excluded.absences_marked_at
+        """.strip(),
+        (artist_id, source, stamp, stamp),
+    )
+
+
 async def _latest_track_stat_map(db, artist_id: int, pairs: list[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
     """Latest row per track metric. One indexed statement per source, not a UNION.
 
@@ -887,11 +956,14 @@ async def remember(
     stored_tracks = []
     track_values = []
     stat_candidates = []
+    confirmed_tracks: dict[str, list[str]] = {}
     for source in sources:
         platform = source.get("platform")
         if source.get("status") == "error" or platform not in {"spotify", "deezer"}:
             continue
         cleaned = _clean_tracks(source.get("tracks"))[:TRACK_READ_LIMIT]
+        if source.get("status") == "ok" and source.get("tracks_confirmed"):
+            confirmed_tracks[platform] = [track["external_id"] for track in cleaned]
         if platform == "deezer":
             for track in cleaned:
                 track["popularity"] = None
@@ -944,10 +1016,21 @@ async def remember(
                 popularity = COALESCE(excluded.popularity, artist_tracks.popularity),
                 album_name = COALESCE(excluded.album_name, artist_tracks.album_name),
                 rank = excluded.rank,
-                last_seen_at = excluded.last_seen_at
+                last_seen_at = excluded.last_seen_at,
+                removed_at = NULL
+            WHERE excluded.track_name IS NOT artist_tracks.track_name
+               OR (excluded.popularity IS NOT NULL AND excluded.popularity IS NOT artist_tracks.popularity)
+               OR (excluded.album_name IS NOT NULL AND excluded.album_name IS NOT artist_tracks.album_name)
+               OR excluded.rank IS NOT artist_tracks.rank
+               OR artist_tracks.removed_at IS NOT NULL
+               OR artist_tracks.last_seen_at <= ?
             """.strip(),
+            (seen_cutoff(moment),),
         )
     )
+    for platform, keys in confirmed_tracks.items():
+        statements.append(_mark_absent("artist_tracks", "artist_id", artist_id, platform, "external_id", keys, stamp))
+        statements.append(_absences_marked(artist_id, f"{platform}_tracks", stamp))
     statements.extend(
         _value_statements(
             """
@@ -1011,11 +1094,14 @@ async def _related_tracked(db) -> int:
 
 async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_cap: int) -> tuple[list[tuple[str, tuple]], int, int]:
     related = []
+    related_confirmed = False
     for source in bundle.get("sources") or []:
         if source.get("platform") == "spotify":
             related = list(source.get("related") or [])[:12]
+            related_confirmed = source.get("status") == "ok" and bool(source.get("related_confirmed"))
             break
     edge_rows = []
+    seen_ids = []
     for item in related:
         spotify_id = _blank(item.get("spotify_id"))
         to_name = _blank(item.get("name"))
@@ -1023,6 +1109,8 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
             continue
         rank = int(item.get("rank") or len(edge_rows) + 1)
         edge_rows.append((artist_id, spotify_id, to_name[:120], "spotify", rank, stamp, stamp))
+        seen_ids.append(spotify_id)
+    cutoff = seen_cutoff(parse_utc(stamp) or datetime.now(timezone.utc))
     statements = _value_statements(
         """
         INSERT INTO related_edges
@@ -1033,9 +1121,20 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
         ON CONFLICT(from_artist_id, to_spotify_id, source) DO UPDATE SET
             to_name = excluded.to_name,
             rank = excluded.rank,
-            last_seen_at = excluded.last_seen_at
+            last_seen_at = excluded.last_seen_at,
+            removed_at = NULL
+        WHERE excluded.to_name IS NOT related_edges.to_name
+           OR excluded.rank IS NOT related_edges.rank
+           OR related_edges.removed_at IS NOT NULL
+           OR related_edges.last_seen_at <= ?
         """.strip(),
+        (cutoff,),
     )
+    if related_confirmed:
+        statements.append(
+            _mark_absent("related_edges", "from_artist_id", artist_id, "spotify", "to_spotify_id", seen_ids, stamp)
+        )
+        statements.append(_absences_marked(artist_id, "spotify_related", stamp))
     written = len(edge_rows)
     discovered = 0
     if related_cap <= 0 or not edge_rows:
@@ -1107,8 +1206,9 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
                         """
                         UPDATE related_edges SET to_artist_id = ?
                         WHERE from_artist_id = ? AND to_spotify_id = ? AND source = 'spotify'
+                          AND (to_artist_id IS NULL OR to_artist_id IS NOT ?)
                         """,
-                        params,
+                        params + (params[0],),
                     )
                 )
             else:
@@ -1127,6 +1227,116 @@ async def _store_related(db, artist_id: int, bundle: dict, stamp: str, related_c
                     )
                 )
     return statements, written, discovered
+
+
+def _playlist_row(artist_id: int, playlist: dict, stamp: str) -> tuple | None:
+    playlist_id = str(playlist.get("id") or playlist.get("playlist_id") or "").strip()
+    title = " ".join(str(playlist.get("title") or playlist.get("playlist_name") or "").split())[:200]
+    if not playlist_id.isdigit() or len(playlist_id) > 32 or not title:
+        return None
+    owner = " ".join(str(playlist.get("owner_name") or playlist.get("ownerName") or "").split())[:120]
+    fans_known = bool(playlist.get("fans_known") if "fans_known" in playlist else playlist.get("fansKnown"))
+    fans = _whole_number(playlist.get("follower_count") if "follower_count" in playlist else playlist.get("fans"))
+    if not fans_known:
+        fans = None
+    editorial = 1 if _editorial(playlist.get("editorial")) else 0
+    return (artist_id, playlist_id, title, owner or None, fans, None, stamp, stamp, "deezer", editorial, fans_known)
+
+
+async def save_deezer_playlists(db, artist_id: int, playlists: list[dict] | None, now: datetime | None = None) -> int:
+    """Upsert Deezer placements. An unchanged recent row is not rewritten.
+
+    Rows missing from this confirmed list get removed_at. first_seen_at stays.
+    A missing follower count is not written as 0.
+    """
+    moment = _as_utc(now)
+    stamp = utc_now(moment)
+    cutoff = seen_cutoff(moment)
+    seen: list[str] = []
+    known: list[tuple] = []
+    unchecked: list[tuple] = []
+    for playlist in playlists or []:
+        if len(known) + len(unchecked) >= PLAYLIST_READ_LIMIT:
+            break
+        parsed = _playlist_row(artist_id, playlist, stamp)
+        if parsed is None or parsed[1] in seen:
+            continue
+        seen.append(parsed[1])
+        row = parsed[:-1]
+        if parsed[-1]:
+            known.append(row)
+        else:
+            unchecked.append(row)
+    update_known = """
+        ON CONFLICT(artist_id, playlist_id) DO UPDATE SET
+            playlist_name = excluded.playlist_name,
+            owner_name = COALESCE(excluded.owner_name, playlist_appearances.owner_name),
+            follower_count = excluded.follower_count,
+            position = COALESCE(excluded.position, playlist_appearances.position),
+            last_seen_at = excluded.last_seen_at,
+            source = excluded.source,
+            editorial = excluded.editorial,
+            removed_at = NULL
+        WHERE excluded.playlist_name IS NOT playlist_appearances.playlist_name
+           OR (excluded.owner_name IS NOT NULL AND excluded.owner_name IS NOT playlist_appearances.owner_name)
+           OR excluded.follower_count IS NOT playlist_appearances.follower_count
+           OR (excluded.position IS NOT NULL AND excluded.position IS NOT playlist_appearances.position)
+           OR excluded.source IS NOT playlist_appearances.source
+           OR excluded.editorial IS NOT playlist_appearances.editorial
+           OR playlist_appearances.removed_at IS NOT NULL
+           OR playlist_appearances.last_seen_at <= ?
+    """.strip()
+    update_unchecked = """
+        ON CONFLICT(artist_id, playlist_id) DO UPDATE SET
+            playlist_name = excluded.playlist_name,
+            owner_name = COALESCE(excluded.owner_name, playlist_appearances.owner_name),
+            position = COALESCE(excluded.position, playlist_appearances.position),
+            last_seen_at = excluded.last_seen_at,
+            source = excluded.source,
+            editorial = excluded.editorial,
+            removed_at = NULL
+        WHERE excluded.playlist_name IS NOT playlist_appearances.playlist_name
+           OR (excluded.owner_name IS NOT NULL AND excluded.owner_name IS NOT playlist_appearances.owner_name)
+           OR (excluded.position IS NOT NULL AND excluded.position IS NOT playlist_appearances.position)
+           OR excluded.source IS NOT playlist_appearances.source
+           OR excluded.editorial IS NOT playlist_appearances.editorial
+           OR playlist_appearances.removed_at IS NOT NULL
+           OR playlist_appearances.last_seen_at <= ?
+    """.strip()
+    insert = """
+        INSERT INTO playlist_appearances (
+            artist_id, playlist_id, playlist_name, owner_name, follower_count, position,
+            first_seen_at, last_seen_at, source, editorial
+        )
+    """.strip()
+    statements = _value_statements(insert, known, update_known, (cutoff,))
+    statements.extend(_value_statements(insert, unchecked, update_unchecked, (cutoff,)))
+    # Source NULL rows were stored before the source column existed. They are Deezer rows.
+    absent_sql, absent_params = _mark_absent(
+        "playlist_appearances", "artist_id", artist_id, None, "playlist_id", seen, stamp
+    )
+    absent_sql = absent_sql.replace(
+        "WHERE artist_id = ? AND removed_at IS NULL",
+        "WHERE artist_id = ? AND removed_at IS NULL AND (source = 'deezer' OR source IS NULL)",
+    )
+    statements.append((absent_sql, absent_params))
+    statements.append(
+        (
+            """
+            INSERT INTO playlist_crawls (artist_id, source, crawled_at, absences_marked_at)
+            VALUES (?, 'deezer', ?, ?)
+            ON CONFLICT(artist_id, source) DO UPDATE SET
+                crawled_at = excluded.crawled_at,
+                absences_marked_at = excluded.absences_marked_at
+            WHERE playlist_crawls.crawled_at < excluded.crawled_at
+               OR playlist_crawls.absences_marked_at IS NULL
+               OR playlist_crawls.absences_marked_at < excluded.absences_marked_at
+            """.strip(),
+            (artist_id, stamp, stamp),
+        )
+    )
+    await db.batch(statements)
+    return len(seen)
 
 
 # deezer_id is on this same row. The card does not look the artist up again.
@@ -1151,12 +1361,28 @@ ORDER BY captured_at DESC, id DESC
 LIMIT ?
 """
 
-# Ordered by rank, not by an exact last_seen match, so a daily refresh stays visible.
+# Ordered by rank. Once absences are marked, a row missing from that crawl is hidden.
+# Before that, every stored edge stays visible, which is what the previous read did.
+# The confirmation time is shown as last_seen so a row we did not rewrite still looks current.
 RELATED_SQL = """
-SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at, last_seen_at
+SELECT to_name, to_spotify_id, to_artist_id, rank, first_seen_at,
+       CASE
+         WHEN related_edges.removed_at IS NULL
+          AND freshness.absences_marked_at IS NOT NULL
+          AND freshness.absences_marked_at > related_edges.last_seen_at
+         THEN freshness.absences_marked_at
+         ELSE related_edges.last_seen_at
+       END AS last_seen_at
 FROM related_edges
-WHERE from_artist_id = ?
-ORDER BY rank ASC, last_seen_at DESC
+LEFT JOIN playlist_crawls AS freshness
+  ON freshness.artist_id = related_edges.from_artist_id
+ AND freshness.source = 'spotify_related'
+WHERE related_edges.from_artist_id = ?
+  AND (
+    related_edges.removed_at IS NULL
+    OR freshness.absences_marked_at IS NULL
+  )
+ORDER BY related_edges.rank ASC, last_seen_at DESC
 LIMIT ?
 """
 
@@ -1168,30 +1394,76 @@ ORDER BY COALESCE(NULLIF(published_at, ''), first_seen_at) DESC, id DESC
 LIMIT ?
 """
 
-# idx_playlist_artist_seen is (artist_id, last_seen_at). The crawl time is one primary-key lookup.
-# Current vs dropped is applied in Python with PLAYLIST_CURRENT_GRACE, not in this read.
+# idx_playlist_artist_seen is (artist_id, last_seen_at). The crawl clock is one primary-key lookup.
+# Current vs dropped is applied in Python. Classified rows sort ahead of older history
+# so the LIMIT still returns the placements the latest crawl confirmed.
 PLAYLIST_SQL = """
 SELECT playlist_id, playlist_name, owner_name, follower_count, position,
-       first_seen_at, last_seen_at, source, editorial,
-       (SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer') AS crawled_at
+       first_seen_at, last_seen_at, source, editorial, removed_at,
+       (SELECT crawled_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer') AS crawled_at,
+       (SELECT absences_marked_at FROM playlist_crawls WHERE artist_id = ? AND source = 'deezer') AS absences_marked_at
 FROM playlist_appearances
 WHERE artist_id = ?
-ORDER BY last_seen_at DESC, id DESC
+ORDER BY
+  CASE WHEN removed_at IS NULL AND absences_marked_at IS NOT NULL THEN 0 ELSE 1 END,
+  last_seen_at DESC,
+  id DESC
 LIMIT ?
 """
 
-# idx_artist_tracks_seen is (artist_id, source, last_seen_at). A track refreshed
-# once a day stays in this window. One that has been off the list longer drops out.
-# strftime keeps the same YYYY-MM-DDTHH:MM:SSZ form as the stored stamps.
-TRACK_SQL = f"""
-SELECT external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
-FROM artist_tracks
-WHERE artist_id = ? AND source = 'spotify'
+
+def _current_track_predicate(source: str) -> str:
+    """One artist and source. The index prefix is (artist_id, source).
+
+    Until playlist_crawls.absences_marked_at is set for this list, a track stays
+    current for 36 hours after the newest last_seen_at. After that, removed_at
+    is the filter and the time bound drops to the epoch so an unchanged row stays visible.
+    """
+    if source not in {"spotify", "deezer"}:
+        raise ValueError("unsupported track source")
+    return f"""
+artist_id = ? AND source = '{source}'
+  AND removed_at IS NULL
   AND last_seen_at >= (
-      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+      SELECT CASE
+        WHEN (
+          SELECT absences_marked_at FROM playlist_crawls
+          WHERE artist_id = ? AND source = '{source}_tracks'
+        ) IS NOT NULL THEN '1970-01-01T00:00:00Z'
+        ELSE strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+      END
       FROM artist_tracks
-      WHERE artist_id = ? AND source = 'spotify'
+      WHERE artist_id = ? AND source = '{source}'
   )
+""".strip()
+
+
+def _confirmed_track_seen(source: str) -> str:
+    """Show the crawl confirmation time when the stored last_seen_at was not rewritten."""
+    if source not in {"spotify", "deezer"}:
+        raise ValueError("unsupported track source")
+    return f"""
+CASE
+  WHEN artist_tracks.removed_at IS NULL
+   AND (
+     SELECT absences_marked_at FROM playlist_crawls
+     WHERE artist_id = artist_tracks.artist_id AND source = '{source}_tracks'
+   ) > artist_tracks.last_seen_at
+  THEN (
+     SELECT absences_marked_at FROM playlist_crawls
+     WHERE artist_id = artist_tracks.artist_id AND source = '{source}_tracks'
+   )
+  ELSE artist_tracks.last_seen_at
+END
+""".strip()
+
+
+# idx_artist_tracks_seen is (artist_id, source, last_seen_at).
+TRACK_SQL = f"""
+SELECT external_id, track_name, popularity, album_name, rank, first_seen_at,
+       {_confirmed_track_seen("spotify")} AS last_seen_at
+FROM artist_tracks
+WHERE {_current_track_predicate("spotify")}
 ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
 LIMIT ?
 """
@@ -1227,12 +1499,7 @@ def track_stats_statement(artist_id: int, source: str, metric: str, cutoff: str)
     FROM (
         SELECT '{source}' AS source, external_id, track_name, rank AS list_rank
         FROM artist_tracks
-        WHERE artist_id = ? AND source = '{source}'
-          AND last_seen_at >= (
-              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
-              FROM artist_tracks
-              WHERE artist_id = ? AND source = '{source}'
-          )
+        WHERE {_current_track_predicate(source)}
         ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
         LIMIT 12
     ) AS c
@@ -1262,7 +1529,7 @@ def track_stats_statement(artist_id: int, source: str, metric: str, cutoff: str)
           LIMIT 1
       )
     """
-    params = (artist_id, artist_id, artist_id, artist_id, artist_id, cutoff)
+    params = (artist_id, artist_id, artist_id, artist_id, artist_id, artist_id, cutoff)
     if sql.count("?") != len(params):
         raise RuntimeError("track stat placeholders do not match parameters")
     return sql, params
@@ -1710,14 +1977,10 @@ WHERE artist_id = ? AND source = 'deezer' AND metric = 'Fans'
 """
 
 DEEZER_TRACKS_SQL = f"""
-SELECT external_id, track_name, album_name, rank, last_seen_at
+SELECT external_id, track_name, album_name, rank,
+       {_confirmed_track_seen("deezer")} AS last_seen_at
 FROM artist_tracks
-WHERE artist_id = ? AND source = 'deezer'
-  AND last_seen_at >= (
-      SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
-      FROM artist_tracks
-      WHERE artist_id = ? AND source = 'deezer'
-  )
+WHERE {_current_track_predicate("deezer")}
 ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
 LIMIT ?
 """
@@ -1938,7 +2201,7 @@ async def load_deezer_card(db, artist_id: int, name: str | None, artist: dict | 
         db,
         [
             (DEEZER_FANS_SQL, (artist_id,)),
-            (DEEZER_TRACKS_SQL, (artist_id, artist_id, 10)),
+            (DEEZER_TRACKS_SQL, (artist_id, artist_id, artist_id, 10)),
             (DEEZER_RELEASES_SQL, (artist_id, 20)),
         ],
     )
@@ -2089,8 +2352,8 @@ async def load_history_for_artist(db, artist: dict, on_growth=None, cache=None) 
     labeled = [
         ("related edges", RELATED_SQL, (artist_id, RELATED_READ_LIMIT)),
         ("content sightings", SIGHTING_SQL, (artist_id, SIGHTING_READ_LIMIT)),
-        ("playlists", PLAYLIST_SQL, (artist_id, artist_id, PLAYLIST_READ_LIMIT)),
-        ("tracks", TRACK_SQL, (artist_id, artist_id, TRACK_READ_LIMIT)),
+        ("playlists", PLAYLIST_SQL, (artist_id, artist_id, artist_id, PLAYLIST_READ_LIMIT)),
+        ("tracks", TRACK_SQL, (artist_id, artist_id, artist_id, TRACK_READ_LIMIT)),
         ("momentum", _MOMENTUM_SQL, (artist_id, cutoff) * 5 + (MOMENTUM_ROW_CAP,)),
         ("alerts", ALERT_SQL, (artist_id, ALERT_READ_LIMIT)),
         ("musicbrainz releases", RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT)),

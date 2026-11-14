@@ -431,8 +431,8 @@ def test_a_track_refreshed_within_36_hours_stays_and_an_older_one_drops():
             """,
             (artist_id, artist_id, artist_id),
         )
-        rows = await database.query(TRACK_SQL, (artist_id, artist_id, 10))
-        plan = await database.query("EXPLAIN QUERY PLAN " + TRACK_SQL, (artist_id, artist_id, 10))
+        rows = await database.query(TRACK_SQL, (artist_id, artist_id, artist_id, 10))
+        plan = await database.query("EXPLAIN QUERY PLAN " + TRACK_SQL, (artist_id, artist_id, artist_id, 10))
         return rows, " ".join(str(row.get("detail") or "") for row in plan)
 
     rows, plan = asyncio.run(run())
