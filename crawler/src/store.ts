@@ -686,7 +686,9 @@ function utcDay(stamp: string): string {
 
 /**
  * Latest stored stat for each track the crawl is about to write.
- * One statement, one indexed LIMIT 1 per track, not one round trip per track.
+ * One non-compound statement per artist and source. SQLite returns `value`
+ * from the row that holds MAX(captured_at). A UNION of per-track LIMIT 1
+ * reads exceeds D1's compound SELECT term limit.
  */
 async function latestTrackStats(
   store: Store,
@@ -695,35 +697,34 @@ async function latestTrackStats(
   stats: { externalId: string; metric: string }[],
 ): Promise<Map<string, { value: number; capturedAt: string }>> {
   const found = new Map<string, { value: number; capturedAt: string }>();
-  const parts: string[] = [];
-  const params: unknown[] = [];
+  const externalIds: string[] = [];
+  const metrics: string[] = [];
   const seen = new Set<string>();
   for (const stat of stats) {
     if (!TRACK_STAT_METRICS.has(stat.metric)) continue;
     const key = `${stat.externalId}\0${stat.metric}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    parts.push(
-      `SELECT external_id, metric, value, captured_at FROM (
-         SELECT external_id, metric, value, captured_at
-         FROM track_stats
-         WHERE artist_id = ? AND source = ? AND external_id = ? AND metric = ?
-         ORDER BY captured_at DESC
-         LIMIT 1
-       )`,
-    );
-    params.push(artistId, source, stat.externalId, stat.metric);
+    if (!externalIds.includes(stat.externalId)) externalIds.push(stat.externalId);
+    if (!metrics.includes(stat.metric)) metrics.push(stat.metric);
   }
-  if (!parts.length) return found;
+  if (!externalIds.length) return found;
   const rows = await store.all<{ external_id: string; metric: string; value: unknown; captured_at: unknown }>(
-    parts.join(" UNION ALL "),
-    params,
+    `SELECT external_id, metric, value, MAX(captured_at) AS captured_at
+     FROM track_stats
+     WHERE artist_id = ? AND source = ?
+       AND metric IN (${metrics.map(() => "?").join(",")})
+       AND external_id IN (${externalIds.map(() => "?").join(",")})
+     GROUP BY external_id, metric`,
+    [artistId, source, ...metrics, ...externalIds],
   );
   for (const row of rows) {
+    const key = `${row.external_id}\0${row.metric}`;
+    if (!seen.has(key)) continue;
     const value = publishedInteger(row.value);
     const capturedAt = typeof row.captured_at === "string" ? row.captured_at : "";
     if (value === null || !capturedAt) continue;
-    found.set(`${row.external_id}\0${row.metric}`, { value, capturedAt });
+    found.set(key, { value, capturedAt });
   }
   return found;
 }

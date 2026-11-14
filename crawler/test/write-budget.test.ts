@@ -456,4 +456,80 @@ describe("track_stats write budget", () => {
     expect(changed(store, "track_stats")).toBe(0);
     expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 1 });
   });
+
+  it("reads latest stats for 12 tracks in one non-compound statement", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    const reads: { sql: string; params: unknown[] }[] = [];
+    const read = store.all;
+    store.all = async (sql, params = []) => {
+      if (String(sql).includes("track_stats")) reads.push({ sql: String(sql), params });
+      return read(sql, params);
+    };
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Kendrick Lamar', 'kendricklamar', 'search', 1, '2026-11-01T00:00:00Z')",
+    ).run();
+    const tracks = Array.from({ length: 12 }, (_, index) => ({
+      externalId: String(index + 1),
+      name: `Track ${index + 1}`,
+      popularity: null,
+      album: "Album",
+      rank: index + 1,
+      deezerRank: 1000 + index,
+    }));
+    const insert = db.prepare(
+      "INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at) VALUES (1, 'deezer', ?, 'deezer_rank', ?, ?)",
+    );
+    for (const track of tracks) {
+      // Latest row is inserted first, and an older row has the larger value.
+      insert.run(track.externalId, track.deezerRank, "2026-11-12T00:00:00Z");
+      insert.run(track.externalId, track.deezerRank + 500, "2026-11-10T00:00:00Z");
+      insert.run(track.externalId, track.deezerRank - 50, "2026-11-01T00:00:00Z");
+    }
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "Kendrick Lamar" },
+      { platform: "deezer", status: "ok", tracks },
+      new Date("2026-11-13T00:00:00Z"),
+      0,
+    );
+    expect(reads).toHaveLength(1);
+    const sql = reads[0].sql.toUpperCase();
+    expect(sql).not.toMatch(/\bUNION\b/);
+    expect(sql).not.toMatch(/\bINTERSECT\b/);
+    expect(sql).not.toMatch(/\bEXCEPT\b/);
+    expect(reads[0].params.length).toBeLessThan(100);
+    // The list cap stores 10 of these 12. Those 10 share one statement.
+    const idParams = reads[0].params.filter((value) => typeof value === "string" && /^\d+$/.test(value));
+    expect(idParams).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${reads[0].sql}`).all(...(reads[0].params as never[])) as { detail: string }[];
+    const detail = plan.map((row) => row.detail).join(" ");
+    expect(detail).toContain("idx_track_stats_lookup");
+    expect(detail).not.toContain("SCAN track_stats");
+    expect(changed(store, "track_stats")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats").get()).toEqual({ n: 36 });
+
+    store.changes.length = 0;
+    reads.length = 0;
+    const changedRank = tracks.map((track) => (track.externalId === "1" ? { ...track, deezerRank: 1100 } : track));
+    await saveSource(
+      store,
+      { id: 1, name: "Kendrick Lamar" },
+      { platform: "deezer", status: "ok", tracks: changedRank },
+      new Date("2026-11-14T00:00:00Z"),
+      0,
+    );
+    expect(reads).toHaveLength(1);
+    expect(reads[0].sql.toUpperCase()).not.toMatch(/\b(UNION|INTERSECT|EXCEPT)\b/);
+    expect(changed(store, "track_stats")).toBe(1);
+    expect(db.prepare("SELECT value, captured_at FROM track_stats WHERE external_id = '1' ORDER BY captured_at").all()).toEqual([
+      { value: 950, captured_at: "2026-11-01T00:00:00Z" },
+      { value: 1500, captured_at: "2026-11-10T00:00:00Z" },
+      { value: 1000, captured_at: "2026-11-12T00:00:00Z" },
+      { value: 1100, captured_at: "2026-11-14T00:00:00Z" },
+    ]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM track_stats WHERE external_id = '2'").get()).toEqual({ n: 3 });
+  });
 });
