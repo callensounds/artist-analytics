@@ -552,7 +552,8 @@ def test_artist_page_batches_the_tail_and_deezer_card(monkeypatch, tmp_path):
     """Each stored read used to be its own D1 round trip. The tail is one batch.
 
     Growth stays one indexed read so a cancelled tail can keep it. Everything else
-    on the artist page, including track stats and the Deezer card, is batched and still renders.
+    on the artist page, including the three track-stat seeks and the Deezer card,
+    is batched and still renders.
     """
     path = tmp_path / "batched.sqlite"
     artist_id = asyncio.run(_seed_page(SqliteDatabase(str(path))))
@@ -580,7 +581,9 @@ def test_artist_page_batches_the_tail_and_deezer_card(monkeypatch, tmp_path):
     assert "4,000" in page.text
     assert HISTORY_UNAVAILABLE not in page.text
     assert "Stored Deezer data could not be read" not in page.text
-    assert batches == [15, 3]
+    # Track stats are three indexed seeks (deezer rank, Spotify plays, Spotify
+    # popularity) inside the same batch, not a second round trip.
+    assert batches == [17, 3]
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
 

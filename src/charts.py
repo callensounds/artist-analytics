@@ -121,7 +121,7 @@ def valid_chart_day(value: object) -> str | None:
     if not _CHART_DAY.fullmatch(text):
         return None
     try:
-        datetime.strptime(text, "%Y-%m-%d")
+        datetime(int(text[0:4]), int(text[5:7]), int(text[8:10]))
     except ValueError:
         return None
     return text
@@ -150,7 +150,7 @@ def _position(value: object) -> int | None:
 
 
 def _day_ms(day: str) -> int:
-    moment = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    moment = datetime(int(day[0:4]), int(day[5:7]), int(day[8:10]), tzinfo=timezone.utc)
     return int(moment.timestamp() * 1000)
 
 

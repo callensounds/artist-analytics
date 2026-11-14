@@ -12,7 +12,13 @@ import main
 from crawl import reset_pool
 from db import SqliteDatabase, migrate, utc_now
 from export_csv import load_export_rows, render_export_csv
-from history import TRACK_STATS_SQL, _latest_track_stat_map, present_track_stats, remember
+from history import (
+    _flag_rows_from_stat_lookup,
+    _latest_track_stat_map,
+    present_track_stats,
+    remember,
+    track_stats_statement,
+)
 
 
 def _plan(database: SqliteDatabase, sql: str, params: tuple) -> str:
@@ -147,12 +153,11 @@ def test_track_stats_card_empty_state_and_csv(monkeypatch, tmp_path):
         return artist_id, empty_id
 
     artist_id, empty_id = asyncio.run(seed())
-    plan = _plan(
-        database,
-        TRACK_STATS_SQL,
-        (artist_id, artist_id, artist_id, artist_id, ago, artist_id, ago),
-    )
+    stat_sql, stat_params = track_stats_statement(artist_id, "deezer", "deezer_rank", ago)
+    assert "UNION" not in stat_sql.upper()
+    plan = _plan(database, stat_sql, stat_params)
     assert "idx_track_stats_lookup" in plan
+    assert "external_id" in plan
     assert "SCAN track_stats" not in plan
 
     client = TestClient(main.app)
@@ -196,6 +201,63 @@ def test_track_stats_card_empty_state_and_csv(monkeypatch, tmp_path):
     assert "made_up" not in text
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_track_stats_keep_the_real_first_value_across_a_long_series():
+    """The 7-day change and the first stored value both come from index seeks, not a truncated window."""
+    database = SqliteDatabase(":memory:")
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def seed():
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at, last_crawled_at)
+            VALUES ('Drake', 'drake', 'search', 1, ?, ?)
+            """,
+            (utc_now(start), utc_now(start + timedelta(days=199))),
+        )
+        artist_id = int((await database.query_one("SELECT id FROM artists"))["id"])
+        latest = utc_now(start + timedelta(days=199))
+        await database.execute(
+            """
+            INSERT INTO artist_tracks (
+                artist_id, source, external_id, track_name, popularity, album_name, rank, first_seen_at, last_seen_at
+            ) VALUES (?, 'deezer', '77', 'One Dance', NULL, 'Views', 1, ?, ?)
+            """,
+            (artist_id, latest, latest),
+        )
+        await database.batch(
+            [
+                (
+                    "INSERT INTO track_stats (artist_id, source, external_id, metric, value, captured_at) VALUES (?, 'deezer', '77', 'deezer_rank', ?, ?)",
+                    (artist_id, 1000 + day, utc_now(start + timedelta(days=day))),
+                )
+                for day in range(200)
+            ]
+        )
+        return artist_id
+
+    artist_id = asyncio.run(seed())
+    cutoff = utc_now(start + timedelta(days=192))
+    sql, params = track_stats_statement(artist_id, "deezer", "deezer_rank", cutoff)
+
+    async def read():
+        return await database.query(sql, params)
+
+    rows = asyncio.run(read())
+    assert len(rows) == 1
+    assert rows[0]["latest_value"] == 1199
+    assert rows[0]["latest_at"] == utc_now(start + timedelta(days=199))
+    assert rows[0]["first_value"] == 1000
+    assert rows[0]["first_at"] == utc_now(start)
+    assert rows[0]["ago_value"] == 1192
+    assert rows[0]["ago_at"] == cutoff
+    presented = present_track_stats(_flag_rows_from_stat_lookup(rows), cutoff)
+    assert presented[0]["value"] == 1199
+    assert presented[0]["captured_at"] == utc_now(start + timedelta(days=199))
+    assert presented[0]["change_text"] == f"+7 since {cutoff[:10]}"
+    assert "first stored value" not in presented[0]["change_text"]
 
 
 def test_remember_writes_one_deezer_rank_per_utc_day():

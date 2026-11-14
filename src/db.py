@@ -26,8 +26,36 @@ def utc_now(now: datetime | None = None) -> str:
 
 
 def parse_utc(value: str | None) -> datetime | None:
+    """Parse the crawler's UTC stamp. The common shape skips ``strptime``.
+
+    ``strptime`` walks a pure-Python format parser. Artist pages call this once
+    per snapshot, chart day, and momentum point, so the fixed 20-character
+    form is sliced instead. Any other shape still goes through ``strptime``.
+    """
     if not value:
         return None
+    if (
+        isinstance(value, str)
+        and len(value) == 20
+        and value[4] == "-"
+        and value[7] == "-"
+        and value[10] == "T"
+        and value[13] == ":"
+        and value[16] == ":"
+        and value[19] == "Z"
+    ):
+        try:
+            return datetime(
+                int(value[0:4]),
+                int(value[5:7]),
+                int(value[8:10]),
+                int(value[11:13]),
+                int(value[14:16]),
+                int(value[17:19]),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None
     try:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
