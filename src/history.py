@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -1195,72 +1196,128 @@ ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
 LIMIT ?
 """
 
-# One read for the current top tracks: latest value, the newest value on or
-# before the cutoff, and the first stored value. idx_track_stats_lookup is
-# (artist_id, source, external_id, metric, captured_at).
-TRACK_STATS_SQL = f"""
-WITH current_tracks AS (
-    SELECT source, external_id, track_name, rank AS list_rank
-    FROM (
-        SELECT source, external_id, track_name, rank
-        FROM artist_tracks
-        WHERE artist_id = ? AND source = 'deezer'
-          AND last_seen_at >= (
-              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
-              FROM artist_tracks
-              WHERE artist_id = ? AND source = 'deezer'
-          )
-        ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
-        LIMIT 12
-    )
-    UNION ALL
-    SELECT source, external_id, track_name, rank AS list_rank
-    FROM (
-        SELECT source, external_id, track_name, rank
-        FROM artist_tracks
-        WHERE artist_id = ? AND source = 'spotify'
-          AND last_seen_at >= (
-              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
-              FROM artist_tracks
-              WHERE artist_id = ? AND source = 'spotify'
-          )
-        ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
-        LIMIT 12
-    )
+# One indexed LIMIT 1 per fact (latest, first, and the newest on or before the
+# cutoff). A window over every stored day sorts the whole history three times;
+# that was the slow artist-page read for a long track_stats table. No UNION:
+# D1 rejects a compound SELECT once it has too many arms, so deezer rank and
+# the two Spotify metrics are three statements in the history batch.
+TRACK_STAT_READS = (
+    ("deezer", "deezer_rank"),
+    ("spotify", "spotify_playcount"),
+    ("spotify", "spotify_popularity"),
 )
-SELECT source, external_id, metric, value, captured_at, track_name, list_rank,
-       rn_latest, rn_first, rn_ago
-FROM (
-    SELECT stats.source AS source,
-           stats.external_id AS external_id,
-           stats.metric AS metric,
-           stats.value AS value,
-           stats.captured_at AS captured_at,
-           current_tracks.track_name AS track_name,
-           current_tracks.list_rank AS list_rank,
-           ROW_NUMBER() OVER (
-               PARTITION BY stats.source, stats.external_id, stats.metric
-               ORDER BY stats.captured_at DESC
-           ) AS rn_latest,
-           ROW_NUMBER() OVER (
-               PARTITION BY stats.source, stats.external_id, stats.metric
-               ORDER BY stats.captured_at ASC
-           ) AS rn_first,
-           ROW_NUMBER() OVER (
-               PARTITION BY stats.source, stats.external_id, stats.metric
-               ORDER BY CASE WHEN stats.captured_at <= ? THEN 0 ELSE 1 END, stats.captured_at DESC
-           ) AS rn_ago
-    FROM track_stats AS stats
-    JOIN current_tracks
-      ON current_tracks.source = stats.source
-     AND current_tracks.external_id = stats.external_id
-    WHERE stats.artist_id = ?
-) AS ranked
-WHERE rn_latest = 1
-   OR rn_first = 1
-   OR (rn_ago = 1 AND captured_at <= ?)
-LIMIT 80
-"""
+
+
+def track_stats_statement(artist_id: int, source: str, metric: str, cutoff: str) -> tuple[str, tuple]:
+    """Current top tracks for one source and metric. Each fact is an index seek."""
+    if (source, metric) not in TRACK_STAT_READS:
+        raise ValueError("unsupported track stat")
+    sql = f"""
+    SELECT c.source AS source,
+           c.external_id AS external_id,
+           '{metric}' AS metric,
+           c.track_name AS track_name,
+           c.list_rank AS list_rank,
+           latest.value AS latest_value,
+           latest.captured_at AS latest_at,
+           first.value AS first_value,
+           first.captured_at AS first_at,
+           ago.value AS ago_value,
+           ago.captured_at AS ago_at
+    FROM (
+        SELECT '{source}' AS source, external_id, track_name, rank AS list_rank
+        FROM artist_tracks
+        WHERE artist_id = ? AND source = '{source}'
+          AND last_seen_at >= (
+              SELECT strftime('%Y-%m-%dT%H:%M:%SZ', MAX(last_seen_at), '-{TRACK_CURRENT_HOURS} hours')
+              FROM artist_tracks
+              WHERE artist_id = ? AND source = '{source}'
+          )
+        ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, track_name ASC
+        LIMIT 12
+    ) AS c
+    JOIN track_stats AS latest
+      ON latest.rowid = (
+          SELECT rowid FROM track_stats
+          WHERE artist_id = ? AND source = '{source}'
+            AND external_id = c.external_id AND metric = '{metric}'
+          ORDER BY captured_at DESC
+          LIMIT 1
+      )
+    LEFT JOIN track_stats AS first
+      ON first.rowid = (
+          SELECT rowid FROM track_stats
+          WHERE artist_id = ? AND source = '{source}'
+            AND external_id = c.external_id AND metric = '{metric}'
+          ORDER BY captured_at ASC
+          LIMIT 1
+      )
+    LEFT JOIN track_stats AS ago
+      ON ago.rowid = (
+          SELECT rowid FROM track_stats
+          WHERE artist_id = ? AND source = '{source}'
+            AND external_id = c.external_id AND metric = '{metric}'
+            AND captured_at <= ?
+          ORDER BY captured_at DESC
+          LIMIT 1
+      )
+    """
+    params = (artist_id, artist_id, artist_id, artist_id, artist_id, cutoff)
+    if sql.count("?") != len(params):
+        raise RuntimeError("track stat placeholders do not match parameters")
+    return sql, params
+
+
+def _flag_rows_from_stat_lookup(rows: list[dict] | None) -> list[dict]:
+    """Shape index lookups like the flag rows ``present_track_stats`` already reads."""
+    flagged = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        latest_at = str(row.get("latest_at") or "")
+        latest_value = row.get("latest_value")
+        if not latest_at or latest_value is None:
+            continue
+        first_at = str(row.get("first_at") or "")
+        ago_at = str(row.get("ago_at") or "")
+        base = {
+            "source": row.get("source"),
+            "external_id": row.get("external_id"),
+            "metric": row.get("metric"),
+            "track_name": row.get("track_name"),
+            "list_rank": row.get("list_rank"),
+        }
+
+        def emit(value, captured: str, *, latest: bool, first: bool, ago: bool) -> None:
+            flagged.append(
+                {
+                    **base,
+                    "value": value,
+                    "captured_at": captured,
+                    "rn_latest": 1 if latest else 0,
+                    "rn_first": 1 if first else 0,
+                    "rn_ago": 1 if ago else 0,
+                }
+            )
+
+        emit(
+            latest_value,
+            latest_at,
+            latest=True,
+            first=bool(first_at) and first_at == latest_at,
+            ago=bool(ago_at) and ago_at == latest_at,
+        )
+        if first_at and first_at != latest_at:
+            emit(
+                row.get("first_value"),
+                first_at,
+                latest=False,
+                first=True,
+                ago=bool(ago_at) and ago_at == first_at,
+            )
+        if ago_at and ago_at not in (latest_at, first_at):
+            emit(row.get("ago_value"), ago_at, latest=False, first=False, ago=True)
+    return flagged
 
 
 def _stat_flag(value) -> bool:
@@ -1906,7 +1963,82 @@ def _logged_rows(scope: str, value) -> list[dict] | None:
     return list(value or [])
 
 
-async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
+# Repeat views of the same crawl skip the history batch. The key includes the
+# stored crawl time, so a new crawl misses. The TTL covers chart rows that
+# land between crawls. Cached cards keep the captured_at values from D1.
+HISTORY_CACHE_TTL = 90
+_HISTORY_CACHE_PREFIX = "artist-history-v1:"
+
+
+def _history_cache_key(artist: dict) -> str:
+    return f"{_HISTORY_CACHE_PREFIX}{int(artist['id'])}:{artist.get('last_crawled_at') or ''}"
+
+
+def _growth_checkpoint(history: dict) -> dict:
+    growth = history.get("growth")
+    return {
+        "artist_id": history.get("artist_id"),
+        "name": history.get("name"),
+        "reason": history.get("reason"),
+        "growth": growth if isinstance(growth, dict) else {"datasets": []},
+    }
+
+
+def _history_cacheable(history: dict) -> bool:
+    """A failed read must not stick for the TTL. An empty catalog can."""
+    parts = [
+        str(history.get(key) or "")
+        for key in (
+            "reason",
+            "playlists_reason",
+            "tracks_reason",
+            "track_stats_reason",
+            "momentum_reason",
+            "alerts_reason",
+            "releases_reason",
+            "charts_reason",
+            "score_reason",
+        )
+    ]
+    posting = history.get("posting") if isinstance(history.get("posting"), dict) else {}
+    calendar = history.get("calendar") if isinstance(history.get("calendar"), dict) else {}
+    parts.append(str(posting.get("reason") or ""))
+    parts.append(str(calendar.get("reason") or ""))
+    return "could not be read" not in " ".join(parts)
+
+
+async def _cached_artist_history(cache, artist: dict) -> dict | None:
+    if cache is None:
+        return None
+    try:
+        raw = await cache.get(_history_cache_key(artist))
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        history = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(history, dict) or history.get("artist_id") != int(artist["id"]):
+        return None
+    return history
+
+
+async def _store_artist_history(cache, artist: dict, history: dict) -> None:
+    if cache is None or not _history_cacheable(history):
+        return
+    try:
+        payload = json.dumps(history, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return
+    try:
+        await cache.set(_history_cache_key(artist), payload, HISTORY_CACHE_TTL)
+    except Exception:
+        return
+
+
+async def load_history_for_artist(db, artist: dict, on_growth=None, cache=None) -> dict:
     """Snapshots, related edges, and sightings for one known artists row. No network.
 
     Audience points are one indexed read, reported through ``on_growth`` before
@@ -1915,8 +2047,16 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     a few dozen extra snapshot rows had to be decoded on every trip. The Deezer
     card is not in this batch. The artist page loads it afterwards so a slow
     card cannot discard this history.
+
+    ``cache`` is isolate memory plus the Cache API on D1. A hit still reports
+    the stored growth checkpoint. It does not invent a newer timestamp.
     """
     artist_id = int(artist["id"])
+    cached = await _cached_artist_history(cache, artist)
+    if cached is not None:
+        if on_growth is not None:
+            on_growth(_growth_checkpoint(cached))
+        return cached
     growth_failed = False
     try:
         rows = await db.query(SNAPSHOT_SQL, (artist_id, GROWTH_ROW_LIMIT))
@@ -1956,25 +2096,26 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
         ("musicbrainz releases", RELEASE_SQL, (artist_id, RELEASE_READ_LIMIT)),
         ("posting times", EXACT_TIME_SQL, (artist_id, EXACT_TIME_READ_LIMIT)),
         ("release sightings", RELEASE_SIGHTING_SQL, (artist_id, RELEASE_SIGHTING_READ_LIMIT)),
-        (
-            "track stats",
-            TRACK_STATS_SQL,
-            (artist_id, artist_id, artist_id, artist_id, cutoff, artist_id, cutoff),
-        ),
     ]
-    body_count = len(labeled)
+    stat_at = len(labeled)
+    for source, metric in TRACK_STAT_READS:
+        stat_sql, stat_params = track_stats_statement(artist_id, source, metric, cutoff)
+        labeled.append(("track stats", stat_sql, stat_params))
+    stat_until = len(labeled)
     labeled.extend(("chart positions", sql, params) for sql, params in charts)
     score_sql, score_params = artist_score_statement(artist_id)
     labeled.append(("audience score", score_sql, score_params))
     raw = await read_many(db, [(sql, params) for _scope, sql, params in labeled])
+    if len(raw) != len(labeled):
+        raw = list(raw) + [RuntimeError("history batch was short")] * (len(labeled) - len(raw))
     loaded = [
         _logged_rows(scope, value)
-        for (scope, _sql, _params), value in zip(labeled[: body_count - 1], raw[: body_count - 1])
+        for (scope, _sql, _params), value in zip(labeled[:stat_at], raw[:stat_at])
     ]
-    stat_raw = raw[body_count - 1] if len(raw) >= body_count else RuntimeError("track stats were not read")
+    stat_values = raw[stat_at:stat_until]
     chart_values = [
         _logged_rows(scope, value)
-        for (scope, _sql, _params), value in zip(labeled[body_count:-1], raw[body_count:-1])
+        for (scope, _sql, _params), value in zip(labeled[stat_until:-1], raw[stat_until:-1])
     ]
     score_value = raw[-1]
     related = loaded[0] or []
@@ -2003,16 +2144,21 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
     else:
         history["tracks"] = present_tracks(track_rows)
         history["tracks_reason"] = None if history["tracks"] else TRACKS_EMPTY
-    if isinstance(stat_raw, BaseException):
-        if missing_table(stat_raw):
-            history["track_stats"] = []
-            history["track_stats_reason"] = TRACK_STATS_EMPTY
+    stat_failed = False
+    stat_rows: list[dict] = []
+    for value in stat_values:
+        if isinstance(value, BaseException):
+            if missing_table(value):
+                continue
+            log_read_failure("track stats", value)
+            stat_failed = True
         else:
-            log_read_failure("track stats", stat_raw)
-            history["track_stats"] = []
-            history["track_stats_reason"] = TRACK_STATS_READ_ERROR
+            stat_rows.extend(_flag_rows_from_stat_lookup(value))
+    if stat_failed:
+        history["track_stats"] = []
+        history["track_stats_reason"] = TRACK_STATS_READ_ERROR
     else:
-        history["track_stats"] = present_track_stats(list(stat_raw or []), cutoff)
+        history["track_stats"] = present_track_stats(stat_rows, cutoff)
         history["track_stats_reason"] = None if history["track_stats"] else TRACK_STATS_EMPTY
     if momentum_rows is None:
         history["momentum"] = []
@@ -2090,10 +2236,11 @@ async def load_history_for_artist(db, artist: dict, on_growth=None) -> dict:
         history["score_components"] = score["components"]
         history["score_formula"] = score["formula"]
         history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
+    await _store_artist_history(cache, artist, history)
     return history
 
 
-async def load_dashboard_history(db, name: str) -> dict:
+async def load_dashboard_history(db, name: str, cache=None) -> dict:
     """Indexed reads only: the artist row, recent snapshots, related edges, and sightings.
 
     The old request path called load_growth, which selected metric_snapshots and left
@@ -2103,7 +2250,7 @@ async def load_dashboard_history(db, name: str) -> dict:
     artist = await find_artist(db, name)
     if not artist:
         return empty_history("This artist has no stored snapshots yet.")
-    return await load_history_for_artist(db, artist)
+    return await load_history_for_artist(db, artist, cache=cache)
 
 
 async def load_artist_history(db, name: str) -> dict:

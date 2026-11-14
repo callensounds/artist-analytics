@@ -8,6 +8,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from cache import history_page_cache
 from charts import CHARTS_PAGE_EMPTY, load_chart_board
 from accounts import (
     DEMO_EMAIL,
@@ -339,7 +340,10 @@ async def read_dashboard_history(name: str, env) -> dict:
             "Growth is stored by the crawler when D1 is bound. This page does not write history."
         )
     try:
-        return await asyncio.wait_for(load_dashboard_history(db, name), GROWTH_READ_TIMEOUT_S)
+        return await asyncio.wait_for(
+            load_dashboard_history(db, name, cache=history_page_cache(env, db)),
+            GROWTH_READ_TIMEOUT_S,
+        )
     except Exception as exc:
         log_read_failure("dashboard growth", exc)
         return empty_history(GROWTH_READ_ERROR)
@@ -986,7 +990,12 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
     kept: dict = {}
     try:
         history = await asyncio.wait_for(
-            load_history_for_artist(db, artist, on_growth=kept.update),
+            load_history_for_artist(
+                db,
+                artist,
+                on_growth=kept.update,
+                cache=history_page_cache(request.scope.get("env"), db),
+            ),
             GROWTH_READ_TIMEOUT_S,
         )
     except Exception as exc:
@@ -1071,7 +1080,14 @@ async def dashboard(request: Request, artist: str | None = None):
     if db is not None:
         try:
             plan = await asyncio.wait_for(
-                load_dashboard_plan(db, query, now, youtube_key=youtube_key, on_growth=kept_growth.update),
+                load_dashboard_plan(
+                    db,
+                    query,
+                    now,
+                    youtube_key=youtube_key,
+                    on_growth=kept_growth.update,
+                    cache=history_page_cache(env, db),
+                ),
                 GROWTH_READ_TIMEOUT_S,
             )
         except Exception as exc:

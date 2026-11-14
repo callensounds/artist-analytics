@@ -274,7 +274,7 @@ async def provider_clocks(db, artist: dict) -> dict[str, datetime | None]:
     return clocks
 
 
-async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool, on_growth=None) -> dict:
+async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool, on_growth=None, cache=None) -> dict:
     """Artist row, history, and the live-provider list. No outbound fetches.
 
     ``on_growth`` is invoked as soon as the audience series is built, before the
@@ -290,7 +290,7 @@ async def load_dashboard_plan(db, name: str, now: datetime, *, youtube_key: bool
         queued = queued_bundle()
         history = empty_history(queued["reason"])
         return {"artist": None, "history": history, "live": [], "cards": [], "clocks": {}}
-    history = await load_history_for_artist(db, artist, on_growth=on_growth)
+    history = await load_history_for_artist(db, artist, on_growth=on_growth, cache=cache)
     try:
         clocks = await provider_clocks(db, artist)
     except Exception as exc:

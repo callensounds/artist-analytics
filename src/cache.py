@@ -187,3 +187,71 @@ def cache_from_env(env) -> TieredCache:
     if kv is not None:
         layers.append(KVCache(kv))
     return TieredCache(layers)
+
+
+# Artist-page history only. Kept off the provider MemoryCache so a full page
+# cannot wipe cached provider bodies, and so a page fill does not write KV.
+_HISTORY_MEMORY: dict[str, tuple[float, str]] = {}
+
+
+class IsolateCache:
+    """In-isolate string cache. No network and no daily write cap."""
+
+    def __init__(self, store: dict[str, tuple[float, str]] | None = None, cap: int = 32):
+        self.store = _HISTORY_MEMORY if store is None else store
+        self.cap = cap
+
+    async def get(self, key: str) -> str | None:
+        item = self.store.get(key)
+        if not item:
+            return None
+        expires, value = item
+        if time.monotonic() > expires:
+            self.store.pop(key, None)
+            return None
+        return value
+
+    async def set(self, key: str, value: str, ttl: int) -> None:
+        if len(self.store) >= self.cap and key not in self.store:
+            self.store.clear()
+        self.store[key] = (time.monotonic() + max(int(ttl), 1), value)
+
+
+class HistoryPageCache:
+    """Isolate memory, then the Cache API. Reads and writes never touch KV or D1."""
+
+    def __init__(self, memory: IsolateCache | None = None, edge: EdgeCache | None = None):
+        self.memory = memory or IsolateCache()
+        self.edge = edge or EdgeCache()
+
+    async def get(self, key: str) -> str | None:
+        local = await self.memory.get(key)
+        if local:
+            return local
+        try:
+            value = await self.edge.get(key)
+        except Exception:
+            return None
+        if not value:
+            return None
+        # Same TTL the history loader stores with. Imported here to avoid a cycle.
+        from history import HISTORY_CACHE_TTL
+
+        await self.memory.set(key, value, HISTORY_CACHE_TTL)
+        return value
+
+    async def set(self, key: str, value: str, ttl: int) -> None:
+        await self.memory.set(key, value, ttl)
+        try:
+            await self.edge.set(key, value, ttl)
+        except Exception:
+            return
+
+
+def history_page_cache(env, db):
+    """Cache assembled artist history on D1. Sqlite tests always recompute."""
+    from db import D1Database
+
+    if not isinstance(db, D1Database):
+        return None
+    return HistoryPageCache()
