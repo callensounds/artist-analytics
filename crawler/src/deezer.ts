@@ -275,7 +275,9 @@ export async function fetchDeezer(name: string, preferredId: string): Promise<Sa
     const top = await readJson(`https://api.deezer.com/artist/${artist.id}/top?limit=${TRACK_LIMIT}`);
     if (top.ok && !errorMessage(top.json)) {
       tracks = parseTopTracks(top.json);
-      tracksConfirmed = true;
+      // An empty top with no further page is a real empty catalog. A short
+      // page that names a next page is not, and must not mark the rest removed.
+      tracksConfirmed = deezerCatalogComplete(top.json, tracks.length, TRACK_LIMIT, false);
     } else notes.push("Deezer top tracks were not available.");
   } catch (error) {
     if (error instanceof DeezerBusy) throw error;
@@ -362,6 +364,23 @@ export interface DeezerPlaylistFetch {
   ok: boolean;
   playlists: DeezerPlaylist[];
   reason: string | null;
+  /** False when another page exists or this page is shorter than the catalog. */
+  complete: boolean;
+}
+
+/**
+ * A short page that still has `next` or a larger `total` is not the whole list.
+ * Top tracks are a capped list: a full page of `limit` is complete even when
+ * later ranks exist. Playlists are the catalog, so a later page is not an absence.
+ */
+export function deezerCatalogComplete(payload: unknown, received: number, limit: number, fullCatalog: boolean): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const body = payload as { total?: unknown; next?: unknown };
+  const next = typeof body.next === "string" ? body.next.trim() : "";
+  const total = typeof body.total === "number" && Number.isFinite(body.total) ? body.total : null;
+  const more = next.length > 0 || (total !== null && total > received);
+  if (!more) return true;
+  return !fullCatalog && received >= limit;
 }
 
 export function isDeezerEditorial(name: string | null | undefined, userId: string | null | undefined): boolean {
@@ -462,11 +481,11 @@ export function applyPlaylistDetail(playlist: DeezerPlaylist, payload: unknown):
 
 export async function fetchDeezerPlaylists(deezerId: string): Promise<DeezerPlaylistFetch> {
   const id = artistId(deezerId);
-  if (!id) return { ok: false, playlists: [], reason: "No Deezer artist id is stored." };
+  if (!id) return { ok: false, playlists: [], reason: "No Deezer artist id is stored.", complete: false };
   const page = await readJson(`https://api.deezer.com/artist/${id}/playlists?limit=${PLAYLIST_LIMIT}`);
-  if (!page.ok) return { ok: false, playlists: [], reason: `Deezer playlists returned HTTP ${page.status}.` };
+  if (!page.ok) return { ok: false, playlists: [], reason: `Deezer playlists returned HTTP ${page.status}.`, complete: false };
   const problem = errorMessage(page.json);
-  if (problem) return { ok: false, playlists: [], reason: problem };
+  if (problem) return { ok: false, playlists: [], reason: problem, complete: false };
   const playlists = parseArtistPlaylists(page.json);
   const byId = new Map(playlists.map((row) => [row.id, row]));
   for (const playlistId of detailPlaylistIds(playlists)) {
@@ -476,5 +495,10 @@ export async function fetchDeezerPlaylists(deezerId: string): Promise<DeezerPlay
     if (!current) continue;
     byId.set(playlistId, applyPlaylistDetail(current, detail.json));
   }
-  return { ok: true, playlists: playlists.map((row) => byId.get(row.id) || row), reason: null };
+  return {
+    ok: true,
+    playlists: playlists.map((row) => byId.get(row.id) || row),
+    reason: null,
+    complete: deezerCatalogComplete(page.json, playlists.length, PLAYLIST_LIMIT, true),
+  };
 }

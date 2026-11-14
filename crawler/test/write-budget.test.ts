@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { parseTopTracks } from "../src/deezer";
+import { deezerCatalogComplete, parseTopTracks } from "../src/deezer";
 import { evaluateAlerts } from "../src/alerts";
+import { popularListComplete, relatedListComplete } from "../src/parse";
 import { SLOW_SOURCE_MS, handleMessage, resetMusicBrainzPace, runScheduled } from "../src/crawl";
 import {
   SNAPSHOT_REPEAT_MS,
@@ -45,7 +46,7 @@ function changed(store: ReturnType<typeof sqliteStore>, table: string): number {
 }
 
 describe("conditional keep-alive upserts", () => {
-  it("rewrites a row only when content changed or last_seen_at is at least a day old", async () => {
+  it("rewrites a release only when content changed or last_seen_at is at least 7 days old", async () => {
     const db = new DatabaseSync(":memory:");
     const store = sqliteStore(db);
     await migrate(store);
@@ -84,11 +85,19 @@ describe("conditional keep-alive upserts", () => {
     store.changes.length = 0;
     const dayLater = new Date("2026-11-12T12:00:00Z");
     await saveMusicBrainzReleases(store, 1, [{ ...release, title: "Sling (deluxe)" }], dayLater, "A");
+    expect(changed(store, "musicbrainz_releases")).toBe(0);
+    expect(db.prepare("SELECT last_seen_at FROM musicbrainz_releases").get()).toEqual({
+      last_seen_at: "2026-11-11T12:00:00Z",
+    });
+
+    store.changes.length = 0;
+    const weekLater = new Date("2026-11-18T12:00:00Z");
+    await saveMusicBrainzReleases(store, 1, [{ ...release, title: "Sling (deluxe)" }], weekLater, "A");
     expect(changed(store, "musicbrainz_releases")).toBe(1);
     expect(db.prepare("SELECT last_seen_at FROM musicbrainz_releases").get()).toEqual({
-      last_seen_at: dayLater.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      last_seen_at: weekLater.toISOString().replace(/\.\d{3}Z$/, "Z"),
     });
-    expect(seenCutoff(dayLater) <= "2026-11-11T12:00:00Z").toBe(true);
+    expect(seenCutoff(weekLater) <= "2026-11-11T12:00:00Z").toBe(true);
   });
 
   it("skips an unchanged playlist and still records a renamed one", async () => {
@@ -285,6 +294,261 @@ describe("conditional keep-alive upserts", () => {
       follower_count: 90,
       last_seen_at: "2026-11-13T06:00:00Z",
     });
+  });
+
+  it("stamps removed_at once, clears it once on return, and ignores a partial list", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id, deezer_id) VALUES ('A', 'a', 'search', 1, '2026-11-01T00:00:00Z', 'sp-a', '27')",
+    ).run();
+    const tracks = [
+      { externalId: "kept", name: "Kept", popularity: 10, album: "Album", rank: 1 },
+      { externalId: "gone", name: "Gone", popularity: 20, album: "Album", rank: 2 },
+    ];
+    const related = [
+      { name: "Kept Pal", spotify_id: "kept-pal", rank: 1 },
+      { name: "Gone Pal", spotify_id: "gone-pal", rank: 2 },
+    ];
+    const first = new Date("2026-11-11T00:00:00Z");
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks, related, tracksConfirmed: true, relatedConfirmed: true },
+      first,
+      0,
+    );
+
+    const missing = new Date("2026-11-11T06:00:00Z");
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      {
+        platform: "spotify",
+        status: "ok",
+        tracks: [tracks[0]],
+        related: [related[0]],
+        tracksConfirmed: true,
+        relatedConfirmed: true,
+      },
+      missing,
+      0,
+    );
+    expect(db.prepare("SELECT removed_at FROM artist_tracks WHERE external_id = 'gone'").get()).toEqual({
+      removed_at: "2026-11-11T06:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'gone-pal'").get()).toEqual({
+      removed_at: "2026-11-11T06:00:00Z",
+    });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      {
+        platform: "spotify",
+        status: "ok",
+        tracks: [tracks[0]],
+        related: [related[0]],
+        tracksConfirmed: true,
+        relatedConfirmed: true,
+      },
+      new Date("2026-11-12T06:00:00Z"),
+      0,
+    );
+    expect(changed(store, "artist_tracks")).toBe(0);
+    expect(changed(store, "related_edges")).toBe(0);
+    expect(db.prepare("SELECT removed_at FROM artist_tracks WHERE external_id = 'gone'").get()).toEqual({
+      removed_at: "2026-11-11T06:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'gone-pal'").get()).toEqual({
+      removed_at: "2026-11-11T06:00:00Z",
+    });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks, related, tracksConfirmed: true, relatedConfirmed: true },
+      new Date("2026-11-12T08:00:00Z"),
+      0,
+    );
+    expect(changed(store, "artist_tracks")).toBe(1);
+    expect(changed(store, "related_edges")).toBe(1);
+    expect(db.prepare("SELECT removed_at, last_seen_at FROM artist_tracks WHERE external_id = 'gone'").get()).toEqual({
+      removed_at: null,
+      last_seen_at: "2026-11-12T08:00:00Z",
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'gone-pal'").get()).toEqual({
+      removed_at: null,
+    });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "ok", tracks, related, tracksConfirmed: true, relatedConfirmed: true },
+      new Date("2026-11-12T10:00:00Z"),
+      0,
+    );
+    expect(changed(store, "artist_tracks")).toBe(0);
+    expect(changed(store, "related_edges")).toBe(0);
+    expect(db.prepare("SELECT last_seen_at FROM artist_tracks WHERE external_id = 'gone'").get()).toEqual({
+      last_seen_at: "2026-11-12T08:00:00Z",
+    });
+
+    store.changes.length = 0;
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      {
+        platform: "spotify",
+        status: "ok",
+        tracks: [tracks[0]],
+        related: [related[0]],
+        tracksConfirmed: false,
+        relatedConfirmed: false,
+      },
+      new Date("2026-11-12T12:00:00Z"),
+      0,
+    );
+    await saveSource(
+      store,
+      { id: 1, name: "A" },
+      { platform: "spotify", status: "error", tracks: [], related: [], tracksConfirmed: true, relatedConfirmed: true },
+      new Date("2026-11-12T12:30:00Z"),
+      0,
+    );
+    expect(changed(store, "artist_tracks")).toBe(0);
+    expect(changed(store, "related_edges")).toBe(0);
+    expect(db.prepare("SELECT removed_at FROM artist_tracks").all()).toEqual([{ removed_at: null }, { removed_at: null }]);
+    expect(db.prepare("SELECT removed_at FROM related_edges").all()).toEqual([{ removed_at: null }, { removed_at: null }]);
+  });
+});
+
+describe("partial lists do not classify absences", () => {
+  it("leaves stored tracks and related artists in place when the page was cut off", async () => {
+    const cut = `
+      <span>Popular</span>
+      <div aria-labelledby="listrow-title-track-spotify:track:kepttrack0000000001-0" aria-label="Kept"></div>
+      <h2>Fans also like</h2>
+      <a href="/artist/keptpal0000000000000001"><span>Kept Pal</span></a>
+    `;
+    expect(popularListComplete(cut, 1)).toBe(false);
+    expect(relatedListComplete(cut, 1)).toBe(false);
+    expect(popularListComplete(`${cut}<h2>Popular releases</h2>`, 1)).toBe(true);
+    expect(relatedListComplete(`${cut}<div>Appears On</div>`, 1)).toBe(true);
+    expect(deezerCatalogComplete({ data: [{}], total: 40, next: "https://api.deezer.com/next" }, 1, 10, false)).toBe(false);
+    expect(deezerCatalogComplete({ data: new Array(10), total: 40, next: "https://api.deezer.com/next" }, 10, 10, false)).toBe(true);
+    expect(deezerCatalogComplete({ data: new Array(50), total: 80, next: "https://api.deezer.com/next" }, 50, 50, true)).toBe(false);
+
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, spotify_id) VALUES ('Clairo', 'clairo', 'search', 1, ?, 'sp-clairo')",
+    ).run("2026-11-01T00:00:00Z");
+    const kept = { externalId: "kepttrack0000000001", name: "Kept", popularity: 10, album: "Sling", rank: 1 };
+    const gone = { externalId: "gonetrack00000000001", name: "Gone", popularity: 4, album: "Sling", rank: 2 };
+    await saveSource(
+      store,
+      { id: 1, name: "Clairo" },
+      {
+        platform: "spotify",
+        status: "ok",
+        tracks: [kept, gone],
+        related: [
+          { name: "Kept Pal", spotify_id: "keptpal0000000000000001", rank: 1 },
+          { name: "Gone Pal", spotify_id: "gonepal00000000000000001", rank: 2 },
+        ],
+        tracksConfirmed: true,
+        relatedConfirmed: true,
+      },
+      new Date("2026-11-11T00:00:00Z"),
+      0,
+    );
+    vi.stubGlobal("fetch", async () => new Response(cut, { status: 200 }));
+    store.changes.length = 0;
+    await handleMessage({ DB: store, CRAWL_QUEUE: { send() {} } }, { artist_id: 1, provider: "spotify" }, new Date("2026-11-11T08:00:00Z"));
+    expect(db.prepare("SELECT removed_at FROM artist_tracks WHERE external_id = 'gonetrack00000000001'").get()).toEqual({
+      removed_at: null,
+    });
+    expect(db.prepare("SELECT removed_at FROM related_edges WHERE to_spotify_id = 'gonepal00000000000000001'").get()).toEqual({
+      removed_at: null,
+    });
+    expect(changed(store, "UPDATE artist_tracks SET removed_at")).toBe(0);
+    expect(changed(store, "UPDATE related_edges SET removed_at")).toBe(0);
+  });
+
+  it("does not mark a Deezer track or playlist absent when the page has a next link", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    db.prepare(
+      "INSERT INTO artists (name, normalized_name, origin, tracked, created_at, deezer_id) VALUES ('Clairo', 'clairo', 'search', 1, ?, '27')",
+    ).run("2026-11-01T00:00:00Z");
+    await saveSource(
+      store,
+      { id: 1, name: "Clairo" },
+      {
+        platform: "deezer",
+        status: "ok",
+        tracks: [
+          { externalId: "11", name: "Kept", popularity: null, album: "Sling", rank: 1 },
+          { externalId: "12", name: "Gone", popularity: null, album: "Sling", rank: 2 },
+        ],
+        tracksConfirmed: true,
+      },
+      new Date("2026-11-11T00:00:00Z"),
+      0,
+    );
+    await saveDeezerPlaylists(
+      store,
+      1,
+      "Clairo",
+      [
+        { id: "10", title: "Pop Hits", ownerName: "Deezer", fans: 80, fansKnown: true, editorial: true },
+        { id: "12", title: "Old Mix", ownerName: "Sam", fans: 40, fansKnown: true, editorial: false },
+      ],
+      new Date("2026-11-11T00:00:00Z"),
+    );
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/artist/27")) {
+        return new Response(JSON.stringify({ id: 27, name: "Clairo", nb_fan: 4000, nb_album: 1 }), { status: 200 });
+      }
+      if (url.includes("/top")) {
+        return new Response(
+          JSON.stringify({ data: [{ id: 11, title: "Kept", album: { title: "Sling" } }], total: 40, next: "https://api.deezer.com/next" }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/albums")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      if (url.includes("/playlists")) {
+        return new Response(
+          JSON.stringify({
+            data: [{ id: 10, title: "Pop Hits", user: { id: 637006841, name: "Deezer" } }],
+            total: 80,
+            next: "https://api.deezer.com/next",
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/playlist/10")) return new Response(JSON.stringify({ id: 10, fans: 80 }), { status: 200 });
+      return new Response("{}", { status: 404 });
+    });
+    store.changes.length = 0;
+    await handleMessage({ DB: store, CRAWL_QUEUE: { send() {} } }, { artist_id: 1, provider: "deezer" }, new Date("2026-11-11T08:00:00Z"));
+    await handleMessage(
+      { DB: store, CRAWL_QUEUE: { send() {} } },
+      { artist_id: 1, provider: "deezer_playlists" },
+      new Date("2026-11-12T09:00:00Z"),
+    );
+    expect(db.prepare("SELECT removed_at FROM artist_tracks WHERE external_id = '12'").get()).toEqual({ removed_at: null });
+    expect(db.prepare("SELECT removed_at FROM playlist_appearances WHERE playlist_id = '12'").get()).toEqual({ removed_at: null });
+    expect(changed(store, "UPDATE artist_tracks SET removed_at")).toBe(0);
+    expect(changed(store, "UPDATE playlist_appearances SET removed_at")).toBe(0);
   });
 });
 

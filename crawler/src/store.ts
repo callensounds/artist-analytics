@@ -371,8 +371,13 @@ export function parseUtc(value: unknown): Date | null {
  * A row missing from a confirmed crawl is marked removed_at instead.
  */
 export const SEEN_KEEP_ALIVE_MS = 7 * 24 * 60 * 60 * 1000;
-/** Release rows are not a current/dropped list. A daily touch stays enough. */
-export const RELEASE_KEEP_ALIVE_MS = 24 * 60 * 60 * 1000;
+/**
+ * Release rows are not a current/dropped list. Readers in src/ return every
+ * stored group; last_seen_at is only a displayed stamp. The release fetch
+ * itself runs daily, so a one-day touch rewrote the whole catalog every crawl.
+ * Refresh the stamp weekly, and sooner when a real field changed.
+ */
+export const RELEASE_KEEP_ALIVE_MS = SEEN_KEEP_ALIVE_MS;
 /**
  * An audience value identical to metric_latest is stored again only after this
  * long, so a flat series still has one real point per day. A different value
@@ -629,9 +634,10 @@ export interface SavedSource {
     /** Spotify play count from the public page. Never a guessed figure. */
     playcount?: number | null;
   }[];
-  /** True after a real read of that list, including a successful empty Deezer top. */
+  /** True after a complete read of that list, including a successful empty Deezer top.
+   *  A truncated, failed, or paginated read stays false and does not mark absences. */
   tracksConfirmed?: boolean;
-  /** True when the Spotify related list was actually parsed and non-empty. */
+  /** True when the Spotify related section was fully parsed and non-empty. */
   relatedConfirmed?: boolean;
   musicbrainzId?: string | null;
   spotifyId?: string | null;
@@ -1163,7 +1169,8 @@ export interface PlaylistPlacement {
 
 /** Upsert Deezer placements. first_seen_at stays on conflict. A missing fan count is not written as 0.
  *  An unchanged row is rewritten only when last_seen_at is at least 7 days old.
- *  Playlists missing from this confirmed list are marked removed_at.
+ *  Playlists missing from this confirmed list are marked removed_at once.
+ *  A paginated or partial page passes confirmAbsences false and does not stamp absences.
  */
 export async function saveDeezerPlaylists(
   store: Store,
@@ -1171,6 +1178,7 @@ export async function saveDeezerPlaylists(
   artistName: string,
   playlists: PlaylistPlacement[],
   now = new Date(),
+  confirmAbsences = true,
 ): Promise<number> {
   const stamp = utcNow(now);
   const cutoff = seenCutoff(now);
@@ -1236,12 +1244,16 @@ export async function saveDeezerPlaylists(
     [...seen],
     stamp,
   );
+  // The clock moves even when this page cannot classify absences. Readers
+  // treat a set absences_marked_at as "current means removed_at is empty",
+  // so an unchanged last_seen_at stays visible. The absence UPDATE is the
+  // statement a partial page must not run.
   await commitWrites(
     store,
     [
       ...chunkedInsert(insert, known, updateKnown, [cutoff]),
       ...chunkedInsert(insert, unchecked, updateUnchecked, [cutoff]),
-      absent,
+      ...(confirmAbsences ? [absent] : []),
       {
         sql: `INSERT INTO playlist_crawls (artist_id, source, crawled_at, absences_marked_at)
               VALUES (?, 'deezer', ?, ?)

@@ -26,7 +26,9 @@ import {
   parseApiTracks,
   parseMonthlyListeners,
   parsePopularTracks,
+  popularListComplete,
   parseRelatedArtists,
+  relatedListComplete,
   parseSpotifyPlaycounts,
   SPOTIFY_PAGE_BYTES,
   parseSpotifyFollowers,
@@ -489,7 +491,13 @@ async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
   const related = parseRelatedArtists(page.text);
   const albums = parseDiscography(lines);
   const playcounts = parseSpotifyPlaycounts(page.text);
-  const tracks = await enrichTracks(artistId, parsePopularTracks(page.text), env);
+  const pageTracks = parsePopularTracks(page.text);
+  const tracks = await enrichTracks(artistId, pageTracks, env);
+  // A byte-capped page can return a non-empty prefix. That prefix is not the
+  // top list: confirming it marks every missing track removed, and the next
+  // full page clears removed_at. An API-only list is the top-tracks response.
+  const pageListComplete = pageTracks.length > 0 && popularListComplete(page.text, pageTracks.length);
+  const apiListOnly = pageTracks.length === 0 && tracks.length > 0;
   return {
     platform: "spotify",
     status: "ok",
@@ -512,9 +520,9 @@ async function spotify(artistId: string, env: CrawlEnv): Promise<SavedSource> {
       rank: track.rank,
       playcount: playcounts.get(track.externalId) ?? null,
     })),
-    tracksConfirmed: tracks.length > 0,
+    tracksConfirmed: pageListComplete || apiListOnly,
     related,
-    relatedConfirmed: related.length > 0,
+    relatedConfirmed: related.length > 0 && relatedListComplete(page.text, related.length),
     spotifyId: artistId,
     markCrawled: true,
   };
@@ -666,7 +674,14 @@ async function crawlDeezerPlaylists(
     ]);
     return { ok: false, detail };
   }
-  const written = await saveDeezerPlaylists(env.DB, artistId, String(row.name || ""), fetched.playlists, now);
+  const written = await saveDeezerPlaylists(
+    env.DB,
+    artistId,
+    String(row.name || ""),
+    fetched.playlists,
+    now,
+    fetched.complete,
+  );
   return { ok: true, detail: `${row.name} | deezer_playlists=ok (${written})` };
 }
 
