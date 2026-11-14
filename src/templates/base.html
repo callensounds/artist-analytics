@@ -7,52 +7,142 @@
     <link rel="icon" href="/favicon.ico" type="image/svg+xml">
     <link rel="stylesheet" href="/static/app.css">
     <style>
+        .bg-emerald-500, .bg-emerald-600 { color: #052e24; }
+        :focus-visible { outline: 2px solid #6ee7b7; outline-offset: 2px; }
+        a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
+            outline: 2px solid #6ee7b7 !important;
+            outline-offset: 2px;
+        }
+        /* slate-500 on slate-800 is under 4.5:1. This stays a secondary color and clears the bar. */
+        .text-slate-500 { color: #c5d0de; }
+        .site-nav-row { display: flex; align-items: center; gap: 0.75rem; min-height: 3.25rem; flex-wrap: nowrap; }
+        .site-brand { display: flex; align-items: center; gap: 0.45rem; min-width: 0; max-width: 11rem; font-weight: 700; font-size: 1.05rem; }
+        .site-nav-links { display: flex; align-items: center; gap: 0.35rem 0.9rem; overflow-x: auto; flex-wrap: nowrap; min-width: 0; flex: 1; padding: 0.4rem 0.15rem; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+        .nav-link, .nav-user { white-space: nowrap; flex: 0 0 auto; color: #e2e8f0; font-size: 0.875rem; }
+        .nav-link:hover { color: #6ee7b7; }
+        .nav-user { color: #c5d0de; max-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
+        .nav-cta { white-space: nowrap; flex: 0 0 auto; background: #10b981; color: #042f24; font-weight: 650; border-radius: 0.5rem; padding: 0.4rem 0.75rem; }
+        main.site-main { overflow-x: clip; }
+        main section, .source-card, .page-head { min-width: 0; max-width: 100%; }
+        main section > h2, main section > div > h2 { font-size: 1rem; font-weight: 650; letter-spacing: -0.015em; color: #f8fafc; }
+        .page-head { display: flex; flex-direction: column; gap: 1rem; margin-bottom: 1.5rem; }
+        .page-title { font-size: 1.7rem; line-height: 1.15; font-weight: 750; letter-spacing: -0.03em; overflow-wrap: anywhere; color: #f8fafc; }
+        .page-subtitle { color: #c5d0de; font-size: 0.875rem; margin-top: 0.25rem; }
+        .page-search { display: flex; gap: 0.5rem; width: 100%; min-width: 0; }
+        .page-search input { min-width: 0; flex: 1; }
+        .stat-value { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.75rem; font-weight: 650; line-height: 1.1; letter-spacing: -0.03em; color: #6ee7b7; overflow-wrap: anywhere; }
+        .chart-frame { position: relative; min-width: 0; max-width: 100%; overflow: hidden; }
         .data-scroll { overflow-x: auto; max-width: 100%; -webkit-overflow-scrolling: touch; }
         .data-scroll > table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.875rem; line-height: 1.4; }
         .data-scroll th, .data-scroll td { white-space: nowrap; vertical-align: top; }
         .data-scroll .cell-wrap { white-space: normal; overflow-wrap: anywhere; min-width: 9rem; max-width: 18rem; }
-        .data-scroll-hint { display: none; margin: 0 0 0.5rem; font-size: 0.75rem; color: #94a3b8; }
+        .data-scroll-hint { display: none; margin: 0 0 0.5rem; font-size: 0.75rem; color: #c5d0de; }
         .calendar-grid, .posting-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
         .calendar-grid > *, .posting-week > * { min-width: 0; overflow-wrap: anywhere; }
+        .calendar-dow { color: #c5d0de; font-size: 0.75rem; text-align: center; padding: 0.25rem 0 0.4rem; font-weight: 650; }
+        .calendar-day { min-height: 4.25rem; min-width: 0; border-radius: 0.45rem; padding: 0.3rem; }
+        .calendar-day-empty { border: 1px solid #334155; background: rgba(15, 23, 42, 0.35); }
+        .calendar-day-has { border: 1px solid rgba(52, 211, 153, 0.9); background: rgba(16, 185, 129, 0.16); box-shadow: inset 3px 0 0 #34d399; }
+        .calendar-day-out { min-height: 2.5rem; }
+        .calendar-day-num { font-size: 0.8rem; font-weight: 650; color: #c5d0de; }
+        .calendar-day-has .calendar-day-num { color: #6ee7b7; }
+        .calendar-time { display: block; margin-top: 0.15rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: 650; color: #6ee7b7; letter-spacing: 0.01em; overflow-wrap: anywhere; }
+        .calendar-release-title { color: #f1f5f9; font-size: 0.82rem; overflow-wrap: anywhere; }
+        .calendar-release-title a:hover { color: #6ee7b7; }
+        .calendar-release-meta, .calendar-more { color: #c5d0de; font-size: 0.72rem; }
+        .calendar-agenda { display: none; list-style: none; margin: 0; padding: 0; }
+        .calendar-agenda-day { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: 0.35rem 0.75rem; padding: 0.75rem 0; border-top: 1px solid #334155; }
+        .calendar-agenda-date { display: flex; flex-direction: column; gap: 0.1rem; }
+        .calendar-agenda-weekday { color: #c5d0de; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+        .calendar-agenda-daynum { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 1.15rem; font-weight: 700; color: #6ee7b7; }
+        .calendar-agenda-empty { color: #c5d0de; font-size: 0.875rem; padding: 0.5rem 0; }
+        .calendar-months-single { grid-template-columns: minmax(0, 1fr); }
+        .month-nav { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin: 0 0 1rem; }
+        .month-nav-link, .month-nav-today { color: #042f24; background: #6ee7b7; border-radius: 999px; padding: 0.35rem 0.7rem; font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
+        .month-nav-link.is-disabled { background: #1e293b; color: #94a3b8; }
+        .month-nav-today, .page-back { background: transparent; color: #6ee7b7; border: 1px solid rgba(110, 231, 183, 0.7); border-radius: 999px; padding: 0.35rem 0.7rem; font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
+        .page-back { align-self: flex-start; }
+        .month-nav-current { display: flex; flex-direction: column; align-items: center; min-width: 0; text-align: center; }
+        .month-nav-label { font-weight: 700; color: #f8fafc; font-size: 1rem; }
+        .month-nav-zone { color: #c5d0de; font-size: 0.7rem; letter-spacing: 0.08em; }
+        .calendar-empty-note { color: #c5d0de; font-size: 0.875rem; margin-bottom: 0.75rem; }
+        .source-grid { display: grid; gap: 1rem; }
+        .source-card { min-width: 0; background: #1e293b; border: 1px solid #334155; border-radius: 1rem; padding: 1.15rem; }
+        .source-card-quiet { background: #0f172a; border-color: #1e293b; padding: 0.75rem 0.9rem; }
+        .source-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.6rem; }
+        .source-card-title { display: flex; align-items: center; gap: 0.5rem; font-size: 1.05rem; font-weight: 650; color: #f8fafc; }
+        .source-card-quiet .source-card-title, .source-card-quiet .source-card-profile, .source-card-quiet .source-card-reason { color: #c5d0de; font-size: 0.9rem; }
+        .source-card-profile { color: #e2e8f0; font-size: 0.875rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
+        .source-card-profile a { color: #6ee7b7; }
+        .source-status { flex: 0 0 auto; font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; color: #c5d0de; }
+        .source-card-reason, .source-note, .source-item-detail { color: #c5d0de; font-size: 0.8rem; overflow-wrap: anywhere; }
+        .source-card-reason { margin-bottom: 0.6rem; }
+        .source-note { margin-top: 0.6rem; }
+        .source-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.6rem; margin-bottom: 0.8rem; }
+        .source-metric { background: rgba(15, 23, 42, 0.55); border-radius: 0.75rem; padding: 0.7rem 0.8rem; min-width: 0; }
+        .source-metric-quiet { background: transparent; padding: 0.15rem 0; }
+        .source-metric-label { color: #c5d0de; font-size: 0.7rem; letter-spacing: 0.04em; text-transform: uppercase; }
+        .source-unavailable { color: #c5d0de; font-size: 0.8rem; margin-top: 0.15rem; }
+        .source-card-quiet .stat-value { font-size: 1.35rem; }
+        .source-items { max-height: 20rem; overflow-y: auto; }
+        .source-item { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.35rem 0.75rem; padding: 0.45rem 0; border-top: 1px solid #334155; }
+        .source-item-title { color: #f1f5f9; font-size: 0.875rem; font-weight: 600; overflow-wrap: anywhere; }
+        .source-item-time { text-align: right; min-width: 0; }
+        .source-tracks { margin-top: 0.6rem; display: grid; gap: 0.25rem; font-size: 0.875rem; }
+        .source-track-rank { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #6ee7b7; }
+        @media (min-width: 768px) {
+            .site-brand { max-width: none; font-size: 1.2rem; }
+            .page-head { flex-direction: row; align-items: flex-end; justify-content: space-between; }
+            .page-title { font-size: 2.15rem; }
+            .page-search { width: auto; }
+        }
+        @media (min-width: 1024px) {
+            .source-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .calendar-months-single { max-width: 68rem; }
+        }
         @media (max-width: 639px) {
             .data-scroll-hint { display: block; }
-            .data-scroll > table { font-size: 0.875rem; }
+            .calendar-grid { display: none; }
+            .calendar-agenda { display: block; }
+            .posting-week { font-size: 0.75rem; gap: 0.2rem; }
+            main.site-main { padding-top: 1.25rem; }
+            main section { padding: 0.9rem !important; }
         }
     </style>
     {% block head %}{% endblock %}
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen overflow-x-hidden">
-    <nav class="border-b border-slate-700 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+    <nav class="site-nav border-b border-slate-700 bg-slate-900/80 backdrop-blur sticky top-0 z-50" aria-label="Primary">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex flex-wrap justify-between gap-x-4 gap-y-2 min-h-16 py-3 items-center">
-                <a href="/" class="flex items-center gap-2 text-lg sm:text-xl font-bold min-w-0">
-                    <span class="text-emerald-400">♪</span>
+            <div class="site-nav-row">
+                <a href="/" class="site-brand">
+                    <span class="text-emerald-400" aria-hidden="true">♪</span>
                     <span class="truncate">Average Analytics</span>
                 </a>
-                <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                <div class="site-nav-links">
                     {% if user is defined and user %}
-                        <a href="/search" class="hover:text-emerald-400">Search</a>
-                        <a href="/artists" class="hover:text-emerald-400">Artists</a>
-                        <a href="/charts" class="hover:text-emerald-400">Charts</a>
-                        <a href="/scores" class="hover:text-emerald-400">Scores</a>
-                        <a href="/trending" class="hover:text-emerald-400">Trending</a>
-                        <a href="/alerts" class="hover:text-emerald-400">Alerts</a>
-                        <a href="/watch" class="hover:text-emerald-400">Watching</a>
-                        <a href="/dashboard" class="hover:text-emerald-400">Dashboard</a>
-                        <a href="/admin" class="hover:text-emerald-400">Crawl</a>
-                        <a href="/admin/diag" class="hover:text-emerald-400">Diagnostics</a>
-                        <span class="text-slate-400 truncate max-w-[10rem] sm:max-w-xs">{{ user.artist_name }}</span>
-                        <a href="/logout" class="text-slate-400 hover:text-white">Logout</a>
+                        <a href="/search" class="nav-link">Search</a>
+                        <a href="/artists" class="nav-link">Artists</a>
+                        <a href="/charts" class="nav-link">Charts</a>
+                        <a href="/scores" class="nav-link">Scores</a>
+                        <a href="/trending" class="nav-link">Trending</a>
+                        <a href="/alerts" class="nav-link">Alerts</a>
+                        <a href="/watch" class="nav-link">Watching</a>
+                        <a href="/dashboard" class="nav-link">Dashboard</a>
+                        <a href="/admin" class="nav-link">Crawl</a>
+                        <a href="/admin/diag" class="nav-link">Diagnostics</a>
+                        <span class="nav-user">{{ user.artist_name }}</span>
+                        <a href="/logout" class="nav-link">Logout</a>
                     {% else %}
-                        <a href="/login" class="hover:text-emerald-400">Login</a>
-                        <a href="/register" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-medium">Get Started</a>
+                        <a href="/login" class="nav-link">Login</a>
+                        <a href="/register" class="nav-cta">Get Started</a>
                     {% endif %}
                 </div>
             </div>
         </div>
     </nav>
 
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <main class="site-main max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {% block content %}{% endblock %}
     </main>
 

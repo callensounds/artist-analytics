@@ -30,7 +30,15 @@ from crawl import (
 from diag import diagnose
 from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
-from analytics import empty_posting_patterns, empty_release_calendar, normalize_name, parse_calendar_period
+from analytics import (
+    empty_posting_patterns,
+    empty_release_calendar,
+    ensure_month_nav,
+    focus_release_month,
+    normalize_name,
+    parse_calendar_month,
+    parse_calendar_period,
+)
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from db import log_read_failure
 from history import (
@@ -217,17 +225,38 @@ def _plan_from_growth(saved: dict, now: datetime, *, youtube_key: bool) -> dict 
     }
 
 
+_QUIET_SOURCE_STATUSES = {"unavailable", "error", "missing_credentials", "pending"}
+
+
+def _metric_number(metric: dict) -> str | None:
+    """A published number only. Unavailable metrics stay blank."""
+    if not isinstance(metric, dict):
+        return None
+    if not metric.get("available") or metric.get("value") is None:
+        return None
+    return str(metric.get("value"))
+
+
 def render_source_cards(sources: list[dict] | None) -> str:
     """Source cards are plain strings. Jinja compiling that loop was the slow template step."""
-    parts = ['<div class="grid lg:grid-cols-2 gap-6">']
+    parts = ['<div class="source-grid">']
     for source in sources or []:
+        if not isinstance(source, dict):
+            continue
         label = html.escape(str(source.get("label") or ""))
-        status = html.escape(str(source.get("status") or "").replace("_", " "))
-        parts.append('<section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700">')
-        parts.append('<div class="flex items-start justify-between gap-3 mb-3"><div>')
-        parts.append('<h2 class="text-lg font-semibold flex items-center gap-2">')
+        status_raw = str(source.get("status") or "").strip().lower()
+        status = html.escape(status_raw.replace("_", " ") or "unavailable")
+        metrics = [metric for metric in (source.get("metrics") or []) if isinstance(metric, dict)]
+        numbered = [(metric, _metric_number(metric)) for metric in metrics]
+        items = source.get("items") or []
+        tracks = source.get("tracks") or []
+        quiet = status_raw in _QUIET_SOURCE_STATUSES and not any(value for _, value in numbered) and not items and not tracks
+        section_class = "source-card source-card-quiet" if quiet else "source-card"
+        parts.append(f'<section class="{section_class}">')
+        parts.append('<div class="source-card-head"><div class="min-w-0">')
+        parts.append('<h2 class="source-card-title">')
         image = source.get("image_url")
-        if image:
+        if image and not quiet:
             parts.append(
                 f'<img src="{html.escape(str(image), quote=True)}" alt="" class="w-8 h-8 rounded-md object-cover">'
             )
@@ -238,71 +267,69 @@ def render_source_cards(sources: list[dict] | None) -> str:
             url = source.get("profile_url")
             if url:
                 parts.append(
-                    '<p class="text-sm text-slate-300">'
-                    f'<a href="{html.escape(str(url), quote=True)}" class="text-emerald-400 hover:underline">{safe_name}</a></p>'
+                    '<p class="source-card-profile">'
+                    f'<a href="{html.escape(str(url), quote=True)}">{safe_name}</a></p>'
                 )
             else:
-                parts.append(f'<p class="text-sm text-slate-300">{safe_name}</p>')
+                parts.append(f'<p class="source-card-profile">{safe_name}</p>')
         parts.append("</div>")
-        parts.append(f'<span class="text-xs uppercase tracking-wide text-slate-400">{status}</span></div>')
+        parts.append(f'<span class="source-status">{status}</span></div>')
         reason = source.get("reason")
         if reason:
-            parts.append(f'<p class="text-sm text-slate-300 mb-3">{html.escape(str(reason))}</p>')
-        metrics = source.get("metrics") or []
+            parts.append(f'<p class="source-card-reason">{html.escape(str(reason))}</p>')
         if metrics:
-            parts.append('<dl class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">')
-            for metric in metrics:
-                parts.append('<div class="bg-slate-900/50 rounded-xl p-3">')
-                parts.append(f'<dt class="text-xs text-slate-400">{html.escape(str(metric.get("label") or ""))}</dt>')
-                if metric.get("available") and metric.get("value") is not None:
-                    parts.append(
-                        f'<dd class="text-sm font-medium mt-1 break-words">{html.escape(str(metric.get("value")))}</dd>'
-                    )
+            parts.append('<dl class="source-metrics">')
+            for metric, value in numbered:
+                metric_label = html.escape(str(metric.get("label") or ""))
+                if value is not None:
+                    parts.append('<div class="source-metric">')
+                    parts.append(f'<dt class="source-metric-label">{metric_label}</dt>')
+                    parts.append(f'<dd class="stat-value">{html.escape(value)}</dd>')
                 else:
                     extra = f" — {html.escape(str(metric.get('reason')))}" if metric.get("reason") else ""
-                    parts.append(f'<dd class="text-sm text-slate-500 mt-1">Unavailable{extra}</dd>')
+                    parts.append('<div class="source-metric source-metric-quiet">')
+                    parts.append(f'<dt class="source-metric-label">{metric_label}</dt>')
+                    parts.append(f'<dd class="source-unavailable">Unavailable{extra}</dd>')
                 parts.append("</div>")
             parts.append("</dl>")
-        items = source.get("items") or []
-        if items:
-            parts.append('<div class="max-h-80 overflow-y-auto divide-y divide-slate-700">')
+        if items and not quiet:
+            parts.append('<div class="source-items">')
             for item in items[:20]:
                 title = html.escape(str(item.get("title") or ""))
                 url = item.get("url")
                 if url:
-                    title = f'<a href="{html.escape(str(url), quote=True)}" class="hover:text-emerald-300">{title}</a>'
+                    title = f'<a href="{html.escape(str(url), quote=True)}">{title}</a>'
                 detail = html.escape(str(item.get("detail") or item.get("kind") or ""))
                 display = html.escape(str(item.get("display") or ""))
                 precision = html.escape(str(item.get("precision_label") or ""))
                 weekday = html.escape(str(item.get("weekday"))) if item.get("weekday") else ""
                 clock = f"{precision} · {weekday}" if weekday else precision
                 parts.append(
-                    '<div class="py-2 flex flex-wrap items-baseline justify-between gap-2"><div class="min-w-0 flex-1">'
-                    f'<div class="text-sm font-medium break-words">{title}</div>'
-                    f'<div class="text-xs text-slate-500 break-words">{detail}</div></div>'
-                    '<div>'
-                    f'<div class="font-mono text-sm text-emerald-300 break-words">{display}</div>'
-                    f'<div class="text-xs text-slate-500 break-words">{clock}</div></div></div>'
+                    '<div class="source-item"><div class="min-w-0">'
+                    f'<div class="source-item-title">{title}</div>'
+                    f'<div class="source-item-detail">{detail}</div></div>'
+                    '<div class="source-item-time">'
+                    f'<div class="calendar-time">{display}</div>'
+                    f'<div class="source-item-detail">{clock}</div></div></div>'
                 )
             parts.append("</div>")
-        tracks = source.get("tracks") or []
-        if tracks:
-            parts.append('<ol class="mt-3 space-y-1 text-sm">')
+        if tracks and not quiet:
+            parts.append('<ol class="source-tracks">')
             for track in tracks[:10]:
                 rank = track.get("rank")
                 prefix = f"{int(rank)}. " if isinstance(rank, int) and not isinstance(rank, bool) else ""
                 title = html.escape(str(track.get("name") or ""))
                 url = track.get("url")
                 if url:
-                    title = f'<a href="{html.escape(str(url), quote=True)}" class="hover:text-emerald-300">{title}</a>'
+                    title = f'<a href="{html.escape(str(url), quote=True)}">{title}</a>'
                 album = html.escape(str(track.get("album_name") or ""))
-                extra = f' <span class="text-slate-500">{album}</span>' if album else ""
-                parts.append(f'<li class="break-words"><span class="font-mono text-emerald-300">{prefix}</span>{title}{extra}</li>')
+                extra = f' <span class="source-item-detail">{album}</span>' if album else ""
+                parts.append(f'<li><span class="source-track-rank">{prefix}</span>{title}{extra}</li>')
             parts.append("</ol>")
-        elif source.get("status") == "ok" and not items:
-            parts.append('<p class="text-sm text-slate-400">This source returned profile data, but no dated rows.</p>')
+        elif source.get("status") == "ok" and not items and not quiet:
+            parts.append('<p class="source-card-reason">This source returned profile data, but no dated rows.</p>')
         for note in source.get("notices") or []:
-            parts.append(f'<p class="text-xs text-slate-500 mt-3">{html.escape(str(note))}</p>')
+            parts.append(f'<p class="source-note">{html.escape(str(note))}</p>')
         parts.append("</section>")
     parts.append("</div>")
     return "".join(parts)
@@ -1009,26 +1036,39 @@ async def _load_stored_artist(request: Request, key: str, redirect_suffix: str =
 
 
 @app.get("/artist/{key}/calendar", response_class=HTMLResponse)
-async def artist_calendar(request: Request, key: str, year: str | None = None):
-    """One stored release year and posting hours. No provider fan-out."""
+async def artist_calendar(request: Request, key: str, year: str | None = None, month: str | None = None):
+    """One stored release year, or one month when `?month=` is set. No provider fan-out."""
     loaded = await _resolve_stored_artist(request, key, "/calendar")
     if not isinstance(loaded, tuple):
         return loaded
     user, artist, db = loaded
-    selected = parse_calendar_period(year, request.query_params.get("from"))
+    artist_id = int(artist["id"])
+    # A present month param, even an invalid one, selects that month. Missing stays on the year page.
+    month_requested = "month" in request.query_params
+    if month_requested:
+        selected_year, selected_month = parse_calendar_month(month)
+        year_arg: int | None = selected_year
+    else:
+        selected_year, selected_month = None, None
+        year_arg = parse_calendar_period(year, request.query_params.get("from"))
     try:
-        history = await asyncio.wait_for(load_calendar_page(db, artist, selected), GROWTH_READ_TIMEOUT_S)
+        history = await asyncio.wait_for(load_calendar_page(db, artist, year_arg), GROWTH_READ_TIMEOUT_S)
     except Exception:
         history = empty_history("Data temporarily unavailable. Stored history could not be read on this request.")
-        history["artist_id"] = int(artist["id"])
+        history["artist_id"] = artist_id
+    calendar = history.get("calendar") if isinstance(history.get("calendar"), dict) else empty_release_calendar()
+    if month_requested and selected_year is not None and selected_month is not None:
+        history["calendar"] = focus_release_month(calendar, selected_year, selected_month, artist_id)
+    else:
+        history["calendar"] = ensure_month_nav(calendar, artist_id)
     return templates.TemplateResponse(
         request,
         "calendar.html",
         {
             "user": user,
             "title": artist.get("name") or "Artist",
-            "artist_id": int(artist["id"]),
-            "subtitle": "Stored dates only, one year at a time. This page does not fetch providers.",
+            "artist_id": artist_id,
+            "subtitle": "Stored dates only. Open a month, or a year. This page does not fetch providers.",
             "history": history,
         },
     )

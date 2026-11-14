@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from calendar import monthrange
 from datetime import datetime, timezone
 
 WEEKDAYS = [
@@ -609,6 +610,93 @@ def calendar_navigation(years: list[int], selected: int | None, artist_id: int) 
     }
 
 
+_MONTH_RE = re.compile(r"\A(\d{4})-(\d{2})\Z")
+
+
+def parse_calendar_month(value: str | None = None, now: datetime | None = None) -> tuple[int, int]:
+    """`YYYY-MM`, or the current UTC month when the value is missing or invalid.
+
+    A day, a bare year, or a month outside 01–12 is not accepted. Nothing here
+    raises, and a partial date is not upgraded into a day.
+    """
+    clock = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    else:
+        clock = clock.astimezone(timezone.utc)
+    fallback = (clock.year, clock.month)
+    text = (value or "").strip()
+    match = _MONTH_RE.fullmatch(text)
+    if match is None:
+        return fallback
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if 1000 <= year <= 9999 and 1 <= month <= 12:
+        return year, month
+    return fallback
+
+
+def shift_calendar_month(year: int, month: int, delta: int) -> tuple[int, int] | None:
+    """Move by whole months. December rolls into January of the next year."""
+    if isinstance(year, bool) or isinstance(month, bool) or isinstance(delta, bool):
+        return None
+    if not isinstance(year, int) or not isinstance(month, int) or not isinstance(delta, int):
+        return None
+    if not 1000 <= year <= 9999 or not 1 <= month <= 12:
+        return None
+    index = year * 12 + (month - 1) + delta
+    shifted_year, shifted_month = divmod(index, 12)
+    shifted_month += 1
+    if not 1000 <= shifted_year <= 9999 or not 1 <= shifted_month <= 12:
+        return None
+    return shifted_year, shifted_month
+
+
+def calendar_month_links(
+    year: int,
+    month: int,
+    artist_id: int,
+    today: tuple[int, int] | None = None,
+) -> dict:
+    """Prev, next, and today. Links are `?month=YYYY-MM`. The clock stays UTC."""
+    try:
+        artist_key = int(artist_id)
+    except (TypeError, ValueError):
+        artist_key = 0
+    current = today if today is not None else parse_calendar_month(None)
+    if (
+        not isinstance(current, tuple)
+        or len(current) != 2
+        or isinstance(current[0], bool)
+        or isinstance(current[1], bool)
+        or not isinstance(current[0], int)
+        or not isinstance(current[1], int)
+    ):
+        current = parse_calendar_month(None)
+    previous = shift_calendar_month(year, month, -1)
+    following = shift_calendar_month(year, month, 1)
+
+    def href(pair: tuple[int, int] | None) -> str | None:
+        if pair is None:
+            return None
+        return f"/artist/{artist_key}/calendar?month={pair[0]:04d}-{pair[1]:02d}"
+
+    return {
+        "year": year,
+        "month": month,
+        "key": f"{year:04d}-{month:02d}",
+        "label": f"{MONTH_NAMES[month]} {year}",
+        "timezone": "UTC",
+        "prev_href": href(previous),
+        "next_href": href(following),
+        "today_href": href((current[0], current[1])),
+        "prev_label": "< Prev",
+        "next_label": "Next >",
+        "today_label": "Today",
+        "is_current": (year, month) == (current[0], current[1]),
+    }
+
+
 def _calendar_place(raw: str, precision: str):
     """A day placement, a month mark, or a year. Never a guessed day."""
     if precision == "time":
@@ -637,6 +725,7 @@ def _calendar_item(row: dict, precision: str, moment: datetime | None) -> dict:
         "precision": precision,
         "precision_label": PRECISION_LABELS.get(precision, precision or "Unknown"),
         "clock": moment.strftime("%H:%M UTC") if precision == "time" and moment is not None else "",
+        "timestamp": "",
     }
     mbid = str(row.get("mbid") or "").strip()
     if mbid:
@@ -644,44 +733,156 @@ def _calendar_item(row: dict, precision: str, moment: datetime | None) -> dict:
     return item
 
 
+def _release_timestamp(precision: str, moment: datetime | None, place: tuple) -> str:
+    """The published UTC timestamp. A missing clock is left off, not filled with 00:00."""
+    if precision == "time" and moment is not None:
+        return moment.strftime("%Y-%m-%d %H:%M UTC")
+    if place[0] == "day":
+        return f"{place[1]:04d}-{place[2]:02d}-{place[3]:02d}"
+    if place[0] == "month":
+        return f"{place[1]:04d}-{place[2]:02d}"
+    if place[0] == "year":
+        return f"{place[1]:04d}"
+    return ""
+
+
+def _datetime_attr(item: dict) -> str:
+    stamp = str(item.get("timestamp") or "")
+    if len(stamp) >= 16 and stamp.endswith(" UTC"):
+        date, clock = stamp[:-4].split(" ", 1)
+        if len(date) == 10 and len(clock) == 5:
+            return f"{date}T{clock}:00Z"
+    if len(stamp) == 10:
+        return stamp
+    return ""
+
+
+def _release_html(item: dict) -> str:
+    """One release. The time line is the exact UTC timestamp when a clock was published."""
+    meta_bits = [str(item.get("source_label") or ""), str(item.get("precision_label") or "")]
+    meta = " · ".join(bit for bit in meta_bits if bit)
+    name = html.escape(str(item.get("title") or ""))
+    mbid = str(item.get("mbid") or "")
+    if mbid:
+        href = "https://musicbrainz.org/release-group/" + html.escape(mbid, quote=True)
+        inner = f'<a href="{href}">{name}</a>'
+    else:
+        inner = name
+    when = str(item.get("timestamp") or item.get("clock") or "")
+    time_html = ""
+    if when:
+        attr = _datetime_attr(item)
+        attr_html = f' datetime="{html.escape(attr, quote=True)}"' if attr else ""
+        time_html = f'<time class="calendar-time"{attr_html}>{html.escape(when)}</time>'
+    return (
+        f'<div class="calendar-release" title="{html.escape(meta, quote=True)}">'
+        f'<div class="calendar-release-title">{inner}</div>'
+        f"{time_html}"
+        f'<div class="calendar-release-meta">{html.escape(meta)}</div>'
+        "</div>"
+    )
+
+
+def _month_cells(year: int, month: int, days: dict) -> list[dict]:
+    try:
+        length = monthrange(year, month)[1]
+        first = datetime(year, month, 1, tzinfo=timezone.utc)
+    except (OverflowError, ValueError):
+        return []
+    cells = [
+        {"in_month": False, "day": None, "weekday": "", "items": [], "more": 0}
+        for _ in range(first.weekday())
+    ]
+    for day in range(1, length + 1):
+        items = sorted(days.get(day) or [], key=lambda item: (item["source"], item["title"].casefold()))
+        shown = items[:CALENDAR_CELL_CAP]
+        moment = datetime(year, month, day, tzinfo=timezone.utc)
+        cells.append(
+            {
+                "in_month": True,
+                "day": day,
+                "weekday": WEEKDAY_SHORT[moment.weekday()],
+                "items": shown,
+                "more": max(0, len(items) - len(shown)),
+            }
+        )
+    while len(cells) % 7:
+        cells.append({"in_month": False, "day": None, "weekday": "", "items": [], "more": 0})
+    return cells
+
+
+def _month_row(
+    year: int,
+    month: int,
+    days: dict | None = None,
+    month_only: list | None = None,
+    *,
+    force_grid: bool = False,
+) -> dict:
+    day_map = days or {}
+    show_grid = force_grid or bool(day_map)
+    cells = _month_cells(year, month, day_map) if show_grid else []
+    row = {
+        "key": f"{year:04d}-{month:02d}",
+        "label": f"{MONTH_NAMES[month]} {year}",
+        "show_grid": show_grid,
+        "weekdays": WEEKDAY_SHORT,
+        "cells": cells,
+        "month_only": list(month_only or []),
+    }
+    # The artist page used to walk every cell in Jinja. That loop, mostly
+    # empty days, was the bulk of the HTML and the render CPU.
+    row["grid_html"] = _month_grid_html(row) if show_grid else ""
+    return row
+
+
 def _month_grid_html(month: dict) -> str:
-    """One month grid as a string. Titles are escaped. The template does not loop the cells."""
-    parts = ['<div class="calendar-grid grid grid-cols-7 gap-1 text-left text-sm">']
-    for label in month.get("weekdays") or []:
-        parts.append(f'<div class="text-slate-500 py-1 text-center">{html.escape(str(label))}</div>')
+    """Desktop month grid plus a mobile agenda. Titles are escaped."""
+    label = html.escape(str(month.get("label") or "Release month"))
+    parts = [f'<div class="calendar-month"><div class="calendar-grid" aria-label="{label}">']
+    for weekday in month.get("weekdays") or []:
+        parts.append(f'<div class="calendar-dow">{html.escape(str(weekday))}</div>')
+    agenda = [f'<ol class="calendar-agenda" aria-label="{label} agenda">']
+    agenda_days = 0
+    key = str(month.get("key") or "")
     for cell in month.get("cells") or []:
         if not cell.get("in_month"):
-            parts.append('<div class="min-h-16 min-w-0 rounded-md p-1"></div>')
+            parts.append('<div class="calendar-day calendar-day-out" aria-hidden="true"></div>')
             continue
         items = cell.get("items") or []
-        if items:
-            klass = "min-h-16 min-w-0 rounded-md p-1 border border-emerald-500/60 bg-slate-800"
-            day_class = "text-emerald-300 font-medium"
-        else:
-            klass = "min-h-16 min-w-0 rounded-md p-1 border border-slate-700"
-            day_class = "text-slate-500"
-        parts.append(f'<div class="{klass}"><div class="{day_class}">{int(cell["day"])}</div>')
+        day = int(cell["day"])
+        klass = "calendar-day calendar-day-has" if items else "calendar-day calendar-day-empty"
+        parts.append(f'<div class="{klass}"><div class="calendar-day-num">{day}</div>')
         for item in items:
-            bits = [str(item.get("source_label") or "")]
-            if item.get("clock"):
-                bits.append(str(item["clock"]))
-            if item.get("precision_label"):
-                bits.append(str(item["precision_label"]))
-            title = html.escape(" · ".join(bit for bit in bits if bit), quote=True)
-            name = html.escape(str(item.get("title") or ""))
-            mbid = str(item.get("mbid") or "")
-            if mbid:
-                href = "https://musicbrainz.org/release-group/" + html.escape(mbid, quote=True)
-                inner = f'<a href="{href}" class="hover:text-emerald-300">{name}</a>'
-            else:
-                inner = name
-            parts.append(f'<div class="break-words text-slate-300" title="{title}">{inner}</div>')
-            if item.get("clock"):
-                parts.append(f'<div class="text-slate-400">{html.escape(str(item["clock"]))}</div>')
-        more = cell.get("more") or 0
+            parts.append(_release_html(item))
+        more = int(cell.get("more") or 0)
         if more:
-            parts.append(f'<div class="text-slate-500">+{int(more)}</div>')
+            parts.append(f'<div class="calendar-more">+{more}</div>')
         parts.append("</div>")
+        if not items:
+            continue
+        agenda_days += 1
+        weekday = html.escape(str(cell.get("weekday") or ""))
+        iso = f"{key}-{day:02d}" if len(key) == 7 else ""
+        iso_html = f'<time class="calendar-time" datetime="{iso}">{iso}</time>' if iso else ""
+        agenda.append('<li class="calendar-agenda-day">')
+        agenda.append(
+            f'<div class="calendar-agenda-date"><span class="calendar-agenda-weekday">{weekday}</span>'
+            f'<span class="calendar-agenda-daynum">{day}</span>{iso_html}</div>'
+        )
+        agenda.append('<div class="calendar-agenda-releases">')
+        for item in items:
+            agenda.append(_release_html(item))
+        if more:
+            agenda.append(f'<div class="calendar-more">+{more}</div>')
+        agenda.append("</div></li>")
+    parts.append("</div>")
+    if agenda_days == 0:
+        agenda.append(
+            '<li class="calendar-agenda-empty">No release with a published day this month. No time was added.</li>'
+        )
+    agenda.append("</ol>")
+    parts.extend(agenda)
     parts.append("</div>")
     return "".join(parts)
 
@@ -731,6 +932,7 @@ def build_release_calendar(
         seen.add(dedupe)
         moment = place[4] if place[0] == "day" else None
         item = _calendar_item(row, precision, moment)
+        item["timestamp"] = _release_timestamp(precision, moment, place)
         if place[0] == "year":
             item["year"] = f"{place[1]:04d}"
             year_only.append(item)
@@ -750,45 +952,10 @@ def build_release_calendar(
         shown_keys = month_keys[:cap]
         omitted = max(0, len(month_keys) - cap)
     months = []
-    for year, month in shown_keys:
-        bucket = grouped[(year, month)]
-        days = bucket["days"]
-        show_grid = bool(days)
-        cells = []
-        if show_grid:
-            first = datetime(year, month, 1, tzinfo=timezone.utc)
-            if month == 12:
-                nxt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-            else:
-                nxt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-            count = (nxt - first).days
-            cells.extend({"in_month": False, "day": None, "items": [], "more": 0} for _ in range(first.weekday()))
-            for day in range(1, count + 1):
-                items = sorted(days.get(day) or [], key=lambda item: (item["source"], item["title"].casefold()))
-                shown = items[:CALENDAR_CELL_CAP]
-                cells.append(
-                    {
-                        "in_month": True,
-                        "day": day,
-                        "items": shown,
-                        "more": max(0, len(items) - len(shown)),
-                    }
-                )
-            while len(cells) % 7:
-                cells.append({"in_month": False, "day": None, "items": [], "more": 0})
+    for year_number, month_number in shown_keys:
+        bucket = grouped[(year_number, month_number)]
         month_only = sorted(bucket["month_only"], key=lambda item: item["title"].casefold())
-        month_row = {
-            "key": f"{year:04d}-{month:02d}",
-            "label": f"{MONTH_NAMES[month]} {year}",
-            "show_grid": show_grid,
-            "weekdays": WEEKDAY_SHORT,
-            "cells": cells,
-            "month_only": month_only,
-        }
-        # The artist page used to walk every cell in Jinja. That loop, mostly
-        # empty days, was the bulk of the HTML and the render CPU.
-        month_row["grid_html"] = _month_grid_html(month_row) if show_grid else ""
-        months.append(month_row)
+        months.append(_month_row(year_number, month_number, bucket["days"], month_only))
     year_only.sort(key=lambda item: item["title"].casefold())
     year_only.sort(key=lambda item: item["year"], reverse=True)
     available = bool(months or year_only)
@@ -823,6 +990,49 @@ def empty_release_calendar(reason: str | None = None) -> dict:
     if reason:
         result["reason"] = reason
     return result
+
+
+def ensure_month_nav(calendar: dict, artist_id: int, today: tuple[int, int] | None = None) -> dict:
+    """Month links for the year page. The selected month is the current UTC month."""
+    if not isinstance(calendar, dict):
+        return calendar
+    current = today if today is not None else parse_calendar_month(None)
+    calendar["month_nav"] = calendar_month_links(current[0], current[1], artist_id, today=current)
+    return calendar
+
+
+def focus_release_month(
+    calendar: dict,
+    year: int,
+    month: int,
+    artist_id: int,
+    today: tuple[int, int] | None = None,
+) -> dict:
+    """Show one month from a year that was already loaded. No extra reads and no invented days."""
+    if not isinstance(calendar, dict):
+        calendar = empty_release_calendar()
+    current = today if today is not None else parse_calendar_month(None)
+    nav = calendar_month_links(year, month, artist_id, today=current)
+    calendar["month_nav"] = nav
+    calendar["focused_month"] = nav["key"]
+    reason = str(calendar.get("reason") or "")
+    if "temporarily unavailable" in reason.lower():
+        return calendar
+    found = next((item for item in calendar.get("months") or [] if isinstance(item, dict) and item.get("key") == nav["key"]), None)
+    if found is None or not found.get("show_grid"):
+        month_only = list(found.get("month_only") or []) if isinstance(found, dict) else []
+        found = _month_row(year, month, None, month_only, force_grid=True)
+    calendar["months"] = [found]
+    has_days = any(cell.get("items") for cell in found.get("cells") or [])
+    calendar["month_empty"] = not has_days and not found.get("month_only")
+    calendar["available"] = True
+    calendar["empty_period"] = False
+    if calendar["month_empty"] and not calendar.get("year_only"):
+        calendar["reason"] = (
+            f"No stored MusicBrainz, Apple, Spotify, or Deezer release falls in {nav['label']}. "
+            "A month or a year is not given a day."
+        )
+    return calendar
 
 
 def scrub(text: str, secrets: list[str]) -> str:
