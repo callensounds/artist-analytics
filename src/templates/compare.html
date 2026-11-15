@@ -1,0 +1,277 @@
+{% extends "base.html" %}
+{% block title %}Compare — Average Analytics{% endblock %}
+
+{% block head %}
+<style>
+    .compare-table { display: none; }
+    .compare-table th, .compare-table td { padding: 0.45rem 0.5rem; vertical-align: top; text-align: left; }
+    .compare-cards, .compare-stack { display: grid; gap: 0.75rem; }
+    .compare-hours, .compare-days { display: flex; align-items: flex-end; gap: 2px; height: 4.5rem; }
+    .compare-hours > div, .compare-days > div { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; min-width: 0; }
+    .compare-hours > div > span, .compare-days > div > span { display: block; width: 100%; border-radius: 2px 2px 0 0; }
+    .compare-day-label { display: block; margin-top: 0.2rem; text-align: center; font-size: 0.65rem; color: #c5d0de; }
+    .compare-chart svg { width: 100%; height: auto; display: block; }
+    .compare-legend { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; margin-top: 0.75rem; }
+    .compare-swatch { width: 0.7rem; height: 0.7rem; border-radius: 999px; display: inline-block; margin-right: 0.35rem; }
+    @media (min-width: 768px) {
+        .compare-table { display: block; }
+        .compare-cards { display: none; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+    <h1 class="text-2xl sm:text-3xl font-bold">Compare</h1>
+    <p class="text-slate-400 text-sm mt-1">{{ note }}</p>
+</div>
+
+{% if read_error %}
+<p class="text-slate-400 text-sm mb-4">{{ read_error }}</p>
+{% endif %}
+{% if missing_note %}
+<p class="text-slate-400 text-sm mb-4">{{ missing_note }}</p>
+{% endif %}
+
+{% if artists %}
+<ul class="flex flex-wrap gap-2 mb-4">
+    {% for artist in artists %}
+    <li class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1 text-sm flex items-center gap-2">
+        <span class="compare-swatch" style="background: {{ artist.color }}"></span>
+        <a href="/artist/{{ artist.id }}" class="font-semibold hover:text-emerald-300">{{ artist.name }}</a>
+        <a href="{{ artist.remove_href }}" class="text-slate-400 hover:text-white">Remove</a>
+    </li>
+    {% endfor %}
+</ul>
+{% endif %}
+
+{% if ready %}
+<p class="mb-4 text-sm"><a href="{{ csv_href }}" class="text-emerald-400 hover:underline">Download CSV</a></p>
+<p class="text-xs text-slate-500 mb-2">{{ delta_note }}</p>
+<p class="text-xs text-slate-500 mb-4">{{ release_note }} {{ score_note }}</p>
+
+<div class="compare-table data-scroll mb-8">
+    <p class="data-scroll-hint">Swipe sideways to see every artist.</p>
+    <table>
+        <thead>
+            <tr>
+                <th class="text-left p-2 text-slate-400">Metric</th>
+                {% for artist in artists %}
+                <th class="text-left p-2" colspan="3"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></th>
+                {% endfor %}
+            </tr>
+            <tr>
+                <th></th>
+                {% for artist in artists %}
+                <th class="text-left p-2 text-xs text-slate-500">Latest</th>
+                <th class="text-left p-2 text-xs text-slate-500">7d</th>
+                <th class="text-left p-2 text-xs text-slate-500">28d</th>
+                {% endfor %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr class="border-t border-slate-700">
+                <th class="text-left p-2 font-semibold">{{ row.label }}</th>
+                {% for cell in row.cells %}
+                <td class="p-2 align-top" data-metric="{{ row.key }}" data-artist="{{ cell.artist_id }}" data-value="{{ cell.value_text }}" data-at="{{ cell.captured_at }}">
+                    {% if cell.value_text == "unavailable" %}
+                    <span class="text-slate-500">unavailable</span>
+                    {% else %}
+                    <span class="font-mono text-emerald-300">{{ cell.value_text }}</span>{% if cell.detail %} <span class="text-slate-400">· {{ cell.detail }}</span>{% endif %}
+                    {% if cell.captured_at %}
+                    <span class="block text-xs text-slate-500">{{ cell.captured_at }}</span>
+                    {% else %}
+                    <span class="block text-xs text-slate-500">unavailable</span>
+                    {% endif %}
+                    {% endif %}
+                </td>
+                <td class="p-2 align-top text-sm" data-metric="{{ row.key }}" data-artist="{{ cell.artist_id }}" data-delta="7" data-value="{{ cell.delta_7 }}">
+                    {{ cell.delta_7 }}
+                    {% if cell.delta_7_status == "ok" %}
+                    <span class="block text-xs text-slate-500">{{ cell.delta_7_from }} → {{ cell.delta_7_to }}</span>
+                    {% endif %}
+                </td>
+                <td class="p-2 align-top text-sm" data-metric="{{ row.key }}" data-artist="{{ cell.artist_id }}" data-delta="28" data-value="{{ cell.delta_28 }}">
+                    {{ cell.delta_28 }}
+                    {% if cell.delta_28_status == "ok" %}
+                    <span class="block text-xs text-slate-500">{{ cell.delta_28_from }} → {{ cell.delta_28_to }}</span>
+                    {% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="compare-cards mb-8">
+    {% for card in cards %}
+    <article class="bg-slate-800 border border-slate-700 rounded-2xl p-4">
+        <h2 class="text-lg font-semibold mb-2"><a href="/artist/{{ card.artist.id }}" class="hover:text-emerald-300">{{ card.artist.name }}</a></h2>
+        {% for row in card.rows %}
+        <div class="border-t border-slate-700 py-2">
+            <p class="text-xs text-slate-500">{{ row.label }}</p>
+            <p data-metric="{{ row.key }}" data-artist="{{ row.cell.artist_id }}" data-value="{{ row.cell.value_text }}" data-at="{{ row.cell.captured_at }}">
+                {% if row.cell.value_text == "unavailable" %}
+                <span class="text-slate-500">unavailable</span>
+                {% else %}
+                <span class="font-mono text-emerald-300">{{ row.cell.value_text }}</span>{% if row.cell.detail %} <span class="text-slate-400">· {{ row.cell.detail }}</span>{% endif %}
+                {% if row.cell.captured_at %}
+                <span class="block text-xs text-slate-500">{{ row.cell.captured_at }}</span>
+                {% else %}
+                <span class="block text-xs text-slate-500">unavailable</span>
+                {% endif %}
+                {% endif %}
+            </p>
+            <p class="text-sm text-slate-400" data-metric="{{ row.key }}" data-artist="{{ row.cell.artist_id }}" data-delta="7" data-value="{{ row.cell.delta_7 }}">7d: {{ row.cell.delta_7 }}</p>
+            <p class="text-sm text-slate-400" data-metric="{{ row.key }}" data-artist="{{ row.cell.artist_id }}" data-delta="28" data-value="{{ row.cell.delta_28 }}">28d: {{ row.cell.delta_28 }}</p>
+        </div>
+        {% endfor %}
+    </article>
+    {% endfor %}
+</div>
+
+<section class="bg-slate-800 border border-slate-700 rounded-2xl p-4 mb-6">
+    <h2 class="text-lg font-semibold mb-2">Growth</h2>
+    <form method="get" action="/compare" class="flex flex-wrap gap-2 mb-3">
+        {% for field in form_slots %}
+        <input type="hidden" name="{{ field.slot }}" value="{{ field.value }}">
+        {% endfor %}
+        <label class="sr-only" for="metric">Metric</label>
+        <select id="metric" name="metric" class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-2" onchange="this.form.submit()">
+            {% for option in metric_options %}
+            <option value="{{ option.key }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Update chart</button>
+    </form>
+    <p class="text-xs text-slate-500 mb-3">{{ chart_note }}</p>
+    {% if chart_svg %}
+    <div class="compare-chart">{{ chart_svg|safe }}</div>
+    {% endif %}
+    {% if chart_series %}
+    <ul class="compare-legend text-sm">
+        {% for item in chart_series %}
+        <li><span class="compare-swatch" style="background: {{ item.color }}"></span>{{ item.name }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+</section>
+
+<section class="mb-8">
+    <h2 class="text-lg font-semibold mb-1">Release and post timing</h2>
+    <p class="text-xs text-slate-500 mb-1">{{ hour_note }}</p>
+    <p class="text-xs text-slate-500 mb-4">{{ weekday_note }}</p>
+    <div class="compare-stack">
+        {% for artist in timing %}
+        <article class="bg-slate-800 border border-slate-700 rounded-2xl p-4" data-timing="{{ artist.id }}" data-hour-total="{{ artist.hour_total }}" data-weekday-total="{{ artist.weekday_total }}">
+            <h3 class="font-semibold mb-2">{{ artist.name }}</h3>
+            {% if artist.hour_bars %}
+            <p class="text-xs text-slate-500 mb-1">Hour of day, UTC{% if artist.hour_summary %} · {{ artist.hour_summary }}{% endif %}</p>
+            <div class="compare-hours" role="img" aria-label="UTC hour counts for {{ artist.name }}">
+                {% for bar in artist.hour_bars %}
+                <div data-artist="{{ artist.id }}" data-hour="{{ bar.hour }}" data-count="{{ bar.count }}" title="{{ bar.label }}: {{ bar.count }}">
+                    <span style="height: {{ bar.height }}%; background: {{ artist.color }}"></span>
+                </div>
+                {% endfor %}
+            </div>
+            {% elif artist.hour_reason %}
+            <p class="text-sm text-slate-400 mb-2">{{ artist.hour_reason }}</p>
+            {% endif %}
+            {% if artist.weekday_bars %}
+            <p class="text-xs text-slate-500 mt-4 mb-1">Weekday{% if artist.weekday_summary %} · {{ artist.weekday_summary }}{% endif %}</p>
+            <div class="compare-days" role="img" aria-label="Weekday counts for {{ artist.name }}">
+                {% for bar in artist.weekday_bars %}
+                <div data-artist="{{ artist.id }}" data-weekday="{{ bar.index }}" data-count="{{ bar.count }}" title="{{ bar.label }}: {{ bar.count }}">
+                    <span style="height: {{ bar.height }}%; background: {{ artist.color }}"></span>
+                </div>
+                {% endfor %}
+            </div>
+            <div class="flex gap-0">
+                {% for bar in artist.weekday_bars %}
+                <span class="compare-day-label" style="flex: 1 1 0">{{ bar.short }}</span>
+                {% endfor %}
+            </div>
+            {% elif artist.weekday_reason %}
+            <p class="text-sm text-slate-400">{{ artist.weekday_reason }}</p>
+            {% endif %}
+        </article>
+        {% endfor %}
+    </div>
+</section>
+{% elif pick_note %}
+<p class="text-slate-400 text-sm mb-4">{{ pick_note }}</p>
+{% endif %}
+
+{% if picker.show %}
+<section class="mb-8">
+    <h2 class="text-lg font-semibold mb-2">{% if picker.mode == "full" %}Pick artists{% else %}Add an artist{% endif %}</h2>
+    <form method="get" action="/compare" class="flex gap-2 w-full max-w-xl mb-4">
+        {% for field in form_slots %}
+        <input type="hidden" name="{{ field.slot }}" value="{{ field.value }}">
+        {% endfor %}
+        {% if form_metric %}
+        <input type="hidden" name="metric" value="{{ form_metric }}">
+        {% endif %}
+        <label class="sr-only" for="q">Artist</label>
+        <input id="q" name="q" value="{{ picker.query }}" maxlength="120"
+               class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2"
+               placeholder="Search stored artists">
+        <button type="submit" class="shrink-0 bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg font-semibold">Search</button>
+    </form>
+    {% if picker.note %}
+    <p class="text-slate-400 text-sm mb-4">{{ picker.note }}</p>
+    {% endif %}
+    {% if picker.watching %}
+    <h3 class="text-sm font-semibold mb-2">Watchlist</h3>
+    <ul class="space-y-3 mb-4">
+        {% for item in picker.watching %}
+        <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-3">
+            <a href="/artist/{{ item.id }}" class="font-semibold hover:text-emerald-300">{{ item.name }}</a>
+            {% if item.added %}
+            <span class="text-sm text-slate-400">Added</span>
+            {% else %}
+            <a href="{{ item.href }}" class="text-sm text-emerald-400 hover:underline">Add</a>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    {% if picker.query %}
+        {% if picker.matches %}
+        <ul class="space-y-3">
+            {% for item in picker.matches %}
+            <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-3">
+                <a href="/artist/{{ item.id }}" class="font-semibold hover:text-emerald-300">{{ item.name }}</a>
+                {% if item.added %}
+                <span class="text-sm text-slate-400">Added</span>
+                {% else %}
+                <a href="{{ item.href }}" class="text-sm text-emerald-400 hover:underline">Add</a>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-slate-400 text-sm">No stored artist matches that name.</p>
+        {% endif %}
+    {% elif picker.tracked %}
+    <h3 class="text-sm font-semibold mb-2">Tracked artists</h3>
+    <ul class="space-y-3">
+        {% for item in picker.tracked %}
+        <li class="bg-slate-800 rounded-2xl p-4 border border-slate-700 flex flex-wrap items-center justify-between gap-3">
+            <a href="/artist/{{ item.id }}" class="font-semibold hover:text-emerald-300">{{ item.name }}</a>
+            {% if item.added %}
+            <span class="text-sm text-slate-400">Added</span>
+            {% else %}
+            <a href="{{ item.href }}" class="text-sm text-emerald-400 hover:underline">Add</a>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% elif picker.mode == "full" %}
+    <p class="text-slate-400 text-sm">Type a name to search artists the crawler has already stored.</p>
+    {% endif %}
+</section>
+{% endif %}
+{% endblock %}

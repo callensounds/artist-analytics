@@ -64,6 +64,7 @@ from http_client import HttpClient
 from passwords import hash_password, verify_password
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware, env_get
+from compare import build_compare_view, empty_compare_view, render_compare_csv
 from scores import SCORE_FORMULA, SCORE_RANK_EMPTY, rank_scores
 
 try:
@@ -827,6 +828,93 @@ async def scores_page(request: Request):
         "scores.html",
         {"user": user, "scores": ranked, "reason": reason, "formula": SCORE_FORMULA},
     )
+
+
+def _compare_slots(a: str, b: str, c: str, d: str) -> list[str]:
+    return [a or "", b or "", c or "", d or ""]
+
+
+@app.get("/compare.csv")
+async def compare_csv(request: Request, a: str = "", b: str = "", c: str = "", d: str = ""):
+    """The comparison table as CSV. Stored rows only. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is None:
+        return Response(
+            "Data temporarily unavailable. Stored history could not be read on this request.\n",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+    try:
+        view = await asyncio.wait_for(
+            build_compare_view(
+                db,
+                slots=_compare_slots(a, b, c, d),
+                user_id=int(user["id"]) if request.session.get("auth") == "d1" else None,
+                redirect=False,
+            ),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("compare csv", exc)
+        return Response(
+            "Data temporarily unavailable. Stored history could not be read on this request.\n",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+    if not view.get("ready"):
+        return Response(
+            "Pick at least two tracked artists.\n",
+            status_code=404,
+            media_type="text/plain; charset=utf-8",
+        )
+    return Response(
+        content=render_compare_csv(view["artists"], view["rows"]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="compare.csv"'},
+    )
+
+
+@app.get("/compare", response_class=HTMLResponse)
+async def compare_page(
+    request: Request,
+    a: str = "",
+    b: str = "",
+    c: str = "",
+    d: str = "",
+    metric: str = "",
+    q: str = "",
+):
+    """Two to four stored artists, side by side. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is None:
+        return templates.TemplateResponse(
+            request,
+            "compare.html",
+            {"user": user, **empty_compare_view("Comparison reads stored crawl data when D1 is bound. This page does not call providers.")},
+        )
+    try:
+        view = await asyncio.wait_for(
+            build_compare_view(
+                db,
+                slots=_compare_slots(a, b, c, d),
+                metric=metric,
+                query=q,
+                user_id=int(user["id"]) if request.session.get("auth") == "d1" else None,
+            ),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("compare", exc)
+        view = empty_compare_view("Data temporarily unavailable. Stored history could not be read on this request.")
+    if view.get("redirect"):
+        return RedirectResponse(view["redirect"], status_code=303)
+    return templates.TemplateResponse(request, "compare.html", {"user": user, **view})
 
 
 @app.get("/artist/{key}/export.csv")
