@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% block title %}Timing — Average Analytics{% endblock %}
+
+{% block head %}
+<style>
+    .timing-counts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 1rem; }
+    .timing-count { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.55rem 0.75rem; min-width: 6.5rem; }
+    .timing-count b { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #6ee7b7; font-size: 1.15rem; }
+    .timing-count span { color: #c5d0de; font-size: 0.72rem; }
+    .timing-card { background: #1e293b; border: 1px solid #334155; border-radius: 1rem; padding: 1rem; margin: 0 0 1rem; min-width: 0; }
+    .timing-heat { min-width: 42rem; }
+    .timing-heat-row { display: grid; grid-template-columns: 2.6rem repeat(24, minmax(1.35rem, 1fr)); gap: 2px; align-items: stretch; margin-bottom: 2px; }
+    .timing-heat-day, .timing-heat-hour { color: #c5d0de; font-size: 0.65rem; line-height: 1.5rem; }
+    .timing-heat-hour { text-align: center; }
+    .timing-heat-cell { display: flex; align-items: center; justify-content: center; min-height: 1.5rem; border-radius: 2px; font-size: 0.62rem; color: #d1fae5; background: rgba(110, 231, 183, calc(var(--level) * 0.22)); box-shadow: inset 0 0 0 1px #334155; }
+    .timing-heat-cell.is-hot { color: #042f24; font-weight: 700; }
+    .timing-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 0.35rem; }
+    .timing-day { background: #0f172a; border-radius: 0.6rem; padding: 0.45rem 0.2rem; text-align: center; min-width: 0; }
+    .timing-day-bar { display: block; width: 100%; margin-top: 0.35rem; border-radius: 2px 2px 0 0; background: #6ee7b7; }
+    .timing-day-count { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #6ee7b7; }
+    .timing-links { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .timing-cards { display: grid; gap: 0.75rem; }
+    .timing-table { display: none; }
+    .timing-stamp { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; color: #6ee7b7; overflow-wrap: anywhere; }
+    @media (min-width: 768px) {
+        .timing-table { display: block; }
+        .timing-cards { display: none; }
+    }
+    @media (max-width: 639px) {
+        .timing-days { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .timing-heat-cell { font-size: 0.55rem; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mb-6" data-timing-scope="{{ scope }}" data-timing-days="{{ days }}" data-timing-kind="{{ kind }}" data-timing-exact="{{ counts.exact }}" data-timing-coarse="{{ counts.coarse }}" data-timing-empty="{{ 'yes' if empty else 'no' }}">
+    <h1 class="text-2xl sm:text-3xl font-bold">Timing</h1>
+    <p class="text-slate-400 text-sm mt-1">{{ page_note }}</p>
+    {% if source_note %}
+    <p class="text-slate-300 text-sm mt-2">{{ source_note }}</p>
+    {% endif %}
+</div>
+
+{% if read_error %}
+<p class="text-slate-400 text-sm mb-4">{{ read_error }}</p>
+{% endif %}
+
+<form method="get" action="/timing" class="flex flex-wrap items-end gap-2 mb-4">
+    <label class="text-sm text-slate-400">Scope
+        <select name="scope" class="block mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100">
+            {% for option in scope_options %}
+            <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label class="text-sm text-slate-400">Window
+        <select name="days" class="block mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100">
+            {% for option in days_options %}
+            <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label class="text-sm text-slate-400">Kind
+        <select name="kind" class="block mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100">
+            {% for option in kind_options %}
+            <option value="{{ option.value }}" {% if option.selected %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <button type="submit" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-lg text-sm">Update</button>
+    {% if csv_href %}
+    <span class="timing-links text-sm">
+        <a href="{{ csv_href }}" class="text-emerald-300 hover:underline">CSV</a>
+        <a href="{{ json_href }}" class="text-emerald-300 hover:underline">JSON</a>
+    </span>
+    {% endif %}
+</form>
+
+{% for note in cap_notes %}
+<p class="text-slate-300 text-sm mb-2">{{ note }}</p>
+{% endfor %}
+
+{% if empty_reason and empty_reason != source_note %}
+<p class="text-slate-300 text-sm mb-4">{{ empty_reason }}</p>
+{% endif %}
+
+{% if not failed and artists %}
+<div class="timing-counts">
+    <div class="timing-count"><b>{{ counts.artists }}</b><span>Artists</span></div>
+    <div class="timing-count"><b>{{ counts.exact }}</b><span>Exact UTC</span></div>
+    <div class="timing-count"><b>{{ counts.day }}</b><span>Day only</span></div>
+    <div class="timing-count"><b>{{ counts.coarse }}</b><span>Not placeable</span></div>
+    <div class="timing-count"><b>{{ counts.counted }}</b><span>Counted</span></div>
+</div>
+
+{% if insights %}
+<section class="timing-card">
+    <h2 class="font-semibold mb-2">Release day share</h2>
+    <ul>
+        {% for line in insights %}
+        <li class="text-sm py-1">{{ line }}</li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+<section class="timing-card">
+    <h2 class="font-semibold mb-1">Weekday and hour (UTC)</h2>
+    <p class="text-xs text-slate-400 mb-3">{{ hour_note }} {{ weekday_note }}</p>
+    {% if heatmap_rows %}
+    <div class="data-scroll mb-4" role="region" aria-label="UTC weekday and hour counts">
+        <p class="data-scroll-hint">Swipe sideways to see every hour.</p>
+        <div class="timing-heat" role="img" aria-label="Exact timestamps by UTC weekday and hour">
+            <div class="timing-heat-row" aria-hidden="true">
+                <span></span>
+                {% for cell in heatmap_rows[0].cells %}
+                <span class="timing-heat-hour">{{ "%02d"|format(cell.hour) }}</span>
+                {% endfor %}
+            </div>
+            {% for row in heatmap_rows %}
+            <div class="timing-heat-row">
+                <span class="timing-heat-day">{{ row.short }}</span>
+                {% for cell in row.cells %}
+                <span class="timing-heat-cell{% if cell.level >= 3 %} is-hot{% endif %}" style="--level: {{ cell.level }}" data-count="{{ cell.count }}" data-weekday="{{ row.short }}" data-hour="{{ cell.hour }}" title="{{ row.label }} {{ cell.label }} · {{ cell.count }}">{% if cell.count %}{{ cell.count }}{% endif %}</span>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% else %}
+    <p class="text-slate-400 text-sm mb-3">{{ hour_reason }}</p>
+    {% endif %}
+    {% if nonzero_hours %}
+    <ul class="mb-4 flex flex-wrap gap-x-4 gap-y-1 text-sm">
+        {% for item in nonzero_hours %}
+        <li class="font-mono text-emerald-300">{{ item.label }} · {{ item.count }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    <h3 class="text-sm font-medium mb-2">Day of week</h3>
+    {% if weekday_bars %}
+    <ul class="timing-days">
+        {% for bar in weekday_bars %}
+        <li class="timing-day">
+            <span class="text-slate-400 text-xs">{{ bar.short }}</span>
+            <span class="timing-day-count">{{ bar.count }}</span>
+            <span class="timing-day-bar" style="height: {{ bar.height }}%"></span>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-slate-400 text-sm">{{ weekday_reason }}</p>
+    {% endif %}
+</section>
+
+{% if sources %}
+<section class="timing-card">
+    <h2 class="font-semibold mb-1">Stored rows by source</h2>
+    <p class="text-xs text-slate-400 mb-3">{{ dedupe_note }}</p>
+    <div class="data-scroll">
+        <table>
+            <thead>
+                <tr>
+                    <th class="text-left p-2 text-slate-400">Source</th>
+                    <th class="text-left p-2 text-slate-400">Exact time</th>
+                    <th class="text-left p-2 text-slate-400">Day</th>
+                    <th class="text-left p-2 text-slate-400">Not placeable</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for source in sources %}
+                <tr class="border-t border-slate-700">
+                    <td class="p-2">{{ source.label }}</td>
+                    <td class="p-2 font-mono" data-source="{{ source.source }}" data-exact="{{ source.exact }}">{{ source.exact }}</td>
+                    <td class="p-2 font-mono" data-source="{{ source.source }}" data-day="{{ source.day }}">{{ source.day }}</td>
+                    <td class="p-2 font-mono" data-source="{{ source.source }}" data-coarse="{{ source.coarse }}">{{ source.coarse }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endif %}
+
+<section class="timing-card">
+    <h2 class="font-semibold mb-1">Artists</h2>
+    <p class="text-xs text-slate-400 mb-3">Modal weekday and hour use exact UTC timestamps only, and only when an artist has at least 3. Friday share uses a stored day or an exact time. The CSV adds each artist's 7 weekday counts and 24 hour counts.</p>
+    <div class="timing-cards">
+        {% for artist in artists %}
+        <article class="bg-slate-900/60 rounded-lg p-3">
+            <h3 class="font-semibold"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></h3>
+            <p class="text-sm mt-1">Exact timestamps <span class="font-mono text-emerald-300">{{ artist.exact_count }}</span></p>
+            <p class="text-sm">{% if artist.modal_note %}{{ artist.modal_note }}{% else %}{{ artist.modal_weekday }} · {{ artist.modal_hour_utc }} UTC{% endif %}</p>
+            <p class="text-sm">Friday {% if artist.friday_share %}{{ artist.friday_share }}{% else %}{{ no_dated_share }}{% endif %}</p>
+            <p class="timing-stamp mt-1">{% if artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</p>
+        </article>
+        {% endfor %}
+    </div>
+    <div class="timing-table data-scroll">
+        <p class="data-scroll-hint">Swipe sideways to see every column.</p>
+        <table>
+            <thead>
+                <tr>
+                    <th class="text-left p-2 text-slate-400">Artist</th>
+                    <th class="text-left p-2 text-slate-400">Exact</th>
+                    <th class="text-left p-2 text-slate-400">Modal weekday</th>
+                    <th class="text-left p-2 text-slate-400">Modal hour (UTC)</th>
+                    <th class="text-left p-2 text-slate-400">Friday share</th>
+                    <th class="text-left p-2 text-slate-400">Latest exact timestamp</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for artist in artists %}
+                <tr class="border-t border-slate-700" data-artist="{{ artist.id }}">
+                    <td class="p-2"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></td>
+                    <td class="p-2 font-mono">{{ artist.exact_count }}</td>
+                    <td class="p-2">{% if artist.modal_note %}{{ artist.modal_note }}{% else %}{{ artist.modal_weekday }}{% endif %}</td>
+                    <td class="p-2 font-mono">{% if artist.modal_hour_utc %}{{ artist.modal_hour_utc }} UTC{% elif artist.modal_note %}{{ artist.modal_note }}{% endif %}</td>
+                    <td class="p-2">{% if artist.friday_share %}{{ artist.friday_share }}{% else %}{{ no_dated_share }}{% endif %}</td>
+                    <td class="p-2 timing-stamp">{% if artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<p class="text-slate-400 text-sm">{{ window_note }}</p>
+{% endif %}
+{% endblock %}
