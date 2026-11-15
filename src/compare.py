@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from datetime import datetime, timedelta, timezone
 from html import escape
 from urllib.parse import urlencode
@@ -24,6 +25,11 @@ from scores import score_from_counts
 
 UNAVAILABLE = "unavailable"
 NOT_ENOUGH = "not enough history"
+# D1's compound-SELECT limit is far below desktop SQLite. One SELECT is the
+# whole statement. A UNION chain is what production rejected on /compare.
+D1_COMPOUND_TERM_LIMIT = 1
+# Character-class GLOB patterns are rejected as "too complex" well before this.
+D1_PATTERN_LIMIT = 50
 COMPARE_LIMIT = 4
 SERIES_LIMIT = 90
 CHART_POINT_CAP = 48
@@ -294,67 +300,103 @@ def _legacy_latest_statement(artist_ids: list[int]) -> tuple[str, tuple]:
     return _check(sql, tuple(artist_ids))
 
 
-def _baseline_statement(artist_ids: list[int], cutoff: str) -> tuple[str, tuple]:
-    """Latest exact snapshot at or before ``cutoff`` for each audience series.
+def compound_select_terms(sql: str) -> int:
+    """SELECT arms joined by UNION, INTERSECT, or EXCEPT.
 
-    One index seek per artist and metric on (artist_id, source, metric, captured_at).
+    A plain statement is one term. Each compound keyword adds one. Nested
+    subqueries are not compound terms.
     """
-    id_sql = " UNION ALL ".join("SELECT ?" if index else "SELECT ? AS artist_id" for index in range(len(artist_ids)))
-    sql = f"""
-        SELECT s.artist_id AS artist_id, s.source AS source, s.metric AS metric,
-               s.value AS value, s.captured_at AS captured_at
-        FROM (
-            SELECT ids.artist_id AS artist_id, metrics.source AS source, metrics.metric AS metric,
-                   (
-                       SELECT metric_snapshots.id
-                       FROM metric_snapshots
-                       WHERE metric_snapshots.artist_id = ids.artist_id
-                         AND metric_snapshots.source = metrics.source
-                         AND metric_snapshots.metric = metrics.metric
-                         AND metric_snapshots.captured_at <= ?
-                         AND metric_snapshots.value IS NOT NULL
-                         AND metric_snapshots.value >= 0
-                         AND metric_snapshots.value = CAST(metric_snapshots.value AS INTEGER)
-                       ORDER BY metric_snapshots.captured_at DESC, metric_snapshots.id DESC
-                       LIMIT 1
-                   ) AS snapshot_id
-            FROM ({id_sql}) AS ids
-            JOIN (
-                SELECT 'spotify' AS source, 'Monthly listeners' AS metric
-                UNION ALL SELECT 'spotify', 'Followers'
-                UNION ALL SELECT 'instagram', 'Followers'
-                UNION ALL SELECT 'tiktok', 'Followers'
-                UNION ALL SELECT 'tiktok', 'Likes'
-                UNION ALL SELECT 'youtube', 'Subscribers'
-                UNION ALL SELECT 'deezer', 'Fans'
-            ) AS metrics
-        ) AS picked
-        JOIN metric_snapshots AS s ON s.id = picked.snapshot_id
+    keywords = len(re.findall(r"\b(?:UNION|INTERSECT|EXCEPT)\b", sql or "", re.I))
+    if keywords:
+        return keywords + 1
+    if re.search(r"\bSELECT\b", sql or "", re.I):
+        return 1
+    return 0
+
+
+def like_glob_patterns(sql: str) -> list[str]:
+    """Literals used as LIKE or GLOB patterns. D1 rejects a long character class."""
+    return re.findall(r"\b(?:LIKE|GLOB)\s+'([^']*)'", sql or "", re.I)
+
+
+def _digit_checks(column: str, positions: tuple[int, ...]) -> str:
+    return " AND ".join(f"substr({column}, {pos}, 1) BETWEEN '0' AND '9'" for pos in positions)
+
+
+def _day_prefix_sql(column: str) -> str:
+    """A real YYYY-MM-DD prefix. Digit and hyphen checks, not a GLOB class."""
+    return " AND ".join(
+        [
+            f"length({column}) >= 10",
+            f"substr({column}, 5, 1) = '-'",
+            f"substr({column}, 8, 1) = '-'",
+            _digit_checks(column, (1, 2, 3, 4, 6, 7, 9, 10)),
+            f"strftime('%w', substr({column}, 1, 10)) IS NOT NULL",
+        ]
+    )
+
+
+def _clock_sql(column: str) -> str:
+    """An exact clock. A date-only string fails the length and separator checks."""
+    return " AND ".join(
+        [
+            f"length({column}) >= 19",
+            f"(substr({column}, 11, 1) = 'T' OR substr({column}, 11, 1) = ' ')",
+            f"substr({column}, 14, 1) = ':'",
+            f"substr({column}, 17, 1) = ':'",
+            _digit_checks(column, (12, 13, 15, 16, 18, 19)),
+            f"CAST(substr({column}, 12, 2) AS INTEGER) BETWEEN 0 AND 23",
+            _day_prefix_sql(column),
+        ]
+    )
+
+
+def _baseline_statements(artist_ids: list[int], cutoff: str) -> list[tuple[str, tuple]]:
+    """One index seek per artist, per audience metric. No compound SELECT.
+
+    Source and metric are bound, so ``(artist_id, source, metric, captured_at)``
+    can stop at the newest row at or before the cutoff.
     """
-    # The cutoff placeholder appears in the SELECT list, before the id placeholders.
-    return _check(sql, (cutoff, *artist_ids))
-
-
-def _series_statement(artist_ids: list[int], source: str, metric: str) -> tuple[str, tuple]:
-    """At most SERIES_LIMIT newest exact points per artist. The index seek stops at the limit."""
-    parts = []
-    params: list = []
-    for artist_id in artist_ids:
-        parts.append(
-            f"""
-            SELECT artist_id, value, captured_at, id FROM (
-                SELECT artist_id, value, captured_at, id
+    if not artist_ids:
+        return []
+    marks = _marks(len(artist_ids))
+    statements = []
+    for _key, source, metric, _label in METRICS:
+        sql = f"""
+            SELECT artists.id AS artist_id, s.source AS source, s.metric AS metric,
+                   s.value AS value, s.captured_at AS captured_at
+            FROM artists
+            JOIN metric_snapshots AS s ON s.id = (
+                SELECT metric_snapshots.id
                 FROM metric_snapshots
-                WHERE artist_id = ? AND source = ? AND metric = ?
-                  AND value IS NOT NULL AND value >= 0
-                  AND value = CAST(value AS INTEGER)
-                ORDER BY captured_at DESC, id DESC
-                LIMIT {SERIES_LIMIT}
+                WHERE metric_snapshots.artist_id = artists.id
+                  AND metric_snapshots.source = ?
+                  AND metric_snapshots.metric = ?
+                  AND metric_snapshots.captured_at <= ?
+                  AND metric_snapshots.value IS NOT NULL
+                  AND metric_snapshots.value >= 0
+                  AND metric_snapshots.value = CAST(metric_snapshots.value AS INTEGER)
+                ORDER BY metric_snapshots.captured_at DESC, metric_snapshots.id DESC
+                LIMIT 1
             )
-            """.strip()
-        )
-        params.extend((artist_id, source, metric))
-    return _check(" UNION ALL ".join(parts), tuple(params))
+            WHERE artists.id IN ({marks})
+        """
+        statements.append(_check(sql, (source, metric, cutoff, *artist_ids)))
+    return statements
+
+
+def _series_statements(artist_ids: list[int], source: str, metric: str) -> list[tuple[str, tuple]]:
+    """At most SERIES_LIMIT newest exact points per artist. One seek each, no UNION."""
+    sql = f"""
+        SELECT artist_id, value, captured_at, id
+        FROM metric_snapshots
+        WHERE artist_id = ? AND source = ? AND metric = ?
+          AND value IS NOT NULL AND value >= 0
+          AND value = CAST(value AS INTEGER)
+        ORDER BY captured_at DESC, id DESC
+        LIMIT {int(SERIES_LIMIT)}
+    """
+    return [_check(sql, (artist_id, source, metric)) for artist_id in artist_ids]
 
 
 def _playlist_statement(artist_ids: list[int]) -> tuple[str, tuple]:
@@ -426,7 +468,7 @@ def _release_statement(artist_ids: list[int], start90: str, start365: str, end: 
           AND released_at >= ?
           AND released_at < ?
           AND precision IN ('day', 'time')
-          AND released_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+          AND {_day_prefix_sql("released_at")}
         GROUP BY artist_id
     """
     return _check(sql, (start90, start90, *artist_ids, start365, end))
@@ -484,21 +526,17 @@ def _track_statement(artist_ids: list[int]) -> tuple[str, tuple]:
 
 
 def _hour_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[str, tuple]:
-    """Hour buckets from a real clock only. SQLite strftime would turn a bare date into 00."""
-    stamp = column
+    """Hour buckets from a real clock only. A bare date never becomes 00."""
+    if table not in {"content_sightings", "musicbrainz_releases"} or column not in {"published_at", "released_at"}:
+        raise ValueError("unsupported timing read")
     sql = f"""
         SELECT artist_id,
-               CAST(substr({stamp}, 12, 2) AS INTEGER) AS hour_utc,
+               CAST(substr({column}, 12, 2) AS INTEGER) AS hour_utc,
                COUNT(*) AS n
         FROM {table}
         WHERE artist_id IN ({_marks(len(artist_ids))})
           AND precision = 'time'
-          AND (
-                {stamp} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
-                OR {stamp} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
-          )
-          AND substr({stamp}, 12, 2) GLOB '[0-9][0-9]'
-          AND CAST(substr({stamp}, 12, 2) AS INTEGER) BETWEEN 0 AND 23
+          AND {_clock_sql(column)}
         GROUP BY artist_id, hour_utc
     """
     return _check(sql, tuple(artist_ids))
@@ -506,6 +544,8 @@ def _hour_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[
 
 def _weekday_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[str, tuple]:
     """Weekday of a stored day or exact time. Month and year precision are excluded."""
+    if table not in {"content_sightings", "musicbrainz_releases"} or column not in {"published_at", "released_at"}:
+        raise ValueError("unsupported timing read")
     sql = f"""
         SELECT artist_id,
                CAST(strftime('%w', substr({column}, 1, 10)) AS INTEGER) AS dow,
@@ -513,11 +553,46 @@ def _weekday_statement(artist_ids: list[int], *, table: str, column: str) -> tup
         FROM {table}
         WHERE artist_id IN ({_marks(len(artist_ids))})
           AND precision IN ('day', 'time')
-          AND {column} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
-          AND strftime('%w', substr({column}, 1, 10)) IS NOT NULL
+          AND {_day_prefix_sql(column)}
         GROUP BY artist_id, dow
     """
     return _check(sql, tuple(artist_ids))
+
+
+def report_statements(artist_ids: list[int], metric_key: str, now: datetime) -> list[tuple[str, tuple]]:
+    """Every read the comparison batch sends. Callers keep this list free of UNION chains."""
+    spec = _METRIC_BY_KEY.get(metric_key) or _METRIC_BY_KEY[DEFAULT_METRIC]
+    moment = _as_utc(now)
+    cutoff_7 = utc_now(moment - timedelta(days=7))
+    cutoff_28 = utc_now(moment - timedelta(days=28))
+    start90 = _day(moment - timedelta(days=90))
+    start365 = _day(moment - timedelta(days=365))
+    end = _day(moment + timedelta(days=1))
+    return [
+        _latest_statement(artist_ids),
+        *_baseline_statements(artist_ids, cutoff_7),
+        *_baseline_statements(artist_ids, cutoff_28),
+        *_series_statements(artist_ids, spec[1], spec[2]),
+        _playlist_statement(artist_ids),
+        _release_statement(artist_ids, start90, start365, end),
+        _track_statement(artist_ids),
+        _hour_statement(artist_ids, table="content_sightings", column="published_at"),
+        _hour_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
+        _weekday_statement(artist_ids, table="content_sightings", column="published_at"),
+        _weekday_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
+    ]
+
+
+def compare_sql_catalog(artist_ids: list[int] | None = None) -> list[str]:
+    """SQL text a four-artist comparison can send, including the legacy fallbacks."""
+    ids = list(artist_ids or [1, 2, 3, 4])
+    moment = datetime(2026, 11, 15, tzinfo=timezone.utc)
+    statements = list(report_statements(ids, DEFAULT_METRIC, moment))
+    statements.append(_legacy_latest_statement(ids))
+    statements.append(_playlist_legacy_statement(ids))
+    for _key, source, metric, _label in METRICS:
+        statements.extend(_series_statements(ids, source, metric))
+    return [sql for sql, _params in statements]
 
 
 def _soft_error(exc: BaseException) -> bool:
@@ -899,71 +974,86 @@ def _chart_from_rows(artists: list[dict], rows: list[dict] | None, spec: tuple) 
     }
 
 
+def _baseline_from_parts(parts: list) -> tuple[dict[tuple[int, str, str], dict], set[tuple[str, str]]]:
+    """Points that were read, and the metrics whose statement failed.
+
+    One failed metric leaves the others alone. It does not blank the page.
+    """
+    points: dict[tuple[int, str, str], dict] = {}
+    failed: set[tuple[str, str]] = set()
+    for part, (_key, source, metric, _label) in zip(parts, METRICS):
+        rows, bad = _rows_or_none(part, label="compare baseline")
+        if bad or rows is None:
+            failed.add((source, metric))
+            continue
+        for row in rows:
+            point = _number_point(row)
+            if point is None or not isinstance(row, dict):
+                continue
+            points[(int(row["artist_id"]), str(row.get("source") or source), str(row.get("metric") or metric))] = point
+    return points, failed
+
+
+def _series_from_parts(parts: list) -> list[dict] | None:
+    rows: list[dict] = []
+    failed = 0
+    for part in parts:
+        found, bad = _rows_or_none(part, label="compare chart")
+        if bad or found is None:
+            failed += 1
+            continue
+        rows.extend(row for row in found if isinstance(row, dict))
+    if parts and failed == len(parts):
+        return None
+    return rows
+
+
 async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) -> dict:
     artist_ids = [artist["id"] for artist in artists]
     spec = _METRIC_BY_KEY.get(metric_key) or _METRIC_BY_KEY[DEFAULT_METRIC]
-    cutoff_7 = utc_now(now - timedelta(days=7))
-    cutoff_28 = utc_now(now - timedelta(days=28))
-    start90 = _day(now - timedelta(days=90))
-    start365 = _day(now - timedelta(days=365))
-    end = _day(now + timedelta(days=1))
-    statements = [
-        _latest_statement(artist_ids),
-        _baseline_statement(artist_ids, cutoff_7),
-        _baseline_statement(artist_ids, cutoff_28),
-        _series_statement(artist_ids, spec[1], spec[2]),
-        _playlist_statement(artist_ids),
-        _release_statement(artist_ids, start90, start365, end),
-        _track_statement(artist_ids),
-        _hour_statement(artist_ids, table="content_sightings", column="published_at"),
-        _hour_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
-        _weekday_statement(artist_ids, table="content_sightings", column="published_at"),
-        _weekday_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
-    ]
+    statements = report_statements(artist_ids, spec[0], now)
+    base_count = len(METRICS)
+    series_count = len(artist_ids)
     found = await read_many(db, statements)
-    hard = False
-    latest_rows, failed = _rows_or_none(found[0], label="compare latest")
-    hard = hard or failed
-    if latest_rows is None and isinstance(found[0], Exception) and _soft_error(found[0]):
+    index = 0
+    latest_found = found[index]
+    index += 1
+    baseline_7_parts = found[index : index + base_count]
+    index += base_count
+    baseline_28_parts = found[index : index + base_count]
+    index += base_count
+    series_parts = found[index : index + series_count]
+    index += series_count
+    tail = found[index:]
+    latest_rows, latest_failed = _rows_or_none(latest_found, label="compare latest")
+    if latest_rows is None and isinstance(latest_found, Exception) and _soft_error(latest_found):
         try:
             latest_rows = await db.query(*_legacy_latest_statement(artist_ids))
+            latest_failed = False
         except Exception as exc:
             latest_rows = None
-            if not _soft_error(exc):
+            latest_failed = not _soft_error(exc)
+            if latest_failed:
                 log_read_failure("compare latest", exc)
-                hard = True
-    baseline_7, failed = _rows_or_none(found[1], label="compare 7d")
-    hard = hard or failed
-    baseline_28, failed = _rows_or_none(found[2], label="compare 28d")
-    hard = hard or failed
-    series_rows, failed = _rows_or_none(found[3], label="compare chart")
-    hard = hard or failed
-    playlist_rows, failed = _rows_or_none(found[4], label="compare playlists")
-    hard = hard or failed
-    if playlist_rows is None and isinstance(found[4], Exception) and "no such column" in str(found[4]).lower():
+    prior_7, failed_7 = _baseline_from_parts(baseline_7_parts)
+    prior_28, failed_28 = _baseline_from_parts(baseline_28_parts)
+    series_rows = _series_from_parts(series_parts)
+    playlist_rows, _playlist_failed = _rows_or_none(tail[0], label="compare playlists")
+    if playlist_rows is None and isinstance(tail[0], Exception) and "no such column" in str(tail[0]).lower():
         try:
             playlist_rows = await db.query(*_playlist_legacy_statement(artist_ids))
         except Exception as exc:
             playlist_rows = None
             if not _soft_error(exc):
                 log_read_failure("compare playlists", exc)
-                hard = True
-    release_rows, failed = _rows_or_none(found[5], label="compare releases")
-    hard = hard or failed
-    track_rows, failed = _rows_or_none(found[6], label="compare track stats")
-    hard = hard or failed
-    hour_rows, failed = _rows_or_none(found[7], label="compare hours")
-    hard = hard or failed
-    hour_release_rows, failed = _rows_or_none(found[8], label="compare release hours")
-    hard = hard or failed
-    weekday_rows, failed = _rows_or_none(found[9], label="compare weekdays")
-    hard = hard or failed
-    weekday_release_rows, failed = _rows_or_none(found[10], label="compare release weekdays")
-    hard = hard or failed
+    release_rows, _release_failed = _rows_or_none(tail[1], label="compare releases")
+    track_rows, _track_failed = _rows_or_none(tail[2], label="compare track stats")
+    hour_rows, _hour_read_failed = _rows_or_none(tail[3], label="compare hours")
+    hour_release_rows, _hour_release_failed = _rows_or_none(tail[4], label="compare release hours")
+    weekday_rows, _weekday_read_failed = _rows_or_none(tail[5], label="compare weekdays")
+    weekday_release_rows, _weekday_release_failed = _rows_or_none(tail[6], label="compare release weekdays")
 
     latest = _index_points(latest_rows)
-    prior_7 = _index_points(baseline_7)
-    prior_28 = _index_points(baseline_28)
     tracks = _pick_track_stats(track_rows) if track_rows is not None else None
     playlists = _count_map(playlist_rows, "n", "captured_at") if playlist_rows is not None else None
     releases = {}
@@ -1000,8 +1090,8 @@ async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) 
             if current is None:
                 cells.append(_cell(artist["id"], UNAVAILABLE, "", "", _blank_delta(), _blank_delta()))
                 continue
-            delta_7 = growth_delta(current, prior_7.get(pair)) if baseline_7 is not None else _na_delta()
-            delta_28 = growth_delta(current, prior_28.get(pair)) if baseline_28 is not None else _na_delta()
+            delta_7 = _na_delta() if (source, metric) in failed_7 else growth_delta(current, prior_7.get(pair))
+            delta_28 = _na_delta() if (source, metric) in failed_28 else growth_delta(current, prior_28.get(pair))
             cells.append(
                 _cell(artist["id"], f"{current['value']:,}", current["captured_at"], "", delta_7, delta_28)
             )
@@ -1130,7 +1220,9 @@ async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) 
     chart = _chart_from_rows(artists, series_rows, spec)
     if series_rows is None:
         chart = {"svg": "", "note": READ_ERROR, "series": []}
-    return {"rows": rows, "timing": timing, "chart": chart, "read_error": READ_ERROR if hard else ""}
+    # The page banner stays clear. Only the audience table says its own read failed.
+    table_note = READ_ERROR if latest_rows is None and latest_failed else ""
+    return {"rows": rows, "timing": timing, "chart": chart, "table_note": table_note}
 
 
 def _decorate(artists: list[dict], metric_key: str) -> list[dict]:
@@ -1298,7 +1390,8 @@ async def build_compare_view(
         "redirect": "",
         "ready": ready,
         "note": PAGE_NOTE,
-        "read_error": report["read_error"] or picker.get("note") or "",
+        "read_error": "",
+        "table_note": report.get("table_note") or "",
         "missing_note": missing_note,
         "artists": decorated,
         "rows": report["rows"],
@@ -1337,6 +1430,7 @@ def empty_compare_view(message: str) -> dict:
         "ready": False,
         "note": PAGE_NOTE,
         "read_error": message,
+        "table_note": "",
         "missing_note": "",
         "artists": [],
         "rows": [],

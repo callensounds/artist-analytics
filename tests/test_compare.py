@@ -9,10 +9,15 @@ from fastapi.testclient import TestClient
 
 import main
 from compare import (
+    D1_COMPOUND_TERM_LIMIT,
+    D1_PATTERN_LIMIT,
     NOT_ENOUGH,
     UNAVAILABLE,
-    _baseline_statement,
+    _baseline_statements,
+    compare_sql_catalog,
+    compound_select_terms,
     growth_delta,
+    like_glob_patterns,
     normalise_growth,
     timing_role,
 )
@@ -119,6 +124,19 @@ def test_normalise_growth_starts_at_the_first_common_snapshot():
     )
     assert len(deduped[1]) == 1
     assert deduped[1][0]["value"] == 10
+
+
+def test_compare_sql_stays_within_d1_limits():
+    """D1 rejects a long UNION chain and a long GLOB character class."""
+    statements = compare_sql_catalog([4, 6, 8, 9])
+    assert len(statements) > 10
+    for sql in statements:
+        assert compound_select_terms(sql) <= D1_COMPOUND_TERM_LIMIT
+        assert "UNION" not in sql.upper()
+        for pattern in like_glob_patterns(sql):
+            assert len(pattern) <= D1_PATTERN_LIMIT
+        assert "GLOB" not in sql.upper()
+        assert " LIKE " not in f" {sql.upper()} "
 
 
 def test_compare_requires_login():
@@ -256,9 +274,10 @@ def _seed(database: SqliteDatabase):
             """,
             (ada, stamps["h1"], ada, stamps["h1"], ada, stamps["h1"], ada, stamps["h1"], ada, stamps["h1"]),
         )
-        sql, params = _baseline_statement([ada], ago(days=7))
-        prior = await database.query(sql, params)
-        listeners = [row for row in prior if row["metric"] == "Monthly listeners"]
+        listeners = []
+        for sql, params in _baseline_statements([ada], ago(days=7)):
+            prior = await database.query(sql, params)
+            listeners.extend(row for row in prior if row["metric"] == "Monthly listeners")
         assert len(listeners) == 1
         assert int(listeners[0]["value"]) == 150
         assert listeners[0]["captured_at"] == stamps["d10"]
@@ -443,6 +462,36 @@ def test_compare_page_reads_stored_values_and_does_not_write(monkeypatch, tmp_pa
 
         assert writes == []
         assert calls == []
+    finally:
+        reset_pool()
+
+
+def test_one_failed_section_does_not_blank_the_page(monkeypatch, tmp_path):
+    path = tmp_path / "compare-hours.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    database = SqliteDatabase(str(path))
+    try:
+        ids, _stamps = _seed(database)
+        ada, bea = ids["ada"], ids["bea"]
+        client = TestClient(main.app)
+        client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+        original = SqliteDatabase.query
+
+        async def explode_hours(self, sql, params=()):
+            if "hour_utc" in sql:
+                raise RuntimeError("D1_ERROR: LIKE or GLOB pattern too complex: SQLITE_ERROR")
+            return await original(self, sql, params)
+
+        monkeypatch.setattr(SqliteDatabase, "query", explode_hours)
+        page = client.get("/compare", params={"a": ada, "b": bea})
+        assert page.status_code == 200
+        assert "data-compare-banner" not in page.text
+        assert f'data-metric="spotify-monthly-listeners" data-artist="{ada}" data-value="200"' in page.text
+        assert 'data-delta="7" data-value="+50 (+33.3%)"' in page.text
+        assert f'data-timing="{ada}" data-hour-total="0" data-weekday-total="7"' in page.text
+        assert "Data temporarily unavailable. Stored history could not be read on this request." in page.text
+        assert "Internal Server Error" not in page.text
     finally:
         reset_pool()
 
