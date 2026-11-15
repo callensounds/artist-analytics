@@ -27,7 +27,7 @@
 </div>
 
 {% if read_error %}
-<p class="text-slate-400 text-sm mb-4">{{ read_error }}</p>
+<p data-compare-banner class="text-slate-400 text-sm mb-4">{{ read_error }}</p>
 {% endif %}
 {% if missing_note %}
 <p class="text-slate-400 text-sm mb-4">{{ missing_note }}</p>
@@ -46,6 +46,9 @@
 {% endif %}
 
 {% if ready %}
+{% if table_note %}
+<p data-compare-table-note class="text-slate-400 text-sm mb-4">{{ table_note }}</p>
+{% endif %}
 <p class="mb-4 text-sm"><a href="{{ csv_href }}" class="text-emerald-400 hover:underline">Download CSV</a></p>
 <p class="text-xs text-slate-500 mb-2">{{ delta_note }}</p>
 <p class="text-xs text-slate-500 mb-4">{{ release_note }} {{ score_note }}</p>
