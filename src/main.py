@@ -74,6 +74,17 @@ from digest import (
     render_digest_csv,
     render_digest_json,
 )
+from timing import (
+    TIMING_DB_NOTE,
+    TIMING_READ_ERROR,
+    build_timing,
+    empty_timing,
+    parse_days as parse_timing_days,
+    parse_kind as parse_timing_kind,
+    parse_scope as parse_timing_scope,
+    render_timing_csv,
+    render_timing_json,
+)
 from scores import SCORE_FORMULA, SCORE_RANK_EMPTY, rank_scores
 
 try:
@@ -846,6 +857,83 @@ async def digest_page(request: Request, threshold: str = ""):
         return RedirectResponse("/login", status_code=303)
     view = await _digest_view(request, user, threshold)
     return templates.TemplateResponse(request, "digest.html", {"user": user, **view})
+
+
+async def _timing_view(request: Request, user: dict, scope: str, days: str, kind: str) -> dict:
+    chosen_scope = parse_timing_scope(scope)
+    chosen_days = parse_timing_days(days)
+    chosen_kind = parse_timing_kind(kind)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is None:
+        return empty_timing(
+            TIMING_DB_NOTE,
+            failed=True,
+            scope=chosen_scope,
+            days=chosen_days,
+            kind=chosen_kind,
+        )
+    try:
+        return await asyncio.wait_for(
+            build_timing(
+                db,
+                user_id=_digest_user_id(request, user),
+                scope=chosen_scope,
+                days=chosen_days,
+                kind=chosen_kind,
+                now=datetime.now(timezone.utc),
+            ),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("timing", exc)
+        return empty_timing(
+            TIMING_READ_ERROR,
+            failed=True,
+            scope=chosen_scope,
+            days=chosen_days,
+            kind=chosen_kind,
+        )
+
+
+@app.get("/timing.csv")
+async def timing_csv(request: Request, scope: str = "", days: str = "", kind: str = ""):
+    """Per-artist timing as CSV. Stored rows only. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _timing_view(request, user, scope, days, kind)
+    if view.get("failed"):
+        return Response(
+            f"{view.get('read_error') or TIMING_READ_ERROR}\n",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+    return Response(
+        content=render_timing_csv(view),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="timing.csv"'},
+    )
+
+
+@app.get("/timing.json")
+async def timing_json(request: Request, scope: str = "", days: str = "", kind: str = ""):
+    """The timing view as JSON. Stored rows only. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _timing_view(request, user, scope, days, kind)
+    status = 503 if view.get("failed") else 200
+    return Response(render_timing_json(view), status_code=status, media_type="application/json")
+
+
+@app.get("/timing", response_class=HTMLResponse)
+async def timing_page(request: Request, scope: str = "", days: str = "", kind: str = ""):
+    """Release and post timing for a watchlist or every tracked artist. No writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _timing_view(request, user, scope, days, kind)
+    return templates.TemplateResponse(request, "timing.html", {"user": user, **view})
 
 
 @app.get("/charts", response_class=HTMLResponse)

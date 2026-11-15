@@ -158,6 +158,22 @@ LIMIT ?
 _TRACK_STAT_METRICS = {"deezer_rank", "spotify_playcount", "spotify_popularity"}
 
 
+# A spreadsheet executes a cell that starts with one of these. The leading
+# apostrophe is stored text, so the cell is not a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def formula_safe(value: object) -> str:
+    """Text for a CSV cell. Stored punctuation is kept; a formula prefix is not executed."""
+    if value is None:
+        return ""
+    text = str(value)
+    probe = text.lstrip(" \t\r")
+    if text[:1] in _FORMULA_PREFIXES or probe[:1] in _FORMULA_PREFIXES:
+        return "'" + text
+    return text
+
+
 def _blank(value) -> str:
     if value is None:
         return ""
