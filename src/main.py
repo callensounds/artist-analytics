@@ -65,6 +65,15 @@ from passwords import hash_password, verify_password
 from providers import collect_artist
 from runtime import FALLBACK_SESSION_SECRET, WorkerSessionMiddleware, env_get
 from compare import build_compare_view, empty_compare_view, render_compare_csv
+from digest import (
+    DIGEST_DB_NOTE,
+    DIGEST_READ_ERROR,
+    build_digest,
+    empty_digest,
+    parse_threshold,
+    render_digest_csv,
+    render_digest_json,
+)
 from scores import SCORE_FORMULA, SCORE_RANK_EMPTY, rank_scores
 
 try:
@@ -763,6 +772,80 @@ async def alerts_page(request: Request):
         "alerts.html",
         {"user": user, "alerts": alerts, "reason": reason},
     )
+
+
+def _digest_user_id(request: Request, user: dict) -> int | None:
+    """A watchlist exists only for a D1 session. Memory demo login has none."""
+    if request.session.get("auth") != "d1":
+        return None
+    try:
+        user_id = int(user["id"])
+    except (TypeError, ValueError):
+        return None
+    if user_id < 1:
+        return None
+    return user_id
+
+
+async def _digest_view(request: Request, user: dict, threshold: str) -> dict:
+    chosen = parse_threshold(threshold)
+    db = await _open_read_db(request.scope.get("env"))
+    if db is None:
+        return empty_digest(DIGEST_DB_NOTE, failed=True, threshold=chosen)
+    try:
+        return await asyncio.wait_for(
+            build_digest(
+                db,
+                user_id=_digest_user_id(request, user),
+                threshold=threshold,
+                now=datetime.now(timezone.utc),
+            ),
+            GROWTH_READ_TIMEOUT_S,
+        )
+    except Exception as exc:
+        log_read_failure("digest", exc)
+        return empty_digest(DIGEST_READ_ERROR, failed=True, threshold=chosen)
+
+
+@app.get("/digest.csv")
+async def digest_csv(request: Request, threshold: str = ""):
+    """The digest as CSV. Stored rows only. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _digest_view(request, user, threshold)
+    if view.get("failed"):
+        return Response(
+            f"{view.get('read_error') or DIGEST_READ_ERROR}\n",
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+        )
+    return Response(
+        content=render_digest_csv(view),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="digest.csv"'},
+    )
+
+
+@app.get("/digest.json")
+async def digest_json(request: Request, threshold: str = ""):
+    """The digest as JSON. Stored rows only. No provider calls and no writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _digest_view(request, user, threshold)
+    status = 503 if view.get("failed") else 200
+    return Response(render_digest_json(view), status_code=status, media_type="application/json")
+
+
+@app.get("/digest", response_class=HTMLResponse)
+async def digest_page(request: Request, threshold: str = ""):
+    """Watchlist digest for the last 7 days. Stored rows only. No writes."""
+    user = await _require_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    view = await _digest_view(request, user, threshold)
+    return templates.TemplateResponse(request, "digest.html", {"user": user, **view})
 
 
 @app.get("/charts", response_class=HTMLResponse)
