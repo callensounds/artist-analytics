@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}Daily digest — Average Analytics{% endblock %}
+
+{% block head %}
+<style>
+    .digest-counts { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 1rem; }
+    .digest-count { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.55rem 0.75rem; min-width: 6.5rem; }
+    .digest-count b { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #6ee7b7; font-size: 1.15rem; }
+    .digest-count span { color: #c5d0de; font-size: 0.72rem; }
+    .digest-artist { background: #1e293b; border: 1px solid #334155; border-radius: 1rem; padding: 1rem; margin: 0 0 1rem; min-width: 0; }
+    .digest-metric { display: flex; flex-direction: column; gap: 0.15rem; padding: 0.6rem 0; border-top: 1px solid #334155; min-width: 0; }
+    .digest-stamp { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; color: #6ee7b7; overflow-wrap: anywhere; }
+    .digest-spike { color: #042f24; background: #6ee7b7; border-radius: 999px; padding: 0.05rem 0.45rem; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+    .digest-links { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+    .digest-sub { margin-top: 0.9rem; }
+    .digest-sub h3 { font-size: 0.95rem; font-weight: 650; color: #f8fafc; margin-bottom: 0.35rem; }
+    .digest-row { padding: 0.45rem 0; border-top: 1px solid #334155; min-width: 0; }
+    .digest-row p { overflow-wrap: anywhere; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mb-6" data-digest-source="{{ source }}">
+    <h1 class="text-2xl sm:text-3xl font-bold">Daily digest</h1>
+    <p class="text-slate-400 text-sm mt-1">{{ note }}</p>
+    {% if source_note %}
+    <p class="text-slate-300 text-sm mt-2">{{ source_note }}</p>
+    {% endif %}
+</div>
+
+{% if read_error %}
+<p class="text-slate-400 text-sm mb-4">{{ read_error }}</p>
+{% endif %}
+
+<form method="get" action="/digest" class="flex flex-wrap items-center gap-2 mb-4">
+    <label for="threshold" class="text-sm text-slate-400">Spike threshold (%)</label>
+    <input id="threshold" name="threshold" inputmode="decimal" value="{{ threshold_input }}"
+           class="w-24 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm">
+    <button type="submit" class="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-lg text-sm">Update</button>
+    {% if csv_href %}
+    <span class="digest-links text-sm">
+        <a href="{{ csv_href }}" class="text-emerald-300 hover:underline">CSV</a>
+        <a href="{{ json_href }}" class="text-emerald-300 hover:underline">JSON</a>
+    </span>
+    {% endif %}
+</form>
+
+<p class="text-slate-400 text-sm mb-4">{{ baseline_note }} A change of {{ threshold_label }} or more is marked Spike. That flag is not stored.</p>
+
+{% if artists %}
+<div class="digest-counts">
+    <div class="digest-count"><b>{{ overview.artist_count }}</b><span>Artists</span></div>
+    <div class="digest-count"><b>{{ overview.spike_count }}</b><span>Spikes</span></div>
+    <div class="digest-count"><b>{{ overview.release_count }}</b><span>Releases</span></div>
+    <div class="digest-count"><b>{{ overview.chart_count }}</b><span>Chart entries</span></div>
+    <div class="digest-count"><b>{{ overview.playlist_count }}</b><span>Playlist adds</span></div>
+    <div class="digest-count"><b>{{ overview.alert_count }}</b><span>Stored alerts</span></div>
+</div>
+{% endif %}
+
+{% if section_notes.metrics %}
+<p class="text-slate-400 text-sm mb-3">{{ section_notes.metrics }}</p>
+{% endif %}
+{% if section_notes.releases %}
+<p class="text-slate-400 text-sm mb-3">{{ section_notes.releases }}</p>
+{% endif %}
+{% if section_notes.charts %}
+<p class="text-slate-400 text-sm mb-3">{{ section_notes.charts }}</p>
+{% endif %}
+{% if section_notes.playlists %}
+<p class="text-slate-400 text-sm mb-3">{{ section_notes.playlists }}</p>
+{% endif %}
+{% if section_notes.alerts %}
+<p class="text-slate-400 text-sm mb-3">{{ section_notes.alerts }}</p>
+{% endif %}
+
+{% if overview.spikes %}
+<section class="digest-artist">
+    <h2 class="font-semibold mb-2">Threshold flags</h2>
+    <ul>
+        {% for spike in overview.spikes %}
+        <li class="digest-row">
+            <a href="/artist/{{ spike.artist_id }}" class="font-semibold hover:text-emerald-300">{{ spike.artist_name }}</a>
+            <p class="text-sm mt-1">{{ spike.label }} <span class="digest-spike">Spike</span></p>
+            <p class="font-mono text-emerald-300 text-sm">{{ spike.text }}</p>
+            <p class="digest-stamp mt-1">{{ spike.baseline_value }} at {{ spike.baseline_at }} → {{ spike.latest_value }} at {{ spike.latest_at }}</p>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+{% for artist in artists %}
+<section class="digest-artist">
+    <h2 class="text-lg font-semibold"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></h2>
+    {% if not section_notes.metrics %}
+        {% if artist.metrics %}
+        <ul class="mt-2">
+            {% for metric in artist.metrics %}
+            <li class="digest-metric" data-status="{{ metric.status }}">
+                <div class="font-medium">{{ metric.label }}{% if metric.spike %} <span class="digest-spike">Spike</span>{% endif %}</div>
+                <div class="text-sm">Latest {{ metric.latest_text }} <span class="digest-stamp">{{ metric.latest_at }}</span></div>
+                {% if metric.status == 'ok' %}
+                <div class="text-sm">Earlier {{ metric.baseline_text }} <span class="digest-stamp">{{ metric.baseline_at }}</span></div>
+                <div class="font-mono text-emerald-300 text-sm">{{ metric.text }}</div>
+                {% else %}
+                <div class="text-sm text-slate-300">{{ metric.text }}</div>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-slate-400 text-sm mt-2">{{ artist.metrics_note }}</p>
+        {% endif %}
+    {% endif %}
+
+    {% if artist.releases %}
+    <div class="digest-sub">
+        <h3>Releases</h3>
+        <ul>
+            {% for release in artist.releases %}
+            <li class="digest-row">
+                <p class="font-medium">{{ release.title }}{% if release.release_type %} <span class="text-slate-400 text-sm">{{ release.release_type }}</span>{% endif %}</p>
+                <p class="digest-stamp">{{ release.released_at }}</p>
+                <p class="text-slate-400 text-xs">{{ release.note }}</p>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    {% if artist.charts %}
+    <div class="digest-sub">
+        <h3>New chart entries</h3>
+        <ul>
+            {% for chart in artist.charts %}
+            <li class="digest-row">
+                <p class="font-medium">{{ chart.title }}</p>
+                <p class="text-sm text-slate-300">{{ chart.label }}{% if chart.position %} #{{ chart.position }}{% endif %} · {{ chart.chart_date }}</p>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    {% if artist.playlists %}
+    <div class="digest-sub">
+        <h3>New playlist adds</h3>
+        <ul>
+            {% for playlist in artist.playlists %}
+            <li class="digest-row">
+                <p class="font-medium">
+                    {% if playlist.url %}
+                    <a href="{{ playlist.url }}" class="hover:text-emerald-300">{{ playlist.playlist_name }}</a>
+                    {% else %}
+                    {{ playlist.playlist_name }}
+                    {% endif %}
+                </p>
+                <p class="digest-stamp">{{ playlist.first_seen_at }}</p>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    {% if artist.alerts %}
+    <div class="digest-sub">
+        <h3>Stored alerts</h3>
+        <ul>
+            {% for alert in artist.alerts %}
+            <li class="digest-row">
+                <p class="text-sm">{{ alert.provider }} {{ alert.metric }} · {{ alert.window }}
+                    <span class="font-mono text-emerald-300">{{ alert.delta_text }}{% if alert.percent %} · {{ alert.percent }}{% endif %}</span>
+                </p>
+                <p class="text-xs text-slate-400">{{ alert.baseline_value }} → {{ alert.latest_value }} · {{ alert.detected_at }}</p>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+</section>
+{% endfor %}
+
+{% if artists %}
+<section class="text-slate-400 text-sm mt-2 space-y-2">
+    <p>{{ release_note }}</p>
+    <p>{{ chart_note }}</p>
+    <p>{{ playlist_note }}</p>
+    <p>{{ alert_note }} <a href="/alerts" class="text-emerald-300 hover:underline">All alerts</a></p>
+</section>
+{% endif %}
+{% endblock %}
