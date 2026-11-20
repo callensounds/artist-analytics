@@ -82,6 +82,7 @@ from timing import (
     parse_days as parse_timing_days,
     parse_kind as parse_timing_kind,
     parse_scope as parse_timing_scope,
+    release_render_fields,
     render_timing_csv,
     render_timing_json,
 )
@@ -873,7 +874,7 @@ async def _timing_view(request: Request, user: dict, scope: str, days: str, kind
             kind=chosen_kind,
         )
     try:
-        return await asyncio.wait_for(
+        view = await asyncio.wait_for(
             build_timing(
                 db,
                 user_id=_digest_user_id(request, user),
@@ -886,13 +887,16 @@ async def _timing_view(request: Request, user: dict, scope: str, days: str, kind
         )
     except Exception as exc:
         log_read_failure("timing", exc)
-        return empty_timing(
+        view = empty_timing(
             TIMING_READ_ERROR,
             failed=True,
             scope=chosen_scope,
             days=chosen_days,
             kind=chosen_kind,
         )
+    # The read is finished. Drop the binding before the template or export encodes the view.
+    db = None
+    return view
 
 
 @app.get("/timing.csv")
@@ -908,8 +912,11 @@ async def timing_csv(request: Request, scope: str = "", days: str = "", kind: st
             status_code=503,
             media_type="text/plain; charset=utf-8",
         )
+    release_render_fields(view)
+    body = render_timing_csv(view)
+    del view
     return Response(
-        content=render_timing_csv(view),
+        content=body,
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="timing.csv"'},
     )
@@ -923,7 +930,10 @@ async def timing_json(request: Request, scope: str = "", days: str = "", kind: s
         return RedirectResponse("/login", status_code=303)
     view = await _timing_view(request, user, scope, days, kind)
     status = 503 if view.get("failed") else 200
-    return Response(render_timing_json(view), status_code=status, media_type="application/json")
+    release_render_fields(view)
+    body = render_timing_json(view)
+    del view
+    return Response(body, status_code=status, media_type="application/json")
 
 
 @app.get("/timing", response_class=HTMLResponse)

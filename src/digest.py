@@ -86,6 +86,7 @@ ALERT_NOTE = (
 )
 DATE_ONLY_NOTE = "Date only. No clock time is stored."
 EXACT_TIME_NOTE = "Exact UTC time."
+APPROXIMATE_NOTE = "approximate (rounded public count)"
 NO_COUNTS_NOTE = "No exact audience count is stored yet."
 SECTION_UNAVAILABLE = {
     "metrics": "Data temporarily unavailable. Stored audience counts could not be read on this request.",
@@ -491,6 +492,34 @@ def _point_map(parts: list) -> tuple[dict, set[tuple[str, str]], bool]:
     return points, failed, hard
 
 
+def public_count_is_rounded(value: object) -> bool:
+    """True when an integer is a rounded public K/M/B figure.
+
+    ``metric_snapshots.value_text`` is the compact label of whatever integer was
+    stored (an exact 1,432,100 is still saved as ``1.4M``). It is not a precision
+    flag, so the integer itself is the signal. TikTok's public pages show the
+    exact count below 10,000. From 10,000 the K display steps by 100 (``10.4K``,
+    ``100.2K``) or by 1,000 when the decimal is dropped (``101K``); both land on
+    a multiple of 100. From 1,000,000 the M display steps by 100,000 (``1.4M``).
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 10_000:
+        return False
+    if value >= 1_000_000_000:
+        unit = 100_000_000
+    elif value >= 1_000_000:
+        unit = 100_000
+    else:
+        unit = 100
+    return value % unit == 0
+
+
+def _rounded_tiktok_followers(source: str, metric: str, latest: int | None, baseline: int | None) -> bool:
+    """A TikTok follower delta is approximate when either stored count is a rounded public figure."""
+    if source != "tiktok" or metric != "Followers":
+        return False
+    return public_count_is_rounded(latest) or public_count_is_rounded(baseline)
+
+
 def _count_text(value: int | None) -> str:
     if value is None:
         return ""
@@ -524,7 +553,11 @@ def _metric_row(
     tenths = None
     if status == "ok" and isinstance(change, int) and isinstance(baseline_value, int):
         tenths = percent_tenths(change, baseline_value)
-    spike = tenths is not None and abs(tenths) >= threshold_tenths
+    approximate = status == "ok" and _rounded_tiktok_followers(
+        source, metric, latest["value"], baseline_value if isinstance(baseline_value, int) else None
+    )
+    # A rounded public count is not an exact change, so it does not trip the threshold.
+    spike = tenths is not None and abs(tenths) >= threshold_tenths and not approximate
     return {
         "source": source,
         "metric": metric,
@@ -540,6 +573,7 @@ def _metric_row(
         "text": text,
         "status": "missing" if status not in {"ok", "unavailable"} else status,
         "spike": spike,
+        "approximate": approximate,
         "tenths": tenths,
     }
 
@@ -902,6 +936,7 @@ def _metric_document(metric: dict) -> dict:
         "text": metric["text"],
         "status": metric["status"],
         "spike": bool(metric["spike"]),
+        "approximate": bool(metric.get("approximate")),
     }
 
 
@@ -1019,6 +1054,7 @@ def render_digest_csv(view: dict) -> str:
         "percent",
         "status",
         "spike",
+        "approximate",
         "title",
         "detail",
         "occurred_at",
@@ -1047,6 +1083,7 @@ def render_digest_csv(view: dict) -> str:
                     _blank(metric["percent"]),
                     metric["status"],
                     "yes" if metric["spike"] else "no",
+                    "true" if metric.get("approximate") else "false",
                     "",
                     metric["text"],
                     metric["latest_at"],
@@ -1070,6 +1107,7 @@ def render_digest_csv(view: dict) -> str:
                     "",
                     release["precision"],
                     "",
+                    "false",
                     release["title"],
                     release["note"],
                     release["released_at"],
@@ -1094,6 +1132,7 @@ def render_digest_csv(view: dict) -> str:
                     "",
                     chart["territory"],
                     "",
+                    "false",
                     chart["title"],
                     detail,
                     chart["chart_date"],
@@ -1117,6 +1156,7 @@ def render_digest_csv(view: dict) -> str:
                     "",
                     "",
                     "",
+                    "false",
                     playlist["playlist_name"],
                     playlist["url"],
                     playlist["first_seen_at"],
@@ -1140,6 +1180,7 @@ def render_digest_csv(view: dict) -> str:
                     _blank(alert.get("percent")),
                     "stored",
                     "",
+                    "false",
                     alert.get("window") or "",
                     alert.get("delta_text") or "",
                     alert.get("detected_at") or "",
@@ -1163,6 +1204,7 @@ def render_digest_csv(view: dict) -> str:
                 _blank(spike.get("percent")),
                 "spike",
                 "yes",
+                "false",
                 spike.get("label") or "",
                 spike.get("text") or "",
                 spike.get("latest_at") or "",

@@ -3,6 +3,11 @@
 Hours and weekdays are UTC. A stored precision is never made finer: an hour
 comes only from an exact timestamp, and a month or a year is not placed on a
 day. The same release title on the same UTC day is counted once.
+
+All stored dates has no time bound, so that window reads only the newest
+``ALL_TIME_ROW_CAP`` rows per table. The page says so when the cap is hit.
+Text columns are shortened in SQL so a huge stored string never lands in the
+isolate, and each stamp is parsed once.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import io
 import json
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from analytics import (
@@ -25,7 +30,7 @@ from analytics import (
     peak,
     stated_precision,
 )
-from compare import compound_select_terms, like_glob_patterns, timing_role
+from compare import compound_select_terms, like_glob_patterns
 from db import log_read_failure, missing_table, read_many, utc_now
 from export_csv import formula_safe
 
@@ -37,6 +42,17 @@ PATTERN_LIMIT = 50
 # a probe so the page can say the cap was hit without a second query.
 ARTIST_CAP = 40
 ROW_CAP = 2000
+# Days=all has no timestamp predicate. Two 2,000-row reads, plus a parsed copy
+# of each row, were enough to trip the 128MB isolate limit (error 1102) while
+# CPU was still ~150ms. The all-time window keeps the newest rows only.
+ALL_TIME_ROW_CAP = 400
+# Match the slices below. SQLite returns the shortened text, not the stored blob.
+_TEXT_SOURCE = 40
+_TEXT_ID = 80
+_TEXT_TITLE = 200
+_TEXT_KIND = 40
+_TEXT_STAMP = 80
+_TEXT_PRECISION = 16
 MODAL_MIN_EXACT = 3
 NOT_ENOUGH_EXACT = "not enough exact timestamps"
 PAGE_NOTE = (
@@ -140,8 +156,21 @@ def _ids(artist_ids: list[int]) -> list[int]:
     return found
 
 
+def row_cap(days: str) -> int:
+    """Rows read per table. All stored dates uses the smaller newest-N cap."""
+    if parse_days(days) == "all":
+        return ALL_TIME_ROW_CAP
+    return ROW_CAP
+
+
 def _marks(count: int) -> str:
     return ",".join("?" * count)
+
+
+def _short(column: str, width: int, alias: str = "") -> str:
+    """Projected text, capped. The ORDER BY column stays bare so it can use an index."""
+    name = alias or column
+    return f"substr({column}, 1, {int(width)}) AS {name}"
 
 
 def _check(sql: str, params: tuple) -> tuple[str, tuple]:
@@ -210,12 +239,21 @@ def tracked_statement() -> tuple[str, tuple]:
     return _check(sql, ())
 
 
-def _sighting_statement(artist_ids: list[int], kind: str, bounds: tuple[str, str] | None) -> tuple[str, tuple]:
+def _sighting_statement(
+    artist_ids: list[int], kind: str, bounds: tuple[str, str] | None, cap: int
+) -> tuple[str, tuple]:
     params: tuple = tuple(artist_ids)
     if bounds is not None:
         params = (*params, bounds[0], bounds[1])
+    # ``published_at`` is ordered as stored text. Wrapping it would block a seek.
     sql = f"""
-        SELECT artist_id, source, external_id, title, kind, published_at, precision
+        SELECT artist_id,
+               {_short("source", _TEXT_SOURCE)},
+               {_short("external_id", _TEXT_ID)},
+               {_short("title", _TEXT_TITLE)},
+               {_short("kind", _TEXT_KIND)},
+               {_short("published_at", _TEXT_STAMP)},
+               {_short("precision", _TEXT_PRECISION)}
         FROM content_sightings
         WHERE artist_id IN ({_marks(len(artist_ids))})
           AND published_at IS NOT NULL
@@ -223,25 +261,30 @@ def _sighting_statement(artist_ids: list[int], kind: str, bounds: tuple[str, str
           {_range_sql("published_at", bounds)}
           {_kind_sql(kind)}
         ORDER BY published_at DESC
-        LIMIT {int(ROW_CAP) + 1}
+        LIMIT {int(cap) + 1}
     """
     return _check(sql, params)
 
 
-def _release_statement(artist_ids: list[int], bounds: tuple[str, str] | None) -> tuple[str, tuple]:
-    """``idx_mb_releases_artist`` is (artist_id, released_at)."""
+def _release_statement(artist_ids: list[int], bounds: tuple[str, str] | None, cap: int) -> tuple[str, tuple]:
+    """``idx_mb_releases_artist`` is (artist_id, released_at). Order by that column, bare."""
     params: tuple = tuple(artist_ids)
     if bounds is not None:
         params = (*params, bounds[0], bounds[1])
     sql = f"""
-        SELECT artist_id, mbid, title, release_type, released_at, precision
+        SELECT artist_id,
+               {_short("mbid", _TEXT_ID)},
+               {_short("title", _TEXT_TITLE)},
+               {_short("release_type", _TEXT_KIND, "release_type")},
+               {_short("released_at", _TEXT_STAMP)},
+               {_short("precision", _TEXT_PRECISION)}
         FROM musicbrainz_releases
         WHERE artist_id IN ({_marks(len(artist_ids))})
           AND released_at IS NOT NULL
           AND released_at != ''
           {_range_sql("released_at", bounds)}
         ORDER BY released_at DESC
-        LIMIT {int(ROW_CAP) + 1}
+        LIMIT {int(cap) + 1}
     """
     return _check(sql, params)
 
@@ -252,10 +295,12 @@ def event_statements(artist_ids: list[int], *, kind: str, days: str, now: dateti
     if not ids:
         return []
     chosen_kind = parse_kind(kind)
-    bounds = _sql_bounds(now, parse_days(days))
-    statements = [_sighting_statement(ids, chosen_kind, bounds)]
+    chosen_days = parse_days(days)
+    bounds = _sql_bounds(now, chosen_days)
+    cap = row_cap(chosen_days)
+    statements = [_sighting_statement(ids, chosen_kind, bounds, cap)]
     if chosen_kind != "post":
-        statements.append(_release_statement(ids, bounds))
+        statements.append(_release_statement(ids, bounds, cap))
     return statements
 
 
@@ -283,12 +328,64 @@ def _window(now: datetime, days: str) -> dict | None:
     }
 
 
+def _real_day(day: str) -> bool:
+    """A real YYYY-MM-DD. Invalid days fail the same way ``parse_utc`` does, without a datetime."""
+    if len(day) != 10 or day[4] != "-" or day[7] != "-":
+        return False
+    year_s, month_s, dom_s = day[0:4], day[5:7], day[8:10]
+    if not (year_s.isdigit() and month_s.isdigit() and dom_s.isdigit()):
+        return False
+    year, month, dom = int(year_s), int(month_s), int(dom_s)
+    if not (1 <= year <= 9999 and 1 <= month <= 12):
+        return False
+    return 1 <= dom <= monthrange(year, month)[1]
+
+
 def _weekday_of_day(day: str) -> int | None:
     """Weekday of a calendar date. The midnight instant is not an hour bucket."""
-    moment = parse_utc(day + "T00:00:00Z")
-    if moment is None or moment.strftime("%Y-%m-%d") != day:
+    if not _real_day(day):
         return None
-    return moment.weekday()
+    return date(int(day[0:4]), int(day[5:7]), int(day[8:10])).weekday()
+
+
+def _place_stamp(raw: str, precision: str):
+    """One parse of a stored stamp.
+
+    Returns role, stated precision, UTC moment, weekday, hour, UTC day, coarse
+    key, and rank. A date-only value has no hour. A month or a year is coarse.
+    """
+    stated = stated_precision(raw, precision)
+    if stated == "time":
+        moment = parse_utc(raw)
+        day = raw[:10]
+        if moment is not None and _real_day(day):
+            moment = moment.astimezone(timezone.utc)
+            return (
+                "time",
+                "time",
+                moment,
+                moment.weekday(),
+                moment.hour,
+                moment.strftime("%Y-%m-%d"),
+                "",
+                PRECISION_RANK["time"],
+            )
+        weekday = _weekday_of_day(day)
+        if weekday is None:
+            return None
+        return ("day", "day", None, weekday, None, day, "", PRECISION_RANK["day"])
+    if stated == "day":
+        day = raw[:10]
+        weekday = _weekday_of_day(day)
+        if weekday is None:
+            return None
+        return ("day", "day", None, weekday, None, day, "", PRECISION_RANK["day"])
+    if stated not in {"month", "year"}:
+        return None
+    coarse_key = _coarse_key(stated, raw)
+    if not coarse_key:
+        return None
+    return ("coarse", stated, None, None, None, "", coarse_key, PRECISION_RANK[stated])
 
 
 def _coarse_key(stated: str, raw: str) -> str:
@@ -355,7 +452,7 @@ def source_label(source: str) -> str:
     return cleaned[:40].title()
 
 
-@dataclass
+@dataclass(slots=True)
 class _Event:
     artist_id: int
     source: str
@@ -382,84 +479,46 @@ def _classify_row(row: dict, *, kind: str, window: dict | None, allowed: set[int
         return None
     if artist_id not in allowed:
         return None
-    source = str(row.get("source") or "").strip().lower()[:40]
-    raw_kind = str(row.get("kind") or "").strip().lower()[:40]
+    # MusicBrainz rows stay in their own shape. Copying them into sighting dicts
+    # held a second string for every release while the original was still live.
+    if "released_at" in row and "published_at" not in row:
+        source = "musicbrainz"
+        raw_kind = str(row.get("release_type") or "release").strip().lower()[:_TEXT_KIND]
+        external_id = str(row.get("mbid") or "").strip()[:_TEXT_ID]
+        raw = str(row.get("released_at") or "").strip()[:_TEXT_STAMP]
+    else:
+        source = str(row.get("source") or "").strip().lower()[:_TEXT_SOURCE]
+        raw_kind = str(row.get("kind") or "").strip().lower()[:_TEXT_KIND]
+        external_id = str(row.get("external_id") or "").strip()[:_TEXT_ID]
+        raw = str(row.get("published_at") or "").strip()[:_TEXT_STAMP]
+    if not raw:
+        return None
     group = event_group(source, raw_kind)
     if kind != "all" and group != kind:
         return None
-    raw = str(row.get("published_at") or "").strip()[:80]
-    if not raw:
+    placed = _place_stamp(raw, str(row.get("precision") or ""))
+    if placed is None:
         return None
-    precision = str(row.get("precision") or "")
-    # timing_role already applies stated_precision, so a clock is never invented.
-    role = timing_role(precision, raw)
-    stated = stated_precision(raw, precision)
-    title = " ".join(str(row.get("title") or "").split())[:200]
-    external_id = str(row.get("external_id") or "").strip()[:80]
-    if role == "time":
-        moment = parse_utc(raw)
-        if moment is None:
-            return None
-        moment = moment.astimezone(timezone.utc)
-        if not _in_window("time", raw, moment, window):
-            return None
-        return _Event(
-            artist_id=artist_id,
-            source=source,
-            external_id=external_id,
-            title=title,
-            group=group,
-            role="time",
-            stated="time",
-            raw=raw,
-            utc_day=moment.strftime("%Y-%m-%d"),
-            weekday=moment.weekday(),
-            hour=moment.hour,
-            moment=moment,
-            coarse_key="",
-            rank=PRECISION_RANK["time"],
-        )
-    if role == "day":
-        day = raw[:10]
-        weekday = _weekday_of_day(day)
-        if weekday is None or not _in_window("day", raw, None, window):
-            return None
-        return _Event(
-            artist_id=artist_id,
-            source=source,
-            external_id=external_id,
-            title=title,
-            group=group,
-            role="day",
-            stated="day",
-            raw=raw,
-            utc_day=day,
-            weekday=weekday,
-            hour=None,
-            moment=None,
-            coarse_key="",
-            rank=PRECISION_RANK["day"],
-        )
-    if stated not in {"month", "year"}:
+    role, stated, moment, weekday, hour, utc_day, coarse_key, rank = placed
+    window_kind = stated if role == "coarse" else role
+    if not _in_window(window_kind, raw, moment, window):
         return None
-    coarse_key = _coarse_key(stated, raw)
-    if not coarse_key or not _in_window(stated, raw, None, window):
-        return None
+    title = " ".join(str(row.get("title") or "").split())[:_TEXT_TITLE]
     return _Event(
         artist_id=artist_id,
         source=source,
         external_id=external_id,
         title=title,
         group=group,
-        role="coarse",
+        role=role,
         stated=stated,
         raw=raw,
-        utc_day="",
-        weekday=None,
-        hour=None,
-        moment=None,
+        utc_day=utc_day,
+        weekday=weekday,
+        hour=hour,
+        moment=moment,
         coarse_key=coarse_key,
-        rank=PRECISION_RANK[stated],
+        rank=rank,
     )
 
 
@@ -472,37 +531,6 @@ def _prefer(candidate: _Event, current: _Event) -> bool:
     if cand_moment != curr_moment:
         return cand_moment > curr_moment
     return (candidate.source, candidate.external_id) < (current.source, current.external_id)
-
-
-def _dedupe(events: list[_Event]) -> tuple[list[_Event], int]:
-    """Collapse the same release. Posts stay as stored. A month is not given a day."""
-    kept: list[_Event] = []
-    dated: dict[tuple, _Event] = {}
-    coarse: dict[tuple, _Event] = {}
-    for event in events:
-        if event.group != "release":
-            kept.append(event)
-            continue
-        title_key = normalize_name(event.title)
-        if not title_key:
-            kept.append(event)
-            continue
-        if event.role in {"time", "day"} and event.utc_day:
-            key = (event.artist_id, title_key, event.utc_day)
-            bucket = dated
-        elif event.role == "coarse" and event.coarse_key:
-            key = (event.artist_id, title_key, "coarse", event.coarse_key)
-            bucket = coarse
-        else:
-            kept.append(event)
-            continue
-        current = bucket.get(key)
-        if current is None or _prefer(event, current):
-            bucket[key] = event
-    kept.extend(dated.values())
-    kept.extend(coarse.values())
-    collapsed = len(events) - len(kept)
-    return kept, max(collapsed, 0)
 
 
 def _source_sort(source: str) -> tuple:
@@ -625,40 +653,179 @@ def _insights(release_friday: int, release_dated: int, post_friday: int, post_da
     return lines
 
 
-def _artist_row(artist: dict, events: list[_Event]) -> dict:
-    weekday_counts = [0] * 7
-    hour_counts = [0] * 24
-    exact_days = [0] * 7
-    exact = 0
-    dated = 0
-    friday = 0
-    latest = ""
-    latest_moment: datetime | None = None
-    for event in events:
-        if event.role == "time" and event.hour is not None and event.weekday is not None:
-            exact += 1
-            hour_counts[event.hour] += 1
-            weekday_counts[event.weekday] += 1
-            exact_days[event.weekday] += 1
-            dated += 1
-            if event.weekday == 4:
-                friday += 1
-            if event.moment is not None and (
-                latest_moment is None
-                or event.moment > latest_moment
-                or (event.moment == latest_moment and event.raw > latest)
-            ):
-                latest_moment = event.moment
-                latest = event.raw
-        elif event.role == "day" and event.weekday is not None:
-            weekday_counts[event.weekday] += 1
-            dated += 1
-            if event.weekday == 4:
-                friday += 1
+class _Tally:
+    """Per-artist counters. Events are not kept once they have been counted."""
+
+    __slots__ = ("exact", "dated", "friday", "weekday", "hour", "exact_days", "latest", "latest_moment")
+
+    def __init__(self):
+        self.exact = 0
+        self.dated = 0
+        self.friday = 0
+        self.weekday = [0] * 7
+        self.hour = [0] * 24
+        self.exact_days = [0] * 7
+        self.latest = ""
+        self.latest_moment = None
+
+
+class _Fold:
+    """Running totals. Dedupe maps hold one winning release, not every row."""
+
+    __slots__ = (
+        "classified",
+        "immediate",
+        "dated",
+        "coarse_kept",
+        "sources",
+        "tallies",
+        "heatmap",
+        "weekday_counts",
+        "hour_counts",
+        "exact",
+        "day",
+        "coarse",
+        "release_dated",
+        "release_friday",
+        "post_dated",
+        "post_friday",
+    )
+
+    def __init__(self, artist_ids: list[int]):
+        self.classified = 0
+        self.immediate = 0
+        self.dated: dict[tuple, _Event] = {}
+        self.coarse_kept: dict[tuple, _Event] = {}
+        self.sources: dict[str, dict] = {}
+        self.tallies = {artist_id: _Tally() for artist_id in artist_ids}
+        self.heatmap = _zero_heatmap()
+        self.weekday_counts = [0] * 7
+        self.hour_counts = [0] * 24
+        self.exact = 0
+        self.day = 0
+        self.coarse = 0
+        self.release_dated = 0
+        self.release_friday = 0
+        self.post_dated = 0
+        self.post_friday = 0
+
+
+def _bump_source(sources: dict[str, dict], event: _Event) -> None:
+    row = sources.get(event.source)
+    if row is None:
+        row = {"source": event.source, "label": source_label(event.source), "exact": 0, "day": 0, "coarse": 0}
+        sources[event.source] = row
+    if event.role == "time":
+        row["exact"] += 1
+    elif event.role == "day":
+        row["day"] += 1
+    else:
+        row["coarse"] += 1
+
+
+def _apply_kept(state: _Fold, event: _Event) -> None:
+    tally = state.tallies.get(event.artist_id)
+    if tally is None:
+        return
+    if event.role == "coarse":
+        state.coarse += 1
+        return
+    if event.weekday is None:
+        return
+    friday = event.weekday == 4
+    if event.role == "time" and event.hour is not None:
+        state.exact += 1
+        state.heatmap[event.weekday][event.hour] += 1
+        state.weekday_counts[event.weekday] += 1
+        state.hour_counts[event.hour] += 1
+        tally.exact += 1
+        tally.hour[event.hour] += 1
+        tally.weekday[event.weekday] += 1
+        tally.exact_days[event.weekday] += 1
+        tally.dated += 1
+        if friday:
+            tally.friday += 1
+        if event.moment is not None and (
+            tally.latest_moment is None
+            or event.moment > tally.latest_moment
+            or (event.moment == tally.latest_moment and event.raw > tally.latest)
+        ):
+            tally.latest_moment = event.moment
+            tally.latest = event.raw
+    elif event.role == "day":
+        state.day += 1
+        state.weekday_counts[event.weekday] += 1
+        tally.weekday[event.weekday] += 1
+        tally.dated += 1
+        if friday:
+            tally.friday += 1
+    else:
+        return
+    if event.group == "release":
+        state.release_dated += 1
+        state.release_friday += int(friday)
+    elif event.group == "post":
+        state.post_dated += 1
+        state.post_friday += int(friday)
+
+
+def _keep_release(state: _Fold, event: _Event, title_key: str) -> None:
+    if event.role in {"time", "day"} and event.utc_day:
+        key = (event.artist_id, title_key, event.utc_day)
+        bucket = state.dated
+    elif event.role == "coarse" and event.coarse_key:
+        key = (event.artist_id, title_key, event.coarse_key)
+        bucket = state.coarse_kept
+    else:
+        state.immediate += 1
+        _apply_kept(state, event)
+        return
+    current = bucket.get(key)
+    if current is None or _prefer(event, current):
+        # The title is only the dedupe key. Drop it so the winner does not keep a second copy.
+        event.title = ""
+        bucket[key] = event
+
+
+def _consume(state: _Fold, rows, *, kind: str, window: dict | None, allowed: set[int]) -> None:
+    for row in rows or []:
+        event = _classify_row(row, kind=kind, window=window, allowed=allowed)
+        if event is None:
+            continue
+        state.classified += 1
+        _bump_source(state.sources, event)
+        if event.group != "release":
+            state.immediate += 1
+            _apply_kept(state, event)
+            continue
+        title_key = normalize_name(event.title)
+        if not title_key:
+            state.immediate += 1
+            _apply_kept(state, event)
+            continue
+        _keep_release(state, event, title_key)
+
+
+def _finish_fold(state: _Fold) -> int:
+    collapsed = state.classified - state.immediate - len(state.dated) - len(state.coarse_kept)
+    winners = list(state.dated.values())
+    winners.extend(state.coarse_kept.values())
+    state.dated.clear()
+    state.coarse_kept.clear()
+    for event in winners:
+        _apply_kept(state, event)
+    del winners
+    return max(collapsed, 0)
+
+
+def _artist_row(artist: dict, tally: _Tally) -> dict:
+    exact = tally.exact
+    dated = tally.dated
+    friday = tally.friday
     if exact >= MODAL_MIN_EXACT:
         # Weekday and hour both come from exact timestamps. A date-only row is not a mode.
-        day_peak = peak(exact_days, list(WEEKDAYS))
-        hour_peak = peak(hour_counts, [f"{hour:02d}:00" for hour in range(24)])
+        day_peak = peak(tally.exact_days, list(WEEKDAYS))
+        hour_peak = peak(tally.hour, [f"{hour:02d}:00" for hour in range(24)])
         modal_weekday = day_peak["label"] if day_peak else ""
         modal_hour = hour_peak["label"] if hour_peak else ""
         modal_note = ""
@@ -676,9 +843,9 @@ def _artist_row(artist: dict, events: list[_Event]) -> dict:
         "friday_count": friday,
         "dated_count": dated,
         "friday_share": f"{friday} of {dated}" if dated else "",
-        "latest_exact_at": latest,
-        "weekday_counts": weekday_counts,
-        "hour_counts": hour_counts,
+        "latest_exact_at": tally.latest,
+        "weekday_counts": tally.weekday,
+        "hour_counts": tally.hour,
     }
 
 
@@ -752,17 +919,16 @@ def assemble_timing(
         if len(cleaned) >= ARTIST_CAP:
             break
     view = _chrome(chosen_scope, chosen_days, chosen_kind, moment)
+    cap = row_cap(chosen_days)
+    sightings, sighting_cap_hit = _bound_rows(sightings, cap, sighting_cap_hit)
+    releases, release_cap_hit = _bound_rows(releases, cap, release_cap_hit)
     notes = []
     if artist_cap_hit:
         notes.append(f"The artist list stopped at {ARTIST_CAP}. Further artists were not read.")
     if sighting_cap_hit:
-        notes.append(
-            f"Content rows stopped at {ROW_CAP}, newest timestamp first. Older rows in this window were not included."
-        )
+        notes.append(_row_cap_note("content", cap, all_time=chosen_days == "all"))
     if release_cap_hit:
-        notes.append(
-            f"MusicBrainz rows stopped at {ROW_CAP}, newest timestamp first. Older rows in this window were not included."
-        )
+        notes.append(_row_cap_note("MusicBrainz", cap, all_time=chosen_days == "all"))
     for note in section_notes or []:
         if note:
             notes.append(note)
@@ -785,12 +951,15 @@ def assemble_timing(
 
     allowed = {artist["id"] for artist in cleaned}
     window = _window(moment, chosen_days)
-    classified: list[_Event] = []
-    for row in list(sightings or []) + list(releases or []):
-        event = _classify_row(row, kind=chosen_kind, window=window, allowed=allowed)
-        if event is not None:
-            classified.append(event)
-    kept, collapsed = _dedupe(classified)
+    state = _Fold([artist["id"] for artist in cleaned])
+    _consume(state, sightings, kind=chosen_kind, window=window, allowed=allowed)
+    # The sighting dicts are the caller's until this function returns. Drop our
+    # reference before the release pass so both tables are not live together
+    # with the dedupe map.
+    del sightings
+    _consume(state, releases, kind=chosen_kind, window=window, allowed=allowed)
+    del releases
+    collapsed = _finish_fold(state)
     if collapsed:
         noun = "row" if collapsed == 1 else "rows"
         notes.append(
@@ -798,60 +967,17 @@ def assemble_timing(
             "The most precise timestamp was kept."
         )
 
-    heatmap = _zero_heatmap()
-    weekday_counts = [0] * 7
-    hour_counts = [0] * 24
-    exact = day = coarse = 0
-    release_dated = release_friday = post_dated = post_friday = 0
-    by_artist: dict[int, list[_Event]] = {artist["id"]: [] for artist in cleaned}
-    for event in kept:
-        bucket = by_artist.get(event.artist_id)
-        if bucket is None:
-            continue
-        bucket.append(event)
-        if event.role == "coarse":
-            coarse += 1
-            continue
-        if event.weekday is None:
-            continue
-        if event.role == "time" and event.hour is not None:
-            exact += 1
-            heatmap[event.weekday][event.hour] += 1
-            weekday_counts[event.weekday] += 1
-            hour_counts[event.hour] += 1
-        elif event.role == "day":
-            day += 1
-            weekday_counts[event.weekday] += 1
-        else:
-            continue
-        friday = event.weekday == 4
-        if event.group == "release":
-            release_dated += 1
-            release_friday += int(friday)
-        elif event.group == "post":
-            post_dated += 1
-            post_friday += int(friday)
-
-    sources: dict[str, dict] = {}
-    for event in classified:
-        row = sources.get(event.source)
-        if row is None:
-            row = {"source": event.source, "label": source_label(event.source), "exact": 0, "day": 0, "coarse": 0}
-            sources[event.source] = row
-        if event.role == "time":
-            row["exact"] += 1
-        elif event.role == "day":
-            row["day"] += 1
-        else:
-            row["coarse"] += 1
-    source_rows = [sources[key] for key in sorted(sources, key=_source_sort)]
-
-    artist_rows = [_artist_row(artist, by_artist[artist["id"]]) for artist in cleaned]
+    source_rows = [state.sources[key] for key in sorted(state.sources, key=_source_sort)]
+    artist_rows = [_artist_row(artist, state.tallies[artist["id"]]) for artist in cleaned]
+    state.tallies.clear()
     artist_rows.sort(key=lambda item: (-item["exact_count"], item["name"].casefold(), item["id"]))
+    exact = state.exact
+    day = state.day
+    coarse = state.coarse
     counted = exact + day + coarse
     counts = {
         "artists": len(cleaned),
-        "stored_rows": len(classified),
+        "stored_rows": state.classified,
         "counted": counted,
         "exact": exact,
         "day": day,
@@ -861,9 +987,12 @@ def assemble_timing(
     }
     nonzero = [
         {"hour": hour, "label": f"{hour:02d}:00 UTC", "count": count}
-        for hour, count in enumerate(hour_counts)
+        for hour, count in enumerate(state.hour_counts)
         if count
     ]
+    heatmap = state.heatmap
+    weekday_counts = state.weekday_counts
+    hour_counts = state.hour_counts
     view.update(
         {
             "failed": False,
@@ -881,7 +1010,9 @@ def assemble_timing(
             "nonzero_hours": nonzero,
             "hour_reason": "" if exact else HOUR_EMPTY,
             "weekday_reason": "" if exact + day else WEEKDAY_EMPTY,
-            "insights": _insights(release_friday, release_dated, post_friday, post_dated, chosen_kind),
+            "insights": _insights(
+                state.release_friday, state.release_dated, state.post_friday, state.post_dated, chosen_kind
+            ),
             "sources": source_rows,
             "artists": artist_rows,
         }
@@ -889,10 +1020,28 @@ def assemble_timing(
     return view
 
 
-def _cap_rows(rows: list) -> tuple[list, bool]:
-    if len(rows) > ROW_CAP:
-        return rows[:ROW_CAP], True
-    return rows, False
+def _row_cap_note(label: str, cap: int, *, all_time: bool) -> str:
+    if all_time:
+        noun = "content rows" if label == "content" else "MusicBrainz rows"
+        return (
+            f"All stored dates is capped at the newest {cap} {noun}. "
+            "Older rows were not included."
+        )
+    noun = "Content rows" if label == "content" else "MusicBrainz rows"
+    return f"{noun} stopped at {cap}, newest timestamp first. Older rows in this window were not included."
+
+
+def _bound_rows(rows, cap: int, hit: bool) -> tuple[list, bool]:
+    """Keep the leading rows, which the SQL returns newest first. Say so when the rest is dropped."""
+    if not rows:
+        return [], hit
+    if len(rows) > cap:
+        return list(rows[:cap]), True
+    return rows, hit
+
+
+def _cap_rows(rows: list, cap: int) -> tuple[list, bool]:
+    return _bound_rows(rows, cap, False)
 
 
 def _clean_loaded_artists(rows: list | None) -> tuple[list[dict], bool]:
@@ -911,35 +1060,6 @@ def _clean_loaded_artists(rows: list | None) -> tuple[list[dict], bool]:
         cleaned.append(row)
     cap_hit = len(cleaned) > ARTIST_CAP
     return cleaned[:ARTIST_CAP], cap_hit
-
-
-def _as_sighting(row: dict, *, source: str, external_id: str, kind: str, published_at: str) -> dict:
-    return {
-        "artist_id": row.get("artist_id"),
-        "source": source,
-        "external_id": external_id,
-        "title": row.get("title"),
-        "kind": kind,
-        "published_at": published_at,
-        "precision": row.get("precision"),
-    }
-
-
-def _release_rows(rows: list) -> list[dict]:
-    found = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        found.append(
-            _as_sighting(
-                row,
-                source="musicbrainz",
-                external_id=str(row.get("mbid") or ""),
-                kind=str(row.get("release_type") or "release"),
-                published_at=str(row.get("released_at") or ""),
-            )
-        )
-    return found
 
 
 def _read_rows(found, label: str) -> tuple[list | None, str]:
@@ -999,14 +1119,20 @@ async def _build(db, *, user_id: int | None, scope: str, days: str, kind: str, n
     if len(found) != len(statements):
         raise RuntimeError("timing read count")
     sighting_rows, sighting_problem = _read_rows(found[0], "timing sightings")
+    found[0] = None
     release_rows: list | None = []
     release_problem = ""
     if kind != "post":
         release_rows, release_problem = _read_rows(found[1], "timing releases")
+        found[1] = None
+    del found
     if sighting_rows is None or release_rows is None:
         return empty_timing(TIMING_READ_ERROR, failed=True, scope=scope, days=days, kind=kind, now=now)
-    sightings, sighting_cap_hit = _cap_rows(sighting_rows)
-    releases, release_cap_hit = _cap_rows(_release_rows(release_rows))
+    cap = row_cap(days)
+    sightings, sighting_cap_hit = _cap_rows(sighting_rows, cap)
+    del sighting_rows
+    releases, release_cap_hit = _cap_rows(release_rows, cap)
+    del release_rows
     section_notes = []
     if sighting_problem == "missing":
         section_notes.append("Content sightings are not stored yet.")
@@ -1150,18 +1276,32 @@ def timing_csv_columns() -> list[str]:
     ]
 
 
+_HTML_ONLY = ("heatmap_rows", "weekday_bars", "scope_options", "days_options", "kind_options", "nonzero_hours")
+
+
+def release_render_fields(view: dict) -> None:
+    """Drop HTML-only cells before CSV or JSON so both are not live with the document."""
+    for key in _HTML_ONLY:
+        view.pop(key, None)
+
+
 def render_timing_csv(view: dict) -> str:
-    """One row per artist. Counts are the deduped chart counts. Formula text is escaped."""
-    document = timing_document(view)
+    """One row per artist. Counts are the deduped chart counts. Formula text is escaped.
+
+    Reads the view that was already built. It does not classify the rows again.
+    """
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(timing_csv_columns())
-    for artist in document["artists"]:
+    scope = formula_safe(view.get("scope") or "")
+    days = formula_safe(view.get("days") or "")
+    kind = formula_safe(view.get("kind") or "")
+    for artist in view.get("artists") or []:
         writer.writerow(
             [
-                formula_safe(document["scope"]),
-                formula_safe(document["days"]),
-                formula_safe(document["kind"]),
+                scope,
+                days,
+                kind,
                 artist["id"],
                 formula_safe(artist["name"]),
                 artist["exact_count"],
