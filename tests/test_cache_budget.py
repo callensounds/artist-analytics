@@ -274,7 +274,7 @@ def test_heavy_paths_are_the_large_pages_only():
     assert not main.heavy_request_path("/search")
 
 
-def test_heavy_routes_collect_once_and_keep_their_content(monkeypatch, tmp_path, capsys):
+def test_heavy_routes_do_not_collect_and_keep_their_content(monkeypatch, tmp_path, capsys):
     path = tmp_path / "memory.sqlite"
     monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
     reset_pool()
@@ -341,26 +341,19 @@ def test_heavy_routes_collect_once_and_keep_their_content(monkeypatch, tmp_path,
         if response.headers["content-type"].startswith("text/html"):
             assert response.text.rstrip().endswith("</html>"), url
         first[url] = _stable_body(url, response.text)
-    assert len(calls) == len(heavy)
+    assert calls == []
     logged_heap = capsys.readouterr().out
-    assert "mem heap_mb=100 path=/favicon.ico" in logged_heap
-    assert "mem heap_mb=100 path=/dashboard" in logged_heap
-    assert "mem heap_mb=100 path=/login" in logged_heap
+    heap_lines = [line for line in logged_heap.splitlines() if line.startswith("mem heap_mb=")]
+    assert heap_lines == [f"mem heap_mb=100 path={url.split('?', 1)[0]}" for url, _status, _marker in heavy]
+    assert "path=/favicon.ico" not in logged_heap
+    assert "path=/login" not in logged_heap
 
     for url, status, marker in heavy:
         again = client.get(url)
         assert again.status_code == status, url
         assert _stable_body(url, again.text) == first[url], url
         assert marker in again.text
-    assert len(calls) == len(heavy) * 2
-
-    def broken():
-        raise RuntimeError("collect failed")
-
-    monkeypatch.setattr(gc, "collect", broken)
-    still = client.get("/timing")
-    assert still.status_code == 200
-    assert still.text == first["/timing"]
+    assert calls == []
     reset_pool()
 
 
