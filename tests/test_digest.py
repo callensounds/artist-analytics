@@ -21,6 +21,7 @@ from digest import (
     digest_sql_catalog,
     fallback_statement,
     parse_threshold,
+    public_count_is_rounded,
     render_digest_csv,
     render_digest_json,
     report_statements,
@@ -515,6 +516,150 @@ def test_digest_caps_the_artist_list(tmp_path):
     assert "Cap 04" in ranked_names
     assert "Cap 03" not in ranked_names
     assert "Cap 01" not in ranked_names
+
+
+def test_rounded_public_counts_follow_the_display_step():
+    assert public_count_is_rounded(1_400_000) is True
+    assert public_count_is_rounded(1_500_000) is True
+    assert public_count_is_rounded(1_432_100) is False
+    assert public_count_is_rounded(10_000) is True
+    assert public_count_is_rounded(10_050) is False
+    assert public_count_is_rounded(100_200) is True
+    assert public_count_is_rounded(101_000) is True
+    assert public_count_is_rounded(9_999) is False
+    assert public_count_is_rounded(1_000) is False
+    assert public_count_is_rounded(True) is False
+
+
+def test_rounded_tiktok_follower_step_is_not_a_spike(tmp_path):
+    """1.4M to 1.5M is a display step. An exact count above the threshold still flags."""
+    database = SqliteDatabase(str(tmp_path / "rounded.sqlite"))
+
+    async def seed():
+        await migrate(database)
+        ten = _stamp(days=10)
+        latest = _stamp()
+
+        async def artist(name: str) -> int:
+            await database.execute(
+                "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES (?, ?, 'search', 1, ?)",
+                (name, name.casefold(), ten),
+            )
+            row = await database.query_one("SELECT id FROM artists WHERE name = ?", (name,))
+            return int(row["id"])
+
+        rounded = await artist("Round")
+        exact = await artist("Exact")
+        series = [
+            (rounded, "tiktok", "Followers", 1_400_000, "1.4M", ten),
+            (rounded, "tiktok", "Followers", 1_500_000, "1.5M", latest),
+            (exact, "tiktok", "Followers", 10234, "10.2K", ten),
+            (exact, "tiktok", "Followers", 12345, "12.3K", latest),
+        ]
+        for artist_id, source, metric, value, text, captured in series:
+            await database.execute(
+                """
+                INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (artist_id, source, metric, value, text, captured),
+            )
+        await database.execute(
+            "INSERT INTO users (email, password_hash, created_at) VALUES ('fan@example.com', 'x', ?)",
+            (ten,),
+        )
+        user = await database.query_one("SELECT id FROM users WHERE email = 'fan@example.com'")
+        user_id = int(user["id"])
+        await database.execute(
+            "INSERT INTO user_artists (user_id, artist_id, created_at) VALUES (?, ?, ?), (?, ?, ?)",
+            (user_id, exact, latest, user_id, rounded, ten),
+        )
+        return user_id
+
+    user_id = asyncio.run(seed())
+    guard = _ReadOnly(database)
+    view = asyncio.run(build_digest(guard, user_id=user_id, threshold="5", now=NOW))
+    assert guard.writes == 0
+    doc = json.loads(render_digest_json(view))
+    rounded = _metric(
+        {"artists": [artist for artist in doc["artists"] if artist["name"] == "Round"]},
+        "tiktok",
+        "Followers",
+    )
+    exact = _metric(
+        {"artists": [artist for artist in doc["artists"] if artist["name"] == "Exact"]},
+        "tiktok",
+        "Followers",
+    )
+    assert rounded["latest_value"] == 1_500_000
+    assert rounded["baseline_value"] == 1_400_000
+    assert rounded["change"] == 100_000
+    assert rounded["approximate"] is True
+    assert rounded["spike"] is False
+    assert exact["latest_value"] == 12345
+    assert exact["baseline_value"] == 10234
+    assert exact["change"] == 2111
+    assert exact["approximate"] is False
+    assert exact["spike"] is True
+    spike_names = {item["artist_name"] for item in doc["overview"]["spikes"] if item["source"] == "tiktok"}
+    assert spike_names == {"Exact"}
+    rows = list(csv.DictReader(io.StringIO(render_digest_csv(view))))
+    rounded_row = next(row for row in rows if row["section"] == "metric" and row["artist"] == "Round" and row["metric"] == "Followers")
+    exact_row = next(row for row in rows if row["section"] == "metric" and row["artist"] == "Exact" and row["metric"] == "Followers")
+    assert rounded_row["approximate"] == "true"
+    assert rounded_row["spike"] == "no"
+    assert exact_row["approximate"] == "false"
+    assert exact_row["spike"] == "yes"
+    assert "1.4M" not in render_digest_json(view)
+
+
+def test_rounded_tiktok_note_is_on_the_digest_page(monkeypatch, tmp_path):
+    path = tmp_path / "rounded-page.sqlite"
+    database = SqliteDatabase(str(path))
+    moment = datetime.now(timezone.utc)
+    older = utc_now(moment - timedelta(days=10))
+    latest = utc_now(moment - timedelta(hours=1))
+
+    async def seed():
+        await migrate(database)
+        round_id = await _add_artist(database, "Round", 8000, captured=older)
+        exact_id = await _add_artist(database, "Exact", 7000, captured=older)
+        await database.execute(
+            """
+            INSERT INTO metric_snapshots (artist_id, source, metric, value, value_text, captured_at)
+            VALUES (?, 'tiktok', 'Followers', 1400000, '1.4M', ?),
+                   (?, 'tiktok', 'Followers', 1500000, '1.5M', ?),
+                   (?, 'tiktok', 'Followers', 10234, '10.2K', ?),
+                   (?, 'tiktok', 'Followers', 12345, '12.3K', ?)
+            """,
+            (round_id, older, round_id, latest, exact_id, older, exact_id, latest),
+        )
+
+    asyncio.run(seed())
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/digest")
+    body = client.get("/digest.json").json()
+    downloaded = client.get("/digest.csv")
+    assert page.status_code == 200
+    assert "approximate (rounded public count)" in page.text
+    assert 'data-approximate="yes"' in page.text
+    rounded = next(artist for artist in body["artists"] if artist["name"] == "Round")
+    followers = next(item for item in rounded["metrics"] if item["source"] == "tiktok" and item["metric"] == "Followers")
+    assert followers["approximate"] is True
+    assert followers["spike"] is False
+    exact = next(artist for artist in body["artists"] if artist["name"] == "Exact")
+    exact_followers = next(item for item in exact["metrics"] if item["source"] == "tiktok" and item["metric"] == "Followers")
+    assert exact_followers["approximate"] is False
+    assert exact_followers["spike"] is True
+    assert "not flagged" in page.text
+    parsed = list(csv.DictReader(io.StringIO(downloaded.text)))
+    rounded_row = next(row for row in parsed if row["artist"] == "Round" and row["metric"] == "Followers")
+    assert rounded_row["approximate"] == "true"
+    assert rounded_row["spike"] == "no"
+    reset_pool()
 
 
 def test_digest_read_failure_is_not_a_raise():

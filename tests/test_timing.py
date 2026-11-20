@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from crawl import reset_pool
 from db import SqliteDatabase, migrate
 from export_csv import formula_safe
 from timing import (
+    ALL_TIME_ROW_CAP,
     ARTIST_CAP,
     COMPOUND_TERM_LIMIT,
     EMPTY_WATCHLIST,
@@ -659,4 +661,110 @@ def test_empty_watchlist_and_row_cap_are_reported(monkeypatch, tmp_path):
     assert document["artists"][0]["latest_exact_at"] == newer_stamp
     assert document["empty"] is False
     assert any("stopped at 1" in note for note in document["cap_notes"])
+    client.get("/logout", follow_redirects=False)
+
+
+def _stamp_at(index: int) -> str:
+    day = (index % 27) + 1
+    month = (index // 27) % 12 + 1
+    year = 2014 + (index // (27 * 12))
+    return f"{year:04d}-{month:02d}-{day:02d}T{index % 24:02d}:{(index // 24) % 60:02d}:00Z"
+
+
+def test_all_time_view_respects_the_row_cap_and_finishes_quickly():
+    """The all-time window keeps the newest capped rows and does not run long."""
+    assert ALL_TIME_ROW_CAP < ROW_CAP
+    artists = _artists((1, "Ada"), (2, "Bea"))
+    extra = 25
+    sightings = []
+    releases = []
+    total = ALL_TIME_ROW_CAP + extra
+    for index in range(total):
+        stamp = _stamp_at(index)
+        artist_id = 1 if index % 2 == 0 else 2
+        sightings.append(
+            _sighting(artist_id, "apple", f"s{index}", f"Song {index}", "release", stamp, "time")
+        )
+        if index < ALL_TIME_ROW_CAP:
+            day = stamp[:10]
+            releases.append(_release(artist_id, f"m{index}", f"Album {index}", day, "day"))
+    # Newest-first, matching the SQL ORDER BY. The cap keeps that leading slice.
+    sightings.reverse()
+    started = time.perf_counter()
+    view = assemble_timing(
+        artists,
+        sightings,
+        releases,
+        scope="all",
+        days="all",
+        kind="all",
+        now=NOW,
+    )
+    elapsed = time.perf_counter() - started
+    assert view["failed"] is False
+    assert view["counts"]["stored_rows"] == ALL_TIME_ROW_CAP * 2
+    assert view["counts"]["exact"] <= ALL_TIME_ROW_CAP
+    assert view["counts"]["day"] <= ALL_TIME_ROW_CAP
+    assert view["empty"] is False
+    notes = " ".join(view["cap_notes"])
+    assert f"All stored dates is capped at the newest {ALL_TIME_ROW_CAP} content rows" in notes
+    assert "Older rows were not included" in notes
+    # The releases were already at the cap, so that table is not described as truncated.
+    assert "MusicBrainz" not in notes
+    assert elapsed < 3.0
+    statements = event_statements([1, 2], kind="all", days="all", now=NOW)
+    assert len(statements) == 2
+    for sql, params in statements:
+        assert f"LIMIT {ALL_TIME_ROW_CAP + 1}" in sql
+        assert "substr(" in sql.lower()
+        assert "ORDER BY published_at DESC" in sql or "ORDER BY released_at DESC" in sql
+        assert sql.count("?") == len(params)
+
+
+def test_all_time_cap_is_visible_on_the_page(monkeypatch, tmp_path):
+    path = tmp_path / "all-time-cap.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    database = SqliteDatabase(str(path))
+    now = datetime.now(timezone.utc)
+    newer = _past(now, 4, 16)
+    older = newer - timedelta(days=14)
+
+    async def seed():
+        await migrate(database)
+        await database.execute(
+            "INSERT INTO artists (name, normalized_name, origin, tracked, created_at) VALUES ('Ada', 'ada', 'search', 1, ?)",
+            (newer.strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        )
+        artist_id = int((await database.query_one("SELECT id FROM artists"))["id"])
+        await database.execute(
+            """
+            INSERT INTO content_sightings (
+                artist_id, source, external_id, title, kind, published_at, precision, first_seen_at
+            ) VALUES (?, 'apple', 'new', 'Newer', 'release', ?, 'time', ?),
+                   (?, 'apple', 'old', 'Older', 'release', ?, 'time', ?)
+            """,
+            (
+                artist_id, newer.strftime("%Y-%m-%dT%H:%M:%SZ"), newer.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                artist_id, older.strftime("%Y-%m-%dT%H:%M:%SZ"), newer.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        )
+
+    asyncio.run(seed())
+    monkeypatch.setattr("timing.ALL_TIME_ROW_CAP", 1)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "artist@demo.com", "password": "demo123"}, follow_redirects=False)
+    page = client.get("/timing", params={"scope": "all", "days": "all", "kind": "all"})
+    assert page.status_code == 200
+    assert "All stored dates is capped at the newest 1 content rows." in page.text
+    assert "Older rows were not included." in page.text
+    assert newer.strftime("%Y-%m-%dT%H:%M:%SZ") in page.text
+    assert older.strftime("%Y-%m-%dT%H:%M:%SZ") not in page.text
+    document = client.get("/timing.json", params={"scope": "all", "days": "all", "kind": "all"}).json()
+    assert document["counts"]["exact"] == 1
+    assert document["artists"][0]["latest_exact_at"] == newer.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert any("newest 1" in note for note in document["cap_notes"])
+    downloaded = client.get("/timing.csv", params={"scope": "all", "days": "all", "kind": "release"})
+    assert downloaded.status_code == 200
+    assert "Ada" in downloaded.text
     client.get("/logout", follow_redirects=False)

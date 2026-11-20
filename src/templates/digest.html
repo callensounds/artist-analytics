@@ -45,7 +45,7 @@
     {% endif %}
 </form>
 
-<p class="text-slate-400 text-sm mb-4">{{ baseline_note }} A change of {{ threshold_label }} or more is marked Spike. That flag is not stored.</p>
+<p class="text-slate-400 text-sm mb-4">{{ baseline_note }} A change of {{ threshold_label }} or more is marked Spike. That flag is not stored. A TikTok follower change on a rounded public count is labeled approximate and is not flagged.</p>
 
 {% if artists %}
 <div class="digest-counts">
@@ -103,6 +103,9 @@
                 {% if metric.status == 'ok' %}
                 <div class="text-sm">Earlier {{ metric.baseline_text }} <span class="digest-stamp">{{ metric.baseline_at }}</span></div>
                 <div class="font-mono text-emerald-300 text-sm">{{ metric.text }}</div>
+                {% if metric.approximate %}
+                <p class="text-xs text-slate-400" data-approximate="yes">approximate (rounded public count)</p>
+                {% endif %}
                 {% else %}
                 <div class="text-sm text-slate-300">{{ metric.text }}</div>
                 {% endif %}
