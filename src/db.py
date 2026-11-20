@@ -112,13 +112,16 @@ def _row_dict(row) -> dict:
         return {}
 
 
-def _result_rows(result) -> list:
+def _iter_result_rows(result):
+    """One pass over a D1 result. ``list()`` first would copy the whole array."""
     if result is None:
-        return []
+        return
     rows = getattr(result, "results", None)
     if rows is None and isinstance(result, dict):
         rows = result.get("results")
-    return list(rows or [])
+    if not rows:
+        return
+    yield from rows
 
 
 def _last_id(result) -> int | None:
@@ -163,7 +166,9 @@ class SqliteDatabase:
 
     async def query(self, sql: str, params: tuple = ()) -> list[dict]:
         cursor = self.conn.execute(sql, params)
-        return [_row_dict(row) for row in cursor.fetchall()]
+        # Walk the cursor once. fetchall() would keep every sqlite3.Row alive
+        # beside the dict copy.
+        return [_row_dict(row) for row in cursor]
 
     async def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         rows = await self.query(sql, params)
@@ -209,7 +214,7 @@ class D1Database:
     async def query(self, sql: str, params: tuple = ()) -> list[dict]:
         statement = await self._statement(sql, params)
         result = await _await(statement.all())
-        return [_row_dict(row) for row in _result_rows(result)]
+        return [_row_dict(row) for row in _iter_result_rows(result)]
 
     async def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         rows = await self.query(sql, params)
@@ -244,8 +249,8 @@ class D1Database:
             prepared.append(await self._statement(sql, params))
         results = await _await(batch_fn(prepared))
         found = []
-        for result in list(results or []):
-            found.append([_row_dict(row) for row in _result_rows(result)])
+        for result in results or []:
+            found.append([_row_dict(row) for row in _iter_result_rows(result)])
         if len(found) != len(statements):
             raise RuntimeError("D1 batch returned a different number of results")
         return found
@@ -281,7 +286,8 @@ async def read_many(db, statements: list[tuple[str, tuple]]) -> list:
             log_read_failure("batched read", exc)
             found = None
         else:
-            found = list(found or [])
+            if not isinstance(found, list):
+                found = list(found or [])
             if len(found) == len(statements):
                 return found
             log_read_failure("batched read", RuntimeError("D1 batch returned a different number of results"))

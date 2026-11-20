@@ -868,6 +868,9 @@ async def _load_sections(db, artists: list[dict], now: datetime, threshold_tenth
     charts = _bucket(presented_charts, ids)
     playlists = _bucket(presented_playlists, ids)
     alerts = _bucket(presented_alerts, ids)
+    # Buckets hold the presented rows. The query batches are a second copy.
+    del presented_releases, presented_charts, presented_playlists, presented_alerts
+    del release_rows, chart_rows, playlist_rows, alert_rows, tail, found
     built, spikes = _build_artists(
         artists,
         latest_map,
@@ -1034,8 +1037,11 @@ def _blank(value) -> str:
 
 
 def render_digest_csv(view: dict) -> str:
-    """Flat export of the same digest. Missing history stays the words, not a zero."""
-    doc = digest_document(view)
+    """Flat export of the same digest. Missing history stays the words, not a zero.
+
+    Reads the view that was already built. A JSON-shaped copy of every artist
+    would sit beside that view until the CSV string replaced it.
+    """
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\n")
     header = [
@@ -1060,9 +1066,9 @@ def render_digest_csv(view: dict) -> str:
         "occurred_at",
     ]
     writer.writerow(header)
-    artist_set = doc["source"]
-    threshold = doc["threshold_percent"]
-    for artist in doc["artists"]:
+    artist_set = view.get("source") or ""
+    threshold = _json_threshold(view.get("threshold_percent") or DEFAULT_THRESHOLD_PERCENT)
+    for artist in view.get("artists") or []:
         name = artist["name"]
         artist_id = artist["id"]
         for metric in artist["metrics"]:
@@ -1186,7 +1192,7 @@ def render_digest_csv(view: dict) -> str:
                     alert.get("detected_at") or "",
                 ]
             )
-    for spike in doc["overview"]["spikes"]:
+    for spike in (view.get("overview") or {}).get("spikes") or []:
         writer.writerow(
             [
                 "spike",

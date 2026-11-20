@@ -908,6 +908,19 @@ async def run_queue_batch(batch, env, *, collect=None, http=None, cache=None) ->
 
 
 _POOL: dict[str, SqliteDatabase] = {}
+# Local sqlite only. The Worker never takes this path. A long test run used to
+# keep one connection per temporary file for the life of the process.
+_POOL_CAP = 8
+
+
+def _close_sqlite(database) -> None:
+    conn = getattr(database, "conn", None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        return
 
 
 def sqlite_path(env) -> str | None:
@@ -939,6 +952,8 @@ async def open_database(env, *, migrate_schema: bool = True):
         return None
     pooled = _POOL.get(path)
     if pooled is None:
+        while len(_POOL) >= _POOL_CAP:
+            _close_sqlite(_POOL.pop(next(iter(_POOL))))
         pooled = SqliteDatabase(path)
         _POOL[path] = pooled
     if migrate_schema:

@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import hmac
 import html
 from datetime import datetime, timezone
@@ -118,6 +119,90 @@ async def d1_outage_page(request: Request, call_next):
             "</main></body></html>"
         )
         return HTMLResponse(page, status_code=503)
+
+
+# Pages that assemble a large row set or a full artist history. Trivial routes
+# (login, CSS, search) are left alone: gc.collect() walks the whole heap.
+_HEAVY_PATHS = frozenset(
+    {
+        "/timing",
+        "/timing.csv",
+        "/timing.json",
+        "/digest",
+        "/digest.csv",
+        "/digest.json",
+        "/compare",
+        "/compare.csv",
+        "/dashboard",
+    }
+)
+# Log once the WASM heap is this close to the 128MB isolate limit.
+_HEAP_LOG_BYTES = 96 * 1024 * 1024
+
+
+def heavy_request_path(path: str) -> bool:
+    """Artist page, calendar, timing, digest, compare, and dashboard."""
+    if path in _HEAVY_PATHS:
+        return True
+    if not path.startswith("/artist/"):
+        return False
+    rest = path[len("/artist/") :]
+    if not rest or "/" not in rest:
+        return bool(rest)
+    key, tail = rest.split("/", 1)
+    return bool(key) and tail == "calendar"
+
+
+def _pyodide_heap_bytes() -> int | None:
+    try:
+        import pyodide_js
+
+        return int(pyodide_js._module.HEAPU8.length)
+    except Exception:
+        return None
+
+
+def note_isolate_heap(path: str) -> None:
+    """One console line when the Pyodide heap is near the isolate limit. Never raises."""
+    try:
+        heap = _pyodide_heap_bytes()
+        if heap is None or heap <= _HEAP_LOG_BYTES:
+            return
+        safe = " ".join(str(path or "").split())[:160] or "/"
+        print(f"mem heap_mb={heap // (1024 * 1024)} path={safe}", flush=True)
+    except Exception:
+        return
+
+
+def _collect_request() -> None:
+    try:
+        gc.collect()
+    except Exception:
+        return
+
+
+class ReleaseHeavyMemory:
+    """Free the previous request's pages after the body has been sent.
+
+    This is raw ASGI middleware. Starlette's HTTP middleware reads the whole
+    body into a buffer, which is the peak we are trying to avoid.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if scope.get("type") == "http":
+                path = scope.get("path") or ""
+                if heavy_request_path(path):
+                    _collect_request()
+                note_isolate_heap(path)
+
+
+app.add_middleware(ReleaseHeavyMemory)
 
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
 # so a ../templates path exists locally and 500s on every HTML route after deploy.
