@@ -12,6 +12,16 @@ def _pyodide_hashlib(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _clear_heavy_page_cache():
+    """Heavy GET responses are reused in-process. Tests must not share that copy."""
+    from page_cache import clear_page_cache
+
+    clear_page_cache()
+    yield
+    clear_page_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_host_secrets(monkeypatch):
     """env_get falls back to os.environ. A secret on the test machine must not change results."""
     for name in WORKER_SECRETS:

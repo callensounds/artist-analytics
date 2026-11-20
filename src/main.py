@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from cache import history_page_cache
+from page_cache import HeavyResponseCache
 from charts import CHARTS_PAGE_EMPTY, load_chart_board
 from accounts import (
     DEMO_EMAIL,
@@ -195,6 +196,9 @@ class ReleaseHeavyMemory:
                     note_isolate_heap(path)
 
 
+# Outside the session middleware: a hit returns before session parsing beyond
+# the signed user id, and a miss can see Set-Cookie added on the way out.
+app.add_middleware(HeavyResponseCache, is_heavy=heavy_request_path)
 app.add_middleware(ReleaseHeavyMemory)
 
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
@@ -493,8 +497,13 @@ async def get_current_user(request: Request):
             return None
         email = str(row["email"])
         artist_name = "Demo Artist" if email == DEMO_EMAIL else email
-        request.session["email"] = email
-        request.session["artist_name"] = artist_name
+        # Assigning the same values marks the session modified and sends
+        # Set-Cookie. A Set-Cookie response is not cached, so a repeat load of
+        # a signed-in page would render every time.
+        if request.session.get("email") != email:
+            request.session["email"] = email
+        if request.session.get("artist_name") != artist_name:
+            request.session["artist_name"] = artist_name
         return {"id": int(row["id"]), "email": email, "artist_name": artist_name}
     for user in USERS.values():
         if user["id"] == user_id:

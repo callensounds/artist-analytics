@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 import crawler_entry
 import main
 from cache import MemoryCache
+from page_cache import clear_page_cache
 from crawl import reset_pool, run_batch, run_queue_batch
 from db import SqliteDatabase, migrate, utc_now
 from history import audience_exact, build_growth, remember
@@ -623,6 +624,8 @@ def test_dashboard_route_performs_no_d1_writes(monkeypatch):
             started = time.perf_counter()
             page = await client.get("/dashboard", params={"artist": "Example"})
             elapsed = time.perf_counter() - started
+            # The first load is cached. Drop it so this request still sends.
+            clear_page_cache()
             slow = _Queue()
 
             async def hang(body):
