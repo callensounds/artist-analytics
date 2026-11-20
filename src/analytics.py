@@ -853,8 +853,9 @@ def _month_grid_html(month: dict) -> str:
         day = int(cell["day"])
         klass = "calendar-day calendar-day-has" if items else "calendar-day calendar-day-empty"
         parts.append(f'<div class="{klass}"><div class="calendar-day-num">{day}</div>')
-        for item in items:
-            parts.append(_release_html(item))
+        # The grid and the agenda show the same releases. Build each snippet once.
+        rendered = [_release_html(item) for item in items]
+        parts.extend(rendered)
         more = int(cell.get("more") or 0)
         if more:
             parts.append(f'<div class="calendar-more">+{more}</div>')
@@ -871,8 +872,7 @@ def _month_grid_html(month: dict) -> str:
             f'<span class="calendar-agenda-daynum">{day}</span>{iso_html}</div>'
         )
         agenda.append('<div class="calendar-agenda-releases">')
-        for item in items:
-            agenda.append(_release_html(item))
+        agenda.extend(rendered)
         if more:
             agenda.append(f'<div class="calendar-more">+{more}</div>')
         agenda.append("</div></li>")

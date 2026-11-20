@@ -1035,9 +1035,17 @@ def _bound_rows(rows, cap: int, hit: bool) -> tuple[list, bool]:
     """Keep the leading rows, which the SQL returns newest first. Say so when the rest is dropped."""
     if not rows:
         return [], hit
-    if len(rows) > cap:
-        return list(rows[:cap]), True
-    return rows, hit
+    if len(rows) <= cap:
+        return rows, hit
+    # A list slice is already a new list. list() around it copies every pointer again.
+    if isinstance(rows, list):
+        return rows[:cap], True
+    kept = []
+    for index, row in enumerate(rows):
+        if index >= cap:
+            break
+        kept.append(row)
+    return kept, True
 
 
 def _cap_rows(rows: list, cap: int) -> tuple[list, bool]:
@@ -1072,6 +1080,8 @@ def _read_rows(found, label: str) -> tuple[list | None, str]:
     if not isinstance(found, list):
         log_read_failure(label, RuntimeError("timing read returned no rows"))
         return None, "error"
+    if all(isinstance(row, dict) for row in found):
+        return found, ""
     return [row for row in found if isinstance(row, dict)], ""
 
 

@@ -173,8 +173,19 @@ _mb_inflight: dict[str, float] = {}
 MB_MAX_OWNERS = 2
 
 
+# A lookup that never reaches its finally leaves a stale marker. Drop those so
+# the dict cannot grow with every artist name the isolate has seen.
+_MB_INFLIGHT_CAP = 64
+
+
 def _owners(now: float) -> int:
-    return sum(1 for expiry in _mb_inflight.values() if expiry > now)
+    if _mb_inflight:
+        stale = [query for query, expiry in _mb_inflight.items() if expiry <= now]
+        for query in stale:
+            _mb_inflight.pop(query, None)
+        while len(_mb_inflight) > _MB_INFLIGHT_CAP:
+            _mb_inflight.pop(next(iter(_mb_inflight)), None)
+    return len(_mb_inflight)
 
 
 class _IsolateGate:

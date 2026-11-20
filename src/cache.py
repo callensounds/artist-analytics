@@ -21,27 +21,163 @@ def _js_options(options: dict):
         return options
     return to_js(options, dict_converter=Object.fromEntries)
 
+# In-isolate string caches. Workers Free kills the isolate around 128MB even when
+# the request has only used a few dozen milliseconds of CPU, and the Pyodide heap
+# does not shrink. Caps are bytes, not just entry counts: one clear-all at 200
+# entries still held the raw provider bodies that filled the isolate.
+MEMORY_MAX_BYTES = 6 * 1024 * 1024
+MEMORY_MAX_ENTRY_BYTES = 512 * 1024
+MEMORY_ENTRY_CAP = 200
+HISTORY_MAX_BYTES = 4 * 1024 * 1024
+HISTORY_MAX_ENTRY_BYTES = 1 * 1024 * 1024
+HISTORY_ENTRY_CAP = 32
+
 _MEMORY: dict[str, tuple[float, str]] = {}
+# Artist-page history only. Kept off the provider MemoryCache so a full page
+# cannot wipe cached provider bodies, and so a page fill does not write KV.
+_HISTORY_MEMORY: dict[str, tuple[float, str]] = {}
+
+
+class _Tally:
+    """Byte total for one store. Rescanned when the dict length changes under us."""
+
+    __slots__ = ("bytes", "count")
+
+    def __init__(self) -> None:
+        self.bytes = 0
+        self.count = 0
+
+
+_MEMORY_TALLY = _Tally()
+_HISTORY_TALLY = _Tally()
+
+
+def _value_size(value) -> int:
+    """len(str) is the byte stand-in. A value without a length counts as empty."""
+    try:
+        return len(value)
+    except Exception:
+        return 0
+
+
+def _item_size(item) -> int:
+    try:
+        return _value_size(item[1])
+    except Exception:
+        return 0
+
+
+def _cache_tally(cache) -> _Tally:
+    store = cache.store
+    if store is _MEMORY:
+        tally = _MEMORY_TALLY
+    elif store is _HISTORY_MEMORY:
+        tally = _HISTORY_TALLY
+    else:
+        tally = getattr(cache, "_local_tally", None)
+        if tally is None:
+            tally = _Tally()
+            cache._local_tally = tally
+    if tally.count != len(store):
+        total = 0
+        for item in store.values():
+            total += _item_size(item)
+        tally.bytes = total
+        tally.count = len(store)
+    return tally
+
+
+def _cache_drop(cache, key: str) -> None:
+    tally = _cache_tally(cache)
+    removed = cache.store.pop(key, None)
+    if removed is None:
+        return
+    tally.bytes -= _item_size(removed)
+    tally.count -= 1
+    if tally.bytes < 0 or tally.count < 0 or tally.count != len(cache.store):
+        tally.bytes = sum(_item_size(item) for item in cache.store.values())
+        tally.count = len(cache.store)
+
+
+def _cache_purge(cache, now: float) -> None:
+    stale = []
+    for key, item in cache.store.items():
+        try:
+            expires = item[0]
+        except (TypeError, IndexError):
+            stale.append(key)
+            continue
+        if now > expires:
+            stale.append(key)
+    for key in stale:
+        _cache_drop(cache, key)
+
+
+def _load_value(cache, key: str):
+    item = cache.store.get(key)
+    if not item:
+        return None
+    try:
+        expires = item[0]
+        value = item[1]
+    except (TypeError, IndexError):
+        cache.store.pop(key, None)
+        _cache_tally(cache)
+        return None
+    if time.monotonic() > expires:
+        _cache_drop(cache, key)
+        return None
+    return value
+
+
+def _store_value(cache, key: str, value, ttl: int) -> None:
+    """Insert in dict order. Expired entries go first, then the oldest live key.
+
+    A value over the per-entry cap is not stored. Callers still write the edge
+    and KV layers; this only refuses the isolate copy. Replacing a key drops the
+    previous copy so a later get cannot return the smaller body.
+    """
+    size = _value_size(value)
+    if size > cache.max_entry_bytes or size > cache.max_bytes:
+        if key in cache.store:
+            _cache_drop(cache, key)
+        return
+    now = time.monotonic()
+    _cache_purge(cache, now)
+    if key in cache.store:
+        _cache_drop(cache, key)
+    tally = _cache_tally(cache)
+    while cache.store and (tally.bytes + size > cache.max_bytes or len(cache.store) >= cache.entry_cap):
+        _cache_drop(cache, next(iter(cache.store)))
+    if not cache.store:
+        tally.bytes = 0
+        tally.count = 0
+    if tally.bytes + size > cache.max_bytes:
+        return
+    cache.store[key] = (now + max(int(ttl), 1), value)
+    tally.bytes += size
+    tally.count += 1
 
 
 class MemoryCache:
-    def __init__(self, store: dict[str, tuple[float, str]] | None = None):
+    def __init__(
+        self,
+        store: dict[str, tuple[float, str]] | None = None,
+        *,
+        max_bytes: int = MEMORY_MAX_BYTES,
+        max_entry_bytes: int = MEMORY_MAX_ENTRY_BYTES,
+        entry_cap: int = MEMORY_ENTRY_CAP,
+    ):
         self.store = _MEMORY if store is None else store
+        self.max_bytes = max_bytes
+        self.max_entry_bytes = max_entry_bytes
+        self.entry_cap = entry_cap
 
     async def get(self, key: str) -> str | None:
-        item = self.store.get(key)
-        if not item:
-            return None
-        expires, value = item
-        if time.monotonic() > expires:
-            self.store.pop(key, None)
-            return None
-        return value
+        return _load_value(self, key)
 
     async def set(self, key: str, value: str, ttl: int) -> None:
-        if len(self.store) > 200:
-            self.store.clear()
-        self.store[key] = (time.monotonic() + max(int(ttl), 1), value)
+        _store_value(self, key, value, ttl)
 
 
 class KVCache:
@@ -189,32 +325,28 @@ def cache_from_env(env) -> TieredCache:
     return TieredCache(layers)
 
 
-# Artist-page history only. Kept off the provider MemoryCache so a full page
-# cannot wipe cached provider bodies, and so a page fill does not write KV.
-_HISTORY_MEMORY: dict[str, tuple[float, str]] = {}
-
-
 class IsolateCache:
     """In-isolate string cache. No network and no daily write cap."""
 
-    def __init__(self, store: dict[str, tuple[float, str]] | None = None, cap: int = 32):
+    def __init__(
+        self,
+        store: dict[str, tuple[float, str]] | None = None,
+        cap: int = HISTORY_ENTRY_CAP,
+        *,
+        max_bytes: int = HISTORY_MAX_BYTES,
+        max_entry_bytes: int = HISTORY_MAX_ENTRY_BYTES,
+    ):
         self.store = _HISTORY_MEMORY if store is None else store
         self.cap = cap
+        self.entry_cap = cap
+        self.max_bytes = max_bytes
+        self.max_entry_bytes = max_entry_bytes
 
     async def get(self, key: str) -> str | None:
-        item = self.store.get(key)
-        if not item:
-            return None
-        expires, value = item
-        if time.monotonic() > expires:
-            self.store.pop(key, None)
-            return None
-        return value
+        return _load_value(self, key)
 
     async def set(self, key: str, value: str, ttl: int) -> None:
-        if len(self.store) >= self.cap and key not in self.store:
-            self.store.clear()
-        self.store[key] = (time.monotonic() + max(int(ttl), 1), value)
+        _store_value(self, key, value, ttl)
 
 
 class HistoryPageCache:

@@ -1865,9 +1865,12 @@ async def _read_posting(db, artist_id: int) -> dict:
     return build_posting_patterns(posting_rows or [])
 
 
-def _musicbrainz_calendar_rows(rows: list[dict] | None) -> list[dict]:
-    return [
-        {
+def _musicbrainz_calendar_rows(rows: list[dict] | None):
+    """One release at a time. The year page used to copy every row into a second list."""
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        yield {
             "title": row.get("title"),
             "source": "musicbrainz",
             "released_at": row.get("released_at"),
@@ -1875,9 +1878,20 @@ def _musicbrainz_calendar_rows(rows: list[dict] | None) -> list[dict]:
             "kind": row.get("release_type"),
             "mbid": row.get("mbid"),
         }
-        for row in rows or []
-        if isinstance(row, dict)
-    ]
+
+
+def _iter_period_calendar_rows(mb_rows, apple_rows, spotify_rows, deezer_rows):
+    yield from _musicbrainz_calendar_rows(mb_rows)
+    for batch in (apple_rows, spotify_rows, deezer_rows):
+        if batch:
+            yield from batch
+
+
+def _iter_artist_calendar_rows(releases, sightings):
+    """MusicBrainz cards, then stored Apple, Spotify, and Deezer sightings."""
+    yield from _musicbrainz_calendar_rows(releases)
+    if sightings:
+        yield from sightings
 
 
 async def _sighting_years(db, artist_id: int, source: str) -> list[int] | None:
@@ -1931,19 +1945,18 @@ async def load_release_calendar(db, artist_id: int, year: int | None = None) -> 
         calendar["period_label"] = str(selected)
         calendar["empty_period"] = False
         return calendar
-    calendar_rows = _musicbrainz_calendar_rows(mb_rows)
-    if apple_rows:
-        calendar_rows.extend(apple_rows)
-    if spotify_rows:
-        calendar_rows.extend(spotify_rows)
-    if deezer_rows:
-        calendar_rows.extend(deezer_rows)
-    calendar = build_release_calendar(calendar_rows, year=selected)
-    calendar["navigation"] = navigation
-    calendar["row_cap_hit"] = any(
+    row_cap_hit = any(
         rows is not None and len(rows) >= CALENDAR_PERIOD_LIMIT
         for rows in (mb_rows, apple_rows, spotify_rows, deezer_rows)
     )
+    calendar = build_release_calendar(
+        _iter_period_calendar_rows(mb_rows, apple_rows, spotify_rows, deezer_rows),
+        year=selected,
+    )
+    # The grids hold the placed releases. The source lists are the second copy.
+    del mb_rows, apple_rows, spotify_rows, deezer_rows, mb_years, apple_years, spotify_years, deezer_years
+    calendar["navigation"] = navigation
+    calendar["row_cap_hit"] = row_cap_hit
     if calendar["empty_period"]:
         calendar["reason"] = (
             f"No stored MusicBrainz, Apple, Spotify, or Deezer release falls in {selected}. "
@@ -2447,20 +2460,13 @@ async def load_history_for_artist(db, artist: dict, on_growth=None, cache=None) 
     else:
         history["posting"] = build_posting_patterns(posting_rows)
     release_sightings_failed = release_sightings is None
-    calendar_rows = [
-        {
-            "title": release.get("title"),
-            "source": "musicbrainz",
-            "released_at": release.get("released_at"),
-            "precision": release.get("precision"),
-            "kind": release.get("release_type"),
-            "mbid": release.get("mbid"),
-        }
-        for release in history["releases"]
-    ]
-    if not release_sightings_failed:
-        calendar_rows.extend(release_sightings or [])
-    history["calendar"] = build_release_calendar(calendar_rows, month_cap=ARTIST_CALENDAR_MONTHS)
+    history["calendar"] = build_release_calendar(
+        _iter_artist_calendar_rows(
+            history["releases"],
+            None if release_sightings_failed else release_sightings,
+        ),
+        month_cap=ARTIST_CALENDAR_MONTHS,
+    )
     if not history["calendar"]["available"] and (releases_failed or release_sightings_failed):
         if releases_failed and release_sightings_failed:
             history["calendar"] = empty_release_calendar(CALENDAR_READ_ERROR)
@@ -2488,7 +2494,8 @@ async def load_history_for_artist(db, artist: dict, on_growth=None, cache=None) 
             score_failed = True
             log_read_failure("audience score", score_value)
     else:
-        score = score_from_counts(list(score_value or []))
+        counted = score_value if isinstance(score_value, list) else list(score_value or [])
+        score = score_from_counts(counted)
     if score_failed or score is None:
         history["score_text"] = None
         history["score_components"] = []
@@ -2499,6 +2506,12 @@ async def load_history_for_artist(db, artist: dict, on_growth=None, cache=None) 
         history["score_components"] = score["components"]
         history["score_formula"] = score["formula"]
         history["score_reason"] = None if score["score_text"] else SCORE_EMPTY
+    # Presented cards are on history. Drop the row lists before the cache JSON
+    # so the string and the query results are not live together.
+    del rows, raw, loaded
+    del related, sightings, playlists, track_rows, momentum_rows, alert_rows
+    del release_rows, posting_rows, release_sightings
+    del stat_values, stat_rows, chart_values, score_value
     await _store_artist_history(cache, artist, history)
     return history
 
