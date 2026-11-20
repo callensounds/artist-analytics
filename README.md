@@ -112,6 +112,18 @@ npx wrangler kv namespace create CACHE
 
 Paste the id into the commented `kv_namespaces` block in `wrangler.jsonc` (binding name `CACHE`) and deploy again. A missing or broken KV binding falls back to memory.
 
+**Heavy page cache**
+
+Finished successful responses for `/timing` (including `.csv` and `.json`), `/digest` (including `.csv` and `.json`), `/compare` and `/compare.csv`, `/dashboard`, `/artist/<id>`, and `/artist/<id>/calendar` are kept for 5 minutes (`PAGE_CACHE_TTL` in `src/page_cache.py`). A repeat GET is served from that copy and does not read D1 or render the template. The first copy is an in-isolate LRU capped at 2 MiB total and 512 KiB per response (8 entries). A response over that size is rendered and not stored. The second copy is the Workers Cache API (`caches.default`) under a synthetic URL, so an isolate restart can still hit when that API is available. There is no KV binding for these pages.
+
+The cache key is a version, the full path, the full query string sorted by name, and the signed-in user (`d1:<id>` or `memory:<id>`, read from the validated session). Anonymous requests use `anon`. The raw session cookie is not in the key. Two users never share an entry, and a signed-in page is never served to an anonymous request.
+
+Only a GET that finished with status 200 and no `Set-Cookie` is stored. `/login`, `/logout`, `/signup`, `/register`, POST, redirects, and any 503 or other error are not stored. A body that says data is temporarily unavailable, or that contains a CSRF token or a flash message, is not stored. These pages include the signed-in user (or a watchlist), so the client is sent `Cache-Control: private, max-age=60`. A response that was not stored is `Cache-Control: no-store`. Neither value is `public`. `X-AA-Cache` is `hit` or `miss`.
+
+On `*.workers.dev`, Cloudflare does not apply Cache API reads or writes (a custom domain or a zone route is required). The isolate LRU is what makes a repeat load cheap there. A custom domain uses both tiers. If either tier throws, the page renders normally.
+
+A `/dashboard` cache hit does not enqueue another crawl. The first load of that URL still does.
+
 ## Crawl
 
 Both Workers bind the existing D1 database `artist-analytics` (`DB`, id `52a9190e-4147-402e-8f75-16f5de58bf84`, migrations in `src/migrations`). The queue is `artist-analytics-crawl`. The crawler is the consumer (`max_batch_size` 1, `max_concurrency` 1, `max_retries` 3, `retry_delay` 180) and the dashboard is only a producer. Failed deliveries go to `artist-analytics-crawl-dlq`. Wrangler creates that dead-letter queue on deploy when the name is new; if a deploy does not create queues, create `artist-analytics-crawl-dlq` once in the dashboard before relying on it. The crawler's cron is `*/15 * * * *` UTC. The deploy command does not run `wrangler d1 migrations apply`. Migration `0001_crawl.sql` is already applied on the remote database; do not rename or edit it. A later schema change is a new file under `src/migrations`. The crawler's scheduled handler and queue consumer apply any migration file not yet recorded in `schema_migrations`. The dashboard request does not. Every statement in `0001_crawl.sql` is `CREATE TABLE IF NOT EXISTS` or `CREATE INDEX IF NOT EXISTS`, so recording it again does not change the remote schema.

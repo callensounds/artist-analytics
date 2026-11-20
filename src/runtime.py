@@ -82,24 +82,61 @@ def env_get(env, name: str) -> str | None:
     return None
 
 
+SESSION_COOKIE = "session"
+SESSION_MAX_AGE = 14 * 24 * 60 * 60
+_SIGNERS: dict[str, TimestampSigner] = {}
+
+
+def session_signer(scope: Scope) -> TimestampSigner:
+    """One signer per secret. The cache and the session middleware share it."""
+    secret = env_get(scope.get("env"), "SECRET_KEY") or FALLBACK_SESSION_SECRET
+    signer = _SIGNERS.get(secret)
+    if signer is None:
+        signer = TimestampSigner(secret)
+        _SIGNERS[secret] = signer
+    return signer
+
+
+def read_signed_session(scope: Scope) -> dict:
+    """Validated session payload, or {}.
+
+    The raw cookie is never returned. A missing or bad signature is anonymous.
+    This does not attach ``scope["session"]`` and does not read D1.
+    """
+    try:
+        raw = HTTPConnection(scope).cookies.get(SESSION_COOKIE)
+        if not raw:
+            return {}
+        unsigned = session_signer(scope).unsign(raw.encode("utf-8"), max_age=SESSION_MAX_AGE)
+        data = json.loads(b64decode(unsigned))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
 class WorkerSessionMiddleware:
     """Starlette session cookies, with the signing key read from the request env."""
 
     def __init__(self, app: ASGIApp, fallback_secret: str = FALLBACK_SESSION_SECRET):
         self.app = app
         self.fallback_secret = fallback_secret
-        self.session_cookie = "session"
-        self.max_age = 14 * 24 * 60 * 60
+        self.session_cookie = SESSION_COOKIE
+        self.max_age = SESSION_MAX_AGE
         self.path = "/"
         self.security_flags = "httponly; samesite=lax"
-        self._signers: dict[str, TimestampSigner] = {}
 
     def _signer(self, scope: Scope) -> TimestampSigner:
-        secret = env_get(scope.get("env"), "SECRET_KEY") or self.fallback_secret
-        signer = self._signers.get(secret)
+        # Keep the instance fallback so a caller that passed a different secret
+        # still signs with that secret when SECRET_KEY is unset.
+        if env_get(scope.get("env"), "SECRET_KEY"):
+            return session_signer(scope)
+        secret = self.fallback_secret
+        signer = _SIGNERS.get(secret)
         if signer is None:
             signer = TimestampSigner(secret)
-            self._signers[secret] = signer
+            _SIGNERS[secret] = signer
         return signer
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
