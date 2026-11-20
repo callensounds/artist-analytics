@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import hmac
 import html
 from datetime import datetime, timezone
@@ -121,8 +120,9 @@ async def d1_outage_page(request: Request, call_next):
         return HTMLResponse(page, status_code=503)
 
 
-# Pages that assemble a large row set or a full artist history. Trivial routes
-# (login, CSS, search) are left alone: gc.collect() walks the whole heap.
+# Pages that assemble a large row set or a full artist history. The heap
+# diagnostic runs only here. gc.collect() is not called: walking the Pyodide
+# heap cost more CPU than the Workers Free budget allows.
 _HEAVY_PATHS = frozenset(
     {
         "/timing",
@@ -174,18 +174,12 @@ def note_isolate_heap(path: str) -> None:
         return
 
 
-def _collect_request() -> None:
-    try:
-        gc.collect()
-    except Exception:
-        return
-
-
 class ReleaseHeavyMemory:
-    """Free the previous request's pages after the body has been sent.
+    """Log the Pyodide heap after a heavy page. Does not collect garbage.
 
-    This is raw ASGI middleware. Starlette's HTTP middleware reads the whole
-    body into a buffer, which is the peak we are trying to avoid.
+    gc.collect() walks the whole WASM heap. On the Free plan that walk was
+    the CPU kill, so this middleware only reads the heap size on heavy paths.
+    It is raw ASGI middleware, so the response body is not buffered.
     """
 
     def __init__(self, app):
@@ -198,8 +192,7 @@ class ReleaseHeavyMemory:
             if scope.get("type") == "http":
                 path = scope.get("path") or ""
                 if heavy_request_path(path):
-                    _collect_request()
-                note_isolate_heap(path)
+                    note_isolate_heap(path)
 
 
 app.add_middleware(ReleaseHeavyMemory)
