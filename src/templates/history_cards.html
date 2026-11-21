@@ -376,7 +376,7 @@
                 <tbody>
                     {% for item in history.sightings %}
                     <tr class="border-t border-slate-700/80">
-                        <td class="py-2 pr-3 font-mono text-emerald-300">{{ item.published_at or "source time unavailable" }}</td>
+                        <td class="py-2 pr-3 font-mono text-emerald-300">{% if item.local_label %}{{ item.local_label }}{% else %}{{ item.published_at or "source time unavailable" }}{% endif %}</td>
                         <td class="py-2 pr-3 text-slate-400">{{ item.precision_label or item.precision }}</td>
                         <td class="py-2 pr-3 text-slate-400">{{ item.source }}</td>
                         <td class="py-2 pr-3 cell-wrap">{{ item.title }}</td>
@@ -411,7 +411,7 @@
             <tbody>
                 {% for release in history.releases %}
                 <tr class="border-t border-slate-700/80">
-                    <td class="py-2 pr-3 font-mono text-emerald-300">{{ release.released_at }}</td>
+                    <td class="py-2 pr-3 font-mono text-emerald-300">{% if release.local_label %}{{ release.local_label }}{% else %}{{ release.released_at }}{% endif %}</td>
                     <td class="py-2 pr-3 text-slate-400">{{ release.precision_label }}</td>
                     <td class="py-2 pr-3 cell-wrap">
                         <a href="https://musicbrainz.org/release-group/{{ release.mbid }}" class="hover:text-emerald-300">{{ release.title }}</a>

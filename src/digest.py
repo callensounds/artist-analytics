@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 from analytics import parse_utc
 from charts import CHART_LABELS, CHART_SOURCES
+from timezones import UTC, format_zoned, normalize_tz
 from compare import (
     METRICS,
     NOT_ENOUGH,
@@ -902,21 +903,43 @@ async def _build_digest(db, *, user_id: int | None, threshold: float, now: datet
     return shell
 
 
+def apply_release_zone(view: dict, tz: str = UTC) -> dict:
+    """Local clock beside each exact release. Day precision stays a date. UTC fields stay."""
+    if not isinstance(view, dict):
+        return view
+    zone = normalize_tz(tz)
+    view["viewer_timezone"] = zone
+    for artist in view.get("artists") or []:
+        if not isinstance(artist, dict):
+            continue
+        for release in artist.get("releases") or []:
+            if not isinstance(release, dict):
+                continue
+            if zone == UTC or release.get("precision") != "time" or release.get("date_only"):
+                release["released_at_local"] = ""
+                continue
+            moment = parse_utc(str(release.get("released_at") or ""))
+            release["released_at_local"] = format_zoned(moment, zone) if moment is not None else ""
+    return view
+
+
 async def build_digest(
     db,
     *,
     user_id: int | None = None,
     threshold: str | float | None = None,
     now: datetime | None = None,
+    tz: str = UTC,
 ) -> dict:
     """One user's digest. Reads only. A failed read is an empty shell, not a raise."""
     chosen = parse_threshold(threshold)
     moment = _as_utc(now)
     try:
-        return await _build_digest(db, user_id=_clean_user_id(user_id), threshold=chosen, now=moment)
+        view = await _build_digest(db, user_id=_clean_user_id(user_id), threshold=chosen, now=moment)
     except Exception as exc:
         log_read_failure("digest", exc)
-        return empty_digest(DIGEST_READ_ERROR, failed=True, threshold=chosen, now=moment)
+        view = empty_digest(DIGEST_READ_ERROR, failed=True, threshold=chosen, now=moment)
+    return apply_release_zone(view, tz)
 
 
 def _json_threshold(value: float) -> int | float:
@@ -955,6 +978,7 @@ def _artist_document(artist: dict) -> dict:
                 "mbid": item["mbid"],
                 "release_type": item["release_type"],
                 "released_at": item["released_at"],
+                "released_at_local": item.get("released_at_local") or "",
                 "precision": item["precision"],
                 "date_only": item["date_only"],
                 "note": item["note"],
@@ -1007,6 +1031,7 @@ def digest_document(view: dict) -> dict:
     overview = view.get("overview") or _empty_overview()
     return {
         "generated_at": view.get("generated_at") or "",
+        "viewer_timezone": view.get("viewer_timezone") or "UTC",
         "source": view.get("source") or "",
         "source_note": view.get("source_note") or "",
         "read_error": view.get("read_error") or "",
@@ -1065,6 +1090,7 @@ def render_digest_csv(view: dict) -> str:
         "title",
         "detail",
         "occurred_at",
+        "released_at_local",
     ]
     writer.writerow(header)
     artist_set = view.get("source") or ""
@@ -1094,6 +1120,7 @@ def render_digest_csv(view: dict) -> str:
                     "",
                     metric["text"],
                     metric["latest_at"],
+                    "",
                 ]
             )
         for release in artist["releases"]:
@@ -1118,6 +1145,7 @@ def render_digest_csv(view: dict) -> str:
                     release["title"],
                     release["note"],
                     release["released_at"],
+                    release.get("released_at_local") or "",
                 ]
             )
         for chart in artist["charts"]:
@@ -1143,6 +1171,7 @@ def render_digest_csv(view: dict) -> str:
                     chart["title"],
                     detail,
                     chart["chart_date"],
+                    "",
                 ]
             )
         for playlist in artist["playlists"]:
@@ -1167,6 +1196,7 @@ def render_digest_csv(view: dict) -> str:
                     playlist["playlist_name"],
                     playlist["url"],
                     playlist["first_seen_at"],
+                    "",
                 ]
             )
         for alert in artist["alerts"]:
@@ -1191,6 +1221,7 @@ def render_digest_csv(view: dict) -> str:
                     alert.get("window") or "",
                     alert.get("delta_text") or "",
                     alert.get("detected_at") or "",
+                    "",
                 ]
             )
     for spike in (view.get("overview") or {}).get("spikes") or []:
@@ -1215,6 +1246,7 @@ def render_digest_csv(view: dict) -> str:
                 spike.get("label") or "",
                 spike.get("text") or "",
                 spike.get("latest_at") or "",
+                "",
             ]
         )
     return buffer.getvalue()

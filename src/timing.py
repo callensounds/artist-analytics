@@ -32,6 +32,7 @@ from analytics import (
 )
 from compare import compound_select_terms, like_glob_patterns
 from db import log_read_failure, missing_table, read_many, utc_now
+from timezones import UTC, format_zoned, normalize_tz, shift, zone_label
 from export_csv import formula_safe
 
 # D1 rejects a long UNION chain. Every statement here is one SELECT. Digest's
@@ -129,10 +130,13 @@ def parse_kind(raw: str | None) -> str:
     return "all"
 
 
-def timing_path(scope: str, days: str, kind: str, export: str = "") -> str:
+def timing_path(scope: str, days: str, kind: str, export: str = "", tz: str = "") -> str:
     """Timing URL for the page or an export. The query is the view that was built."""
     suffix = f".{export}" if export in {"csv", "json"} else ""
-    query = urlencode((("scope", scope), ("days", days), ("kind", kind)))
+    pairs = [("scope", scope), ("days", days), ("kind", kind)]
+    if tz and tz != UTC:
+        pairs.append(("tz", tz))
+    query = urlencode(pairs)
     return f"/timing{suffix}?{query}"
 
 
@@ -573,26 +577,41 @@ def _options(selected: str, pairs: tuple[tuple[str, str], ...]) -> list[dict]:
     return [{"value": value, "label": label, "selected": value == selected} for value, label in pairs]
 
 
-def _chrome(scope: str, days: str, kind: str, now: datetime) -> dict:
+def _chrome(scope: str, days: str, kind: str, now: datetime, tz: str = UTC) -> dict:
     scope_pairs = (("watchlist", "Watchlist"), ("all", "All tracked"))
     day_pairs = (("90", "90 days"), ("365", "365 days"), ("all", "All stored dates"))
     kind_pairs = (("all", "Releases and posts"), ("release", "Releases"), ("post", "Posts"))
+    zone = normalize_tz(tz)
+    label = zone_label(zone)
+    if zone == UTC:
+        hour_note = HOUR_NOTE
+        weekday_note = WEEKDAY_NOTE
+    else:
+        hour_note = (
+            f"The grid counts exact timestamps in {label}. A date-only release is not given an hour. "
+            "UTC fields in the CSV and JSON are unchanged."
+        )
+        weekday_note = (
+            f"Exact times use {label}. A stored day stays on that weekday. A month or a year is not placed."
+        )
     return {
         "generated_at": utc_now(now),
         "timezone": "UTC",
+        "viewer_timezone": zone,
+        "zone_label": label,
         "scope": scope,
         "days": days,
         "kind": kind,
         "page_note": PAGE_NOTE,
-        "hour_note": HOUR_NOTE,
-        "weekday_note": WEEKDAY_NOTE,
+        "hour_note": hour_note,
+        "weekday_note": weekday_note,
         "dedupe_note": DEDUPE_NOTE,
         "window_note": WINDOW_NOTE,
         "scope_options": _options(scope, scope_pairs),
         "days_options": _options(days, day_pairs),
         "kind_options": _options(kind, kind_pairs),
-        "csv_href": timing_path(scope, days, kind, "csv"),
-        "json_href": timing_path(scope, days, kind, "json"),
+        "csv_href": timing_path(scope, days, kind, "csv", zone),
+        "json_href": timing_path(scope, days, kind, "json", zone),
         "not_enough_exact": NOT_ENOUGH_EXACT,
         "no_exact_latest": NO_EXACT_LATEST,
         "no_dated_share": NO_DATED_SHARE,
@@ -609,13 +628,14 @@ def empty_timing(
     now: datetime | None = None,
     source_note: str = "",
     empty_reason: str = "",
+    tz: str = UTC,
 ) -> dict:
     """Page shell when the database is missing or the read did not finish."""
     chosen_scope = parse_scope(scope)
     chosen_days = parse_days(days)
     chosen_kind = parse_kind(kind)
     moment = _as_utc(now)
-    view = _chrome(chosen_scope, chosen_days, chosen_kind, moment)
+    view = _chrome(chosen_scope, chosen_days, chosen_kind, moment, tz)
     if failed:
         view["csv_href"] = ""
         view["json_href"] = ""
@@ -656,9 +676,20 @@ def _insights(release_friday: int, release_dated: int, post_friday: int, post_da
 class _Tally:
     """Per-artist counters. Events are not kept once they have been counted."""
 
-    __slots__ = ("exact", "dated", "friday", "weekday", "hour", "exact_days", "latest", "latest_moment")
+    __slots__ = (
+        "exact",
+        "dated",
+        "friday",
+        "weekday",
+        "hour",
+        "exact_days",
+        "latest",
+        "latest_moment",
+        "local_hour",
+        "local_exact_days",
+    )
 
-    def __init__(self):
+    def __init__(self, local: bool = False):
         self.exact = 0
         self.dated = 0
         self.friday = 0
@@ -667,6 +698,9 @@ class _Tally:
         self.exact_days = [0] * 7
         self.latest = ""
         self.latest_moment = None
+        # Allocated only when the viewer is not on UTC.
+        self.local_hour = [0] * 24 if local else None
+        self.local_exact_days = [0] * 7 if local else None
 
 
 class _Fold:
@@ -689,18 +723,28 @@ class _Fold:
         "release_friday",
         "post_dated",
         "post_friday",
+        "viewer_tz",
+        "local_heatmap",
+        "local_weekday",
+        "local_hour",
     )
 
-    def __init__(self, artist_ids: list[int]):
+    def __init__(self, artist_ids: list[int], tz: str = UTC):
+        zone = normalize_tz(tz)
+        local = zone != UTC
+        self.viewer_tz = zone
         self.classified = 0
         self.immediate = 0
         self.dated: dict[tuple, _Event] = {}
         self.coarse_kept: dict[tuple, _Event] = {}
         self.sources: dict[str, dict] = {}
-        self.tallies = {artist_id: _Tally() for artist_id in artist_ids}
+        self.tallies = {artist_id: _Tally(local) for artist_id in artist_ids}
         self.heatmap = _zero_heatmap()
         self.weekday_counts = [0] * 7
         self.hour_counts = [0] * 24
+        self.local_heatmap = _zero_heatmap() if local else None
+        self.local_weekday = [0] * 7 if local else None
+        self.local_hour = [0] * 24 if local else None
         self.exact = 0
         self.day = 0
         self.coarse = 0
@@ -752,6 +796,7 @@ def _apply_kept(state: _Fold, event: _Event) -> None:
         ):
             tally.latest_moment = event.moment
             tally.latest = event.raw
+        _note_local(state, tally, event)
     elif event.role == "day":
         state.day += 1
         state.weekday_counts[event.weekday] += 1
@@ -759,6 +804,7 @@ def _apply_kept(state: _Fold, event: _Event) -> None:
         tally.dated += 1
         if friday:
             tally.friday += 1
+        _note_local(state, tally, event)
     else:
         return
     if event.group == "release":
@@ -818,7 +864,26 @@ def _finish_fold(state: _Fold) -> int:
     return max(collapsed, 0)
 
 
-def _artist_row(artist: dict, tally: _Tally) -> dict:
+def _note_local(state: _Fold, tally: _Tally, event: _Event) -> None:
+    """Viewer-zone buckets. Exact clocks move. A day with no clock does not."""
+    if state.local_hour is None or state.local_weekday is None or state.local_heatmap is None:
+        return
+    if event.role == "time" and event.moment is not None:
+        local = shift(event.moment, state.viewer_tz)
+        hour = local.hour
+        day = local.weekday()
+        state.local_heatmap[day][hour] += 1
+        state.local_hour[hour] += 1
+        state.local_weekday[day] += 1
+        if tally.local_hour is not None and tally.local_exact_days is not None:
+            tally.local_hour[hour] += 1
+            tally.local_exact_days[day] += 1
+        return
+    if event.role == "day" and event.weekday is not None:
+        state.local_weekday[event.weekday] += 1
+
+
+def _artist_row(artist: dict, tally: _Tally, tz: str = UTC) -> dict:
     exact = tally.exact
     dated = tally.dated
     friday = tally.friday
@@ -833,24 +898,40 @@ def _artist_row(artist: dict, tally: _Tally) -> dict:
         modal_weekday = ""
         modal_hour = ""
         modal_note = NOT_ENOUGH_EXACT
+    zone = normalize_tz(tz)
+    modal_weekday_local = ""
+    modal_hour_local = ""
+    latest_exact_local = ""
+    if zone != UTC:
+        if exact >= MODAL_MIN_EXACT and tally.local_exact_days is not None and tally.local_hour is not None:
+            local_day = peak(tally.local_exact_days, list(WEEKDAYS))
+            local_hour = peak(tally.local_hour, [f"{hour:02d}:00" for hour in range(24)])
+            modal_weekday_local = local_day["label"] if local_day else ""
+            modal_hour_local = local_hour["label"] if local_hour else ""
+        if tally.latest_moment is not None:
+            latest_exact_local = format_zoned(tally.latest_moment, zone)
     return {
         "id": artist["id"],
         "name": artist["name"],
         "exact_count": exact,
         "modal_weekday": modal_weekday,
         "modal_hour_utc": modal_hour,
+        "modal_weekday_local": modal_weekday_local,
+        "modal_hour_local": modal_hour_local,
         "modal_note": modal_note,
         "friday_count": friday,
         "dated_count": dated,
         "friday_share": f"{friday} of {dated}" if dated else "",
         "latest_exact_at": tally.latest,
+        "latest_exact_local": latest_exact_local,
         "weekday_counts": tally.weekday,
         "hour_counts": tally.hour,
     }
 
 
-def _present_heatmap(heatmap: list[list[int]]) -> list[dict]:
+def _present_heatmap(heatmap: list[list[int]], *, utc: bool = True) -> list[dict]:
     top = max((count for row in heatmap for count in row), default=0)
+    suffix = " UTC" if utc else ""
     rows = []
     for index, label in enumerate(WEEKDAYS):
         cells = []
@@ -859,7 +940,7 @@ def _present_heatmap(heatmap: list[list[int]]) -> list[dict]:
                 {
                     "hour": hour,
                     "count": count,
-                    "label": f"{hour:02d}:00 UTC",
+                    "label": f"{hour:02d}:00{suffix}",
                     "level": _level(count, top),
                 }
             )
@@ -896,8 +977,10 @@ def assemble_timing(
     release_cap_hit: bool = False,
     source_note: str = "",
     section_notes: list[str] | None = None,
+    tz: str = UTC,
 ) -> dict:
     """Charts and per-artist rows from rows already read. No database access."""
+    zone = normalize_tz(tz)
     chosen_scope = parse_scope(scope)
     chosen_days = parse_days(days)
     chosen_kind = parse_kind(kind)
@@ -918,7 +1001,7 @@ def assemble_timing(
         cleaned.append({"id": artist_id, "name": name})
         if len(cleaned) >= ARTIST_CAP:
             break
-    view = _chrome(chosen_scope, chosen_days, chosen_kind, moment)
+    view = _chrome(chosen_scope, chosen_days, chosen_kind, moment, zone)
     cap = row_cap(chosen_days)
     sightings, sighting_cap_hit = _bound_rows(sightings, cap, sighting_cap_hit)
     releases, release_cap_hit = _bound_rows(releases, cap, release_cap_hit)
@@ -945,13 +1028,14 @@ def assemble_timing(
             now=moment,
             source_note=source_note,
             empty_reason=empty_reason,
+            tz=zone,
         )
         shell["cap_notes"] = notes
         return shell
 
     allowed = {artist["id"] for artist in cleaned}
     window = _window(moment, chosen_days)
-    state = _Fold([artist["id"] for artist in cleaned])
+    state = _Fold([artist["id"] for artist in cleaned], zone)
     _consume(state, sightings, kind=chosen_kind, window=window, allowed=allowed)
     # The sighting dicts are the caller's until this function returns. Drop our
     # reference before the release pass so both tables are not live together
@@ -968,7 +1052,7 @@ def assemble_timing(
         )
 
     source_rows = [state.sources[key] for key in sorted(state.sources, key=_source_sort)]
-    artist_rows = [_artist_row(artist, state.tallies[artist["id"]]) for artist in cleaned]
+    artist_rows = [_artist_row(artist, state.tallies[artist["id"]], zone) for artist in cleaned]
     state.tallies.clear()
     artist_rows.sort(key=lambda item: (-item["exact_count"], item["name"].casefold(), item["id"]))
     exact = state.exact
@@ -985,14 +1069,19 @@ def assemble_timing(
         "coarse": coarse,
         "collapsed": collapsed,
     }
-    nonzero = [
-        {"hour": hour, "label": f"{hour:02d}:00 UTC", "count": count}
-        for hour, count in enumerate(state.hour_counts)
-        if count
-    ]
     heatmap = state.heatmap
     weekday_counts = state.weekday_counts
     hour_counts = state.hour_counts
+    # JSON and CSV keep the UTC grids. The HTML grid follows the viewer zone.
+    show_heat = state.local_heatmap if state.local_heatmap is not None else heatmap
+    show_days = state.local_weekday if state.local_weekday is not None else weekday_counts
+    show_hours = state.local_hour if state.local_hour is not None else hour_counts
+    hour_suffix = " UTC" if zone == UTC else ""
+    nonzero = [
+        {"hour": hour, "label": f"{hour:02d}:00{hour_suffix}", "count": count}
+        for hour, count in enumerate(show_hours)
+        if count
+    ]
     view.update(
         {
             "failed": False,
@@ -1003,9 +1092,9 @@ def assemble_timing(
             "cap_notes": notes,
             "counts": counts,
             "heatmap": heatmap,
-            "heatmap_rows": _present_heatmap(heatmap) if exact else [],
+            "heatmap_rows": _present_heatmap(show_heat, utc=zone == UTC) if exact else [],
             "weekday_counts": weekday_counts,
-            "weekday_bars": _present_weekday_bars(weekday_counts) if exact + day else [],
+            "weekday_bars": _present_weekday_bars(show_days) if exact + day else [],
             "hour_counts": hour_counts,
             "nonzero_hours": nonzero,
             "hour_reason": "" if exact else HOUR_EMPTY,
@@ -1109,7 +1198,7 @@ async def _load_artists(db, *, user_id: int | None, scope: str) -> tuple[list[di
     return artists, cap_hit, note
 
 
-async def _build(db, *, user_id: int | None, scope: str, days: str, kind: str, now: datetime) -> dict:
+async def _build(db, *, user_id: int | None, scope: str, days: str, kind: str, now: datetime, tz: str = UTC) -> dict:
     artists, artist_cap_hit, source_note = await _load_artists(db, user_id=user_id, scope=scope)
     if artists is None:
         return empty_timing(TIMING_READ_ERROR, failed=True, scope=scope, days=days, kind=kind, now=now)
@@ -1161,6 +1250,7 @@ async def _build(db, *, user_id: int | None, scope: str, days: str, kind: str, n
         release_cap_hit=release_cap_hit,
         source_note=source_note,
         section_notes=section_notes,
+        tz=tz,
     )
 
 
@@ -1172,6 +1262,7 @@ async def build_timing(
     days: str = "",
     kind: str = "",
     now: datetime | None = None,
+    tz: str = UTC,
 ) -> dict:
     """One timing view. Reads only. A failed read is an empty shell, not a raise."""
     chosen_scope = parse_scope(scope)
@@ -1189,6 +1280,7 @@ async def build_timing(
             days=chosen_days,
             kind=chosen_kind,
             now=moment,
+            tz=tz,
         )
     except Exception as exc:
         log_read_failure("timing", exc)
@@ -1199,6 +1291,7 @@ async def build_timing(
             days=chosen_days,
             kind=chosen_kind,
             now=moment,
+            tz=tz,
         )
 
 
@@ -1209,11 +1302,14 @@ def _artist_document(artist: dict) -> dict:
         "exact_count": artist["exact_count"],
         "modal_weekday": artist["modal_weekday"],
         "modal_hour_utc": artist["modal_hour_utc"],
+        "modal_weekday_local": artist.get("modal_weekday_local") or "",
+        "modal_hour_local": artist.get("modal_hour_local") or "",
         "modal_note": artist["modal_note"],
         "friday_count": artist["friday_count"],
         "dated_count": artist["dated_count"],
         "friday_share": artist["friday_share"],
         "latest_exact_at": artist["latest_exact_at"],
+        "latest_exact_local": artist.get("latest_exact_local") or "",
         "weekday_counts": list(artist["weekday_counts"]),
         "hour_counts": list(artist["hour_counts"]),
     }
@@ -1225,6 +1321,7 @@ def timing_document(view: dict) -> dict:
     return {
         "generated_at": view.get("generated_at") or "",
         "timezone": "UTC",
+        "viewer_timezone": view.get("viewer_timezone") or "UTC",
         "scope": view.get("scope") or "",
         "days": view.get("days") or "",
         "kind": view.get("kind") or "",
@@ -1276,11 +1373,15 @@ def timing_csv_columns() -> list[str]:
         "exact_count",
         "modal_weekday",
         "modal_hour_utc",
+        "modal_weekday_local",
+        "modal_hour_local",
         "modal_note",
         "friday_count",
         "dated_count",
         "friday_share",
         "latest_exact_at",
+        "latest_exact_local",
+        "viewer_tz",
         *[f"weekday_{name}" for name in _WEEKDAY_KEYS],
         *[f"hour_{hour:02d}" for hour in range(24)],
     ]
@@ -1317,11 +1418,15 @@ def render_timing_csv(view: dict) -> str:
                 artist["exact_count"],
                 formula_safe(artist["modal_weekday"]),
                 formula_safe(artist["modal_hour_utc"]),
+                formula_safe(artist.get("modal_weekday_local") or ""),
+                formula_safe(artist.get("modal_hour_local") or ""),
                 formula_safe(artist["modal_note"]),
                 artist["friday_count"],
                 artist["dated_count"],
                 formula_safe(artist["friday_share"]),
                 formula_safe(artist["latest_exact_at"]),
+                formula_safe(artist.get("latest_exact_local") or ""),
+                formula_safe(view.get("viewer_timezone") or "UTC"),
                 *artist["weekday_counts"],
                 *artist["hour_counts"],
             ]

@@ -48,6 +48,7 @@ dependencies = [
     { name = "python-dateutil" },
     { name = "python-multipart" },
     { name = "pytz" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -67,6 +68,7 @@ requires-dist = [
     { name = "python-dateutil" },
     { name = "python-multipart" },
     { name = "pytz" },
+    { name = "tzdata" },
 ]
 
 [package.metadata.requires-dev]

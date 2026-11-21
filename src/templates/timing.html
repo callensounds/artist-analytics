@@ -106,12 +106,12 @@
 {% endif %}
 
 <section class="timing-card">
-    <h2 class="font-semibold mb-1">Weekday and hour (UTC)</h2>
+    <h2 class="font-semibold mb-1">Weekday and hour ({{ zone_label }})</h2>
     <p class="text-xs text-slate-400 mb-3">{{ hour_note }} {{ weekday_note }}</p>
     {% if heatmap_rows %}
     <div class="data-scroll mb-4" role="region" aria-label="UTC weekday and hour counts">
         <p class="data-scroll-hint">Swipe sideways to see every hour.</p>
-        <div class="timing-heat" role="img" aria-label="Exact timestamps by UTC weekday and hour">
+        <div class="timing-heat" role="img" aria-label="Exact timestamps by weekday and hour ({{ zone_label }})">
             <div class="timing-heat-row" aria-hidden="true">
                 <span></span>
                 {% for cell in heatmap_rows[0].cells %}
@@ -191,9 +191,9 @@
         <article class="bg-slate-900/60 rounded-lg p-3">
             <h3 class="font-semibold"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></h3>
             <p class="text-sm mt-1">Exact timestamps <span class="font-mono text-emerald-300">{{ artist.exact_count }}</span></p>
-            <p class="text-sm">{% if artist.modal_note %}{{ artist.modal_note }}{% else %}{{ artist.modal_weekday }} · {{ artist.modal_hour_utc }} UTC{% endif %}</p>
+            <p class="text-sm">{% if artist.modal_note %}{{ artist.modal_note }}{% elif artist.modal_hour_local %}{{ artist.modal_weekday_local }} · {{ artist.modal_hour_local }} ({{ zone_label }}) · {{ artist.modal_hour_utc }} UTC{% else %}{{ artist.modal_weekday }} · {{ artist.modal_hour_utc }} UTC{% endif %}</p>
             <p class="text-sm">Friday {% if artist.friday_share %}{{ artist.friday_share }}{% else %}{{ no_dated_share }}{% endif %}</p>
-            <p class="timing-stamp mt-1">{% if artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</p>
+            <p class="timing-stamp mt-1">{% if artist.latest_exact_local %}{{ artist.latest_exact_local }}{% elif artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</p>
         </article>
         {% endfor %}
     </div>
@@ -205,7 +205,7 @@
                     <th class="text-left p-2 text-slate-400">Artist</th>
                     <th class="text-left p-2 text-slate-400">Exact</th>
                     <th class="text-left p-2 text-slate-400">Modal weekday</th>
-                    <th class="text-left p-2 text-slate-400">Modal hour (UTC)</th>
+                    <th class="text-left p-2 text-slate-400">Modal hour ({{ zone_label }})</th>
                     <th class="text-left p-2 text-slate-400">Friday share</th>
                     <th class="text-left p-2 text-slate-400">Latest exact timestamp</th>
                 </tr>
@@ -216,9 +216,9 @@
                     <td class="p-2"><a href="/artist/{{ artist.id }}" class="hover:text-emerald-300">{{ artist.name }}</a></td>
                     <td class="p-2 font-mono">{{ artist.exact_count }}</td>
                     <td class="p-2">{% if artist.modal_note %}{{ artist.modal_note }}{% else %}{{ artist.modal_weekday }}{% endif %}</td>
-                    <td class="p-2 font-mono">{% if artist.modal_hour_utc %}{{ artist.modal_hour_utc }} UTC{% elif artist.modal_note %}{{ artist.modal_note }}{% endif %}</td>
+                    <td class="p-2 font-mono">{% if artist.modal_hour_local %}{{ artist.modal_hour_local }} · {{ artist.modal_hour_utc }} UTC{% elif artist.modal_hour_utc %}{{ artist.modal_hour_utc }} UTC{% elif artist.modal_note %}{{ artist.modal_note }}{% endif %}</td>
                     <td class="p-2">{% if artist.friday_share %}{{ artist.friday_share }}{% else %}{{ no_dated_share }}{% endif %}</td>
-                    <td class="p-2 timing-stamp">{% if artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</td>
+                    <td class="p-2 timing-stamp">{% if artist.latest_exact_local %}{{ artist.latest_exact_local }}{% elif artist.latest_exact_at %}{{ artist.latest_exact_at }}{% else %}{{ no_exact_latest }}{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>

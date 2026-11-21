@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 from accounts import list_watched
 from analytics import WEEKDAYS, WEEKDAY_SHORT, normalize_name, parse_utc, peak, stated_precision
+from timezones import UTC, normalize_tz, shift, zone_label
 from db import log_read_failure, missing_table, parse_utc as parse_snapshot, read_many, utc_now
 from history import (
     TRACK_CURRENT_HOURS,
@@ -41,6 +42,27 @@ READ_ERROR = "Data temporarily unavailable. Stored history could not be read on 
 PAGE_NOTE = "Stored counts only. Nothing is estimated, and this page does not call providers."
 HOUR_NONE = "No exact UTC timestamp is stored. A date-only release is not given an hour."
 WEEKDAY_NONE = "No stored day or exact time is available. A month or a year is not placed on a weekday."
+
+
+def _hour_note(tz: str, truncated: bool) -> str:
+    if tz == UTC:
+        note = "Hours are UTC and use an exact timestamp only. A date-only release is not given an hour."
+    else:
+        note = (
+            f"Hours are {zone_label(tz)} and use an exact timestamp only. "
+            "A date-only release is not given an hour."
+        )
+    if truncated:
+        note += f" The local chart kept the newest {HOUR_KEY_CAP} distinct UTC hours."
+    return note
+
+
+def _weekday_note(tz: str) -> str:
+    if tz == UTC:
+        return "Weekdays use a stored day or an exact time. A month or a year is left out."
+    return (
+        f"Exact times use {zone_label(tz)}. A stored day stays on that weekday. A month or a year is left out."
+    )
 CHART_EMPTY = "No exact stored readings for this metric."
 PICK_NOTE = "Pick at least two tracked artists."
 
@@ -525,11 +547,22 @@ def _track_statement(artist_ids: list[int]) -> tuple[str, tuple]:
     return _check(sql, tuple(artist_ids))
 
 
-def _hour_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[str, tuple]:
-    """Hour buckets from a real clock only. A bare date never becomes 00."""
+# Distinct UTC hours returned for a non-UTC chart. The UTC chart stays grouped
+# into 24 buckets. 4000 is a memory cap, not a guess of missing hours.
+HOUR_KEY_CAP = 4000
+
+
+def _hour_statement(artist_ids: list[int], *, table: str, column: str, tz: str = UTC) -> tuple[str, tuple]:
+    """Hour buckets from a real clock only. A bare date never becomes 00.
+
+    UTC keeps the 24-bucket aggregate. Another zone groups by the UTC hour of
+    each stored day so Python can apply that day's DST offset. Same statement
+    count either way.
+    """
     if table not in {"content_sightings", "musicbrainz_releases"} or column not in {"published_at", "released_at"}:
         raise ValueError("unsupported timing read")
-    sql = f"""
+    if tz == UTC:
+        sql = f"""
         SELECT artist_id,
                CAST(substr({column}, 12, 2) AS INTEGER) AS hour_utc,
                COUNT(*) AS n
@@ -539,27 +572,45 @@ def _hour_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[
           AND {_clock_sql(column)}
         GROUP BY artist_id, hour_utc
     """
+        return _check(sql, tuple(artist_ids))
+    sql = f"""
+        SELECT artist_id,
+               substr({column}, 1, 13) AS hour_key,
+               COUNT(*) AS n
+        FROM {table}
+        WHERE artist_id IN ({_marks(len(artist_ids))})
+          AND precision = 'time'
+          AND {_clock_sql(column)}
+        GROUP BY artist_id, hour_key
+        ORDER BY hour_key DESC
+        LIMIT {HOUR_KEY_CAP + 1}
+    """
     return _check(sql, tuple(artist_ids))
 
 
-def _weekday_statement(artist_ids: list[int], *, table: str, column: str) -> tuple[str, tuple]:
-    """Weekday of a stored day or exact time. Month and year precision are excluded."""
+def _weekday_statement(artist_ids: list[int], *, table: str, column: str, tz: str = UTC) -> tuple[str, tuple]:
+    """Weekday of a stored day or exact time. Month and year precision are excluded.
+
+    A non-UTC view asks this statement for day precision only. Exact clocks are
+    added in Python from the hour keys, on the local weekday.
+    """
     if table not in {"content_sightings", "musicbrainz_releases"} or column not in {"published_at", "released_at"}:
         raise ValueError("unsupported timing read")
+    precision = "precision = 'day'" if tz != UTC else "precision IN ('day', 'time')"
     sql = f"""
         SELECT artist_id,
                CAST(strftime('%w', substr({column}, 1, 10)) AS INTEGER) AS dow,
                COUNT(*) AS n
         FROM {table}
         WHERE artist_id IN ({_marks(len(artist_ids))})
-          AND precision IN ('day', 'time')
+          AND {precision}
           AND {_day_prefix_sql(column)}
         GROUP BY artist_id, dow
     """
     return _check(sql, tuple(artist_ids))
 
 
-def report_statements(artist_ids: list[int], metric_key: str, now: datetime) -> list[tuple[str, tuple]]:
+def report_statements(artist_ids: list[int], metric_key: str, now: datetime, tz: str = UTC) -> list[tuple[str, tuple]]:
     """Every read the comparison batch sends. Callers keep this list free of UNION chains."""
     spec = _METRIC_BY_KEY.get(metric_key) or _METRIC_BY_KEY[DEFAULT_METRIC]
     moment = _as_utc(now)
@@ -568,6 +619,7 @@ def report_statements(artist_ids: list[int], metric_key: str, now: datetime) -> 
     start90 = _day(moment - timedelta(days=90))
     start365 = _day(moment - timedelta(days=365))
     end = _day(moment + timedelta(days=1))
+    zone = normalize_tz(tz)
     return [
         _latest_statement(artist_ids),
         *_baseline_statements(artist_ids, cutoff_7),
@@ -576,10 +628,10 @@ def report_statements(artist_ids: list[int], metric_key: str, now: datetime) -> 
         _playlist_statement(artist_ids),
         _release_statement(artist_ids, start90, start365, end),
         _track_statement(artist_ids),
-        _hour_statement(artist_ids, table="content_sightings", column="published_at"),
-        _hour_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
-        _weekday_statement(artist_ids, table="content_sightings", column="published_at"),
-        _weekday_statement(artist_ids, table="musicbrainz_releases", column="released_at"),
+        _hour_statement(artist_ids, table="content_sightings", column="published_at", tz=zone),
+        _hour_statement(artist_ids, table="musicbrainz_releases", column="released_at", tz=zone),
+        _weekday_statement(artist_ids, table="content_sightings", column="published_at", tz=zone),
+        _weekday_statement(artist_ids, table="musicbrainz_releases", column="released_at", tz=zone),
     ]
 
 
@@ -783,6 +835,35 @@ def _count_map(rows: list[dict] | None, count_key: str, time_key: str) -> dict[i
     return found
 
 
+def _parse_hour_key(value: object):
+    text = str(value or "").strip()
+    if len(text) < 13:
+        return None
+    stamp = text[:10] + "T" + text[11:13] + ":00:00Z"
+    return parse_utc(stamp)
+
+
+def _fill_local_clocks(rows: list[dict] | None, hours: dict[int, list[int]], weekdays: dict[int, list[int]], tz: str) -> None:
+    """DST-aware hour and weekday totals from grouped UTC hour keys. Day precision is not here."""
+    zone = normalize_tz(tz)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            artist_id = int(row["artist_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        count = _whole_number(row.get("n"))
+        moment = _parse_hour_key(row.get("hour_key"))
+        if count is None or moment is None:
+            continue
+        local = moment if zone == UTC else shift(moment, zone)
+        hour_bucket = hours.setdefault(artist_id, [0] * 24)
+        day_bucket = weekdays.setdefault(artist_id, [0] * 7)
+        hour_bucket[local.hour] += count
+        day_bucket[local.weekday()] += count
+
+
 def _fill_buckets(rows: list[dict] | None, buckets: dict[int, list[int]], *, width: int, column: str) -> None:
     for row in rows or []:
         if not isinstance(row, dict):
@@ -815,7 +896,7 @@ def _bars(counts: list[int], labels: list[str], *, hour: bool) -> list[dict]:
                     "hour": index,
                     "count": count,
                     "height": height,
-                    "label": f"{index:02d}:00 UTC",
+                    "label": labels[index] if index < len(labels) else f"{index:02d}:00",
                 }
             )
         else:
@@ -1008,10 +1089,11 @@ def _series_from_parts(parts: list) -> list[dict] | None:
     return rows
 
 
-async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) -> dict:
+async def _load_report(db, artists: list[dict], metric_key: str, now: datetime, tz: str = UTC) -> dict:
     artist_ids = [artist["id"] for artist in artists]
     spec = _METRIC_BY_KEY.get(metric_key) or _METRIC_BY_KEY[DEFAULT_METRIC]
-    statements = report_statements(artist_ids, spec[0], now)
+    zone = normalize_tz(tz)
+    statements = report_statements(artist_ids, spec[0], now, zone)
     base_count = len(METRICS)
     series_count = len(artist_ids)
     found = await read_many(db, statements)
@@ -1176,28 +1258,49 @@ async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) 
         rows.append({"key": key, "label": label, "cells": cells})
 
     hours: dict[int, list[int]] = {}
-    weekdays_sqlite: dict[int, list[int]] = {}
+    # Monday-indexed. UTC fills this from SQLite's Sunday=0. Other zones fill
+    # exact clocks here and add day-only rows after converting that index.
+    weekdays_monday: dict[int, list[int]] = {}
     hour_failed = hour_rows is None and hour_release_rows is None
     weekday_failed = weekday_rows is None and weekday_release_rows is None
-    if hour_rows is not None:
-        _fill_buckets(hour_rows, hours, width=24, column="hour_utc")
-    if hour_release_rows is not None:
-        _fill_buckets(hour_release_rows, hours, width=24, column="hour_utc")
+    hour_truncated = False
+    day_sqlite: dict[int, list[int]] = {}
     if weekday_rows is not None:
-        _fill_buckets(weekday_rows, weekdays_sqlite, width=7, column="dow")
+        _fill_buckets(weekday_rows, day_sqlite, width=7, column="dow")
     if weekday_release_rows is not None:
-        _fill_buckets(weekday_release_rows, weekdays_sqlite, width=7, column="dow")
+        _fill_buckets(weekday_release_rows, day_sqlite, width=7, column="dow")
+    if zone == UTC:
+        if hour_rows is not None:
+            _fill_buckets(hour_rows, hours, width=24, column="hour_utc")
+        if hour_release_rows is not None:
+            _fill_buckets(hour_release_rows, hours, width=24, column="hour_utc")
+        for artist_id, raw_days in day_sqlite.items():
+            bucket = weekdays_monday.setdefault(artist_id, [0] * 7)
+            for dow, count in enumerate(raw_days):
+                bucket[_sqlite_dow_to_monday(dow)] += count
+    else:
+        if hour_rows is not None and len(hour_rows) > HOUR_KEY_CAP:
+            hour_rows = hour_rows[:HOUR_KEY_CAP]
+            hour_truncated = True
+        if hour_release_rows is not None and len(hour_release_rows) > HOUR_KEY_CAP:
+            hour_release_rows = hour_release_rows[:HOUR_KEY_CAP]
+            hour_truncated = True
+        if hour_rows is not None:
+            _fill_local_clocks(hour_rows, hours, weekdays_monday, zone)
+        if hour_release_rows is not None:
+            _fill_local_clocks(hour_release_rows, hours, weekdays_monday, zone)
+        for artist_id, raw_days in day_sqlite.items():
+            bucket = weekdays_monday.setdefault(artist_id, [0] * 7)
+            for dow, count in enumerate(raw_days):
+                bucket[_sqlite_dow_to_monday(dow)] += count
     timing = []
-    hour_labels = [f"{hour:02d}:00 UTC" for hour in range(24)]
+    hour_labels = [f"{hour:02d}:00 UTC" for hour in range(24)] if zone == UTC else [f"{hour:02d}:00" for hour in range(24)]
     for artist in artists:
         hour_counts = hours.get(artist["id"], [0] * 24) if not hour_failed else None
-        weekday_counts = [0] * 7
-        if not weekday_failed:
-            raw_days = weekdays_sqlite.get(artist["id"], [0] * 7)
-            for dow, count in enumerate(raw_days):
-                weekday_counts[_sqlite_dow_to_monday(dow)] += count
-        else:
+        if weekday_failed:
             weekday_counts = None
+        else:
+            weekday_counts = list(weekdays_monday.get(artist["id"], [0] * 7))
         hour_total = sum(hour_counts) if hour_counts is not None else 0
         weekday_total = sum(weekday_counts) if weekday_counts is not None else 0
         timing.append(
@@ -1222,7 +1325,14 @@ async def _load_report(db, artists: list[dict], metric_key: str, now: datetime) 
         chart = {"svg": "", "note": READ_ERROR, "series": []}
     # The page banner stays clear. Only the audience table says its own read failed.
     table_note = READ_ERROR if latest_rows is None and latest_failed else ""
-    return {"rows": rows, "timing": timing, "chart": chart, "table_note": table_note}
+    return {
+        "rows": rows,
+        "timing": timing,
+        "chart": chart,
+        "table_note": table_note,
+        "hour_truncated": hour_truncated,
+        "viewer_timezone": zone,
+    }
 
 
 def _decorate(artists: list[dict], metric_key: str) -> list[dict]:
@@ -1342,6 +1452,7 @@ async def build_compare_view(
     user_id: int | None = None,
     now: datetime | None = None,
     redirect: bool = True,
+    tz: str = UTC,
 ) -> dict:
     """Artists, table, chart, and picker. Reads only.
 
@@ -1362,7 +1473,7 @@ async def build_compare_view(
     ready = len(decorated) >= 2
     report = {"rows": [], "timing": [], "chart": {"svg": "", "note": "", "series": []}, "read_error": ""}
     if ready:
-        report = await _load_report(db, decorated, metric_key, moment)
+        report = await _load_report(db, decorated, metric_key, moment, tz)
     picker = await _load_picker(
         db,
         decorated,
@@ -1409,8 +1520,9 @@ async def build_compare_view(
         "csv_href": compare_path([str(artist["id"]) for artist in decorated], csv=True) if ready else "",
         "picker": picker,
         "pick_note": "" if ready else PICK_NOTE,
-        "hour_note": "Hours are UTC and use an exact timestamp only. A date-only release is not given an hour.",
-        "weekday_note": "Weekdays use a stored day or an exact time. A month or a year is left out.",
+        "hour_note": _hour_note(normalize_tz(tz), bool(report.get("hour_truncated"))),
+        "weekday_note": _weekday_note(normalize_tz(tz)),
+        "zone_label": zone_label(normalize_tz(tz)),
         "release_note": (
             "Release counts are official MusicBrainz albums, EPs, and singles with a day or an exact time. "
             "A month or a year is not placed in the 90-day or 365-day window."
@@ -1447,6 +1559,7 @@ def empty_compare_view(message: str) -> dict:
         "pick_note": PICK_NOTE,
         "hour_note": "",
         "weekday_note": "",
+        "zone_label": "UTC",
         "release_note": "",
         "score_note": "",
         "delta_note": "",

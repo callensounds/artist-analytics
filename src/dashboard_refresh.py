@@ -64,6 +64,10 @@ def empty_patterns() -> dict:
     return {
         "hour_labels": hour_labels(),
         "weekday_labels": list(WEEKDAYS),
+        "hour_heading": "Hour of day (UTC)",
+        "weekday_heading": "Weekday (UTC)",
+        "timezone": "UTC",
+        "timezone_label": "UTC",
         "release_hours": [],
         "social_hours": [],
         "weekdays": [],
@@ -198,7 +202,14 @@ def cards_from_history(
     return cards
 
 
-def assemble_bundle(cards: list[dict], live_bundle: dict | None, live: list[str], *, stored_only: bool) -> dict:
+def assemble_bundle(
+    cards: list[dict],
+    live_bundle: dict | None,
+    live: list[str],
+    *,
+    stored_only: bool,
+    tz: str = "UTC",
+) -> dict:
     live_by = {}
     if live_bundle and live:
         live_by = {
@@ -226,10 +237,10 @@ def assemble_bundle(cards: list[dict], live_bundle: dict | None, live: list[str]
     else:
         note = "No provider was fetched on this request."
     insights = [note]
-    insights.extend(build_insights(sources))
+    insights.extend(build_insights(sources, tz))
     return {
         "sources": sources,
-        "patterns": build_patterns(sources) if sources else empty_patterns(),
+        "patterns": build_patterns(sources, tz) if sources else empty_patterns(),
         "insights": insights[:8],
     }
 

@@ -2,8 +2,9 @@
 
 A repeat load of /timing, /digest, /compare, /dashboard, or an artist page
 should not read D1 or render a template again. The key is the path, the sorted
-query string, and the user id from the validated session. The raw session
-cookie is never part of the key.
+query string, the user id from the validated session, and the viewer timezone
+(UTC, or an allowlisted IANA name from the ``tz`` query or the ``aa_tz``
+cookie). The raw session cookie is never part of the key.
 
 Two tiers:
 
@@ -28,6 +29,7 @@ from urllib.parse import parse_qsl, quote, urlencode
 
 from cache import _js_options
 from runtime import read_signed_session
+from timezones import UTC, resolved_tz_from_scope
 
 # Five minutes. Repeat bursts of the same heavy URL stay inside this window.
 PAGE_CACHE_TTL = 300
@@ -209,12 +211,13 @@ def sorted_query_string(raw: bytes | str) -> str:
     return urlencode(pairs, encoding="utf-8", errors="replace")
 
 
-def page_cache_key(path: str, query: str, user_token: str) -> str:
-    return f"{PAGE_CACHE_VERSION}\x1f{user_token}\x1f{path}\x1f{query}"
+def page_cache_key(path: str, query: str, user_token: str, tz: str = UTC) -> str:
+    zone = tz if isinstance(tz, str) and tz else UTC
+    return f"{PAGE_CACHE_VERSION}\x1f{user_token}\x1f{zone}\x1f{path}\x1f{query}"
 
 
 def cache_key_from_scope(scope) -> str | None:
-    """Path + sorted query + session user. None means do not cache this request."""
+    """Path + sorted query + session user + viewer zone. None means do not cache."""
     raw = scope.get("query_string") or b""
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "replace")
@@ -224,7 +227,11 @@ def cache_key_from_scope(scope) -> str | None:
     if not isinstance(path, str) or len(path) > 512:
         return None
     token = user_cache_token(read_signed_session(scope))
-    return page_cache_key(path, sorted_query_string(raw), token)
+    try:
+        zone = resolved_tz_from_scope(scope)
+    except Exception:
+        zone = UTC
+    return page_cache_key(path, sorted_query_string(raw), token, zone)
 
 
 def is_page_cache_get(method: str, path: str, is_heavy) -> bool:
