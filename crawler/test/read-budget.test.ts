@@ -117,4 +117,35 @@ describe("read budget", () => {
     expect(seen.some((sql) => sql.includes("metric_snapshots"))).toBe(false);
     expect(db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0016_read_indexes.sql")).toBeTruthy();
   });
+
+  it("does not throw when two fresh stores migrate a database that already has 0016", async () => {
+    const db = new DatabaseSync(":memory:");
+    await migrate(sqliteStore(db));
+    const recorded = db.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?").get(LATEST_MIGRATION) as {
+      n: number;
+    };
+    expect(recorded.n).toBe(1);
+
+    // Each isolate has its own store object. A stale read still says 0016 is missing,
+    // so both take the insert path after the other isolate has already recorded it.
+    const stale = (): Store => {
+      const inner = sqliteStore(db);
+      return {
+        async all(sql, params) {
+          return inner.all(sql, params);
+        },
+        async first(sql, params = []) {
+          if (sql.includes("schema_migrations") && params[0] === LATEST_MIGRATION) return null;
+          return inner.first(sql, params);
+        },
+        batch: (statements) => inner.batch(statements),
+      };
+    };
+    await expect(migrate(stale())).resolves.toBeUndefined();
+    await expect(migrate(stale())).resolves.toBeUndefined();
+    const after = db.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?").get(LATEST_MIGRATION) as {
+      n: number;
+    };
+    expect(after.n).toBe(1);
+  });
 });

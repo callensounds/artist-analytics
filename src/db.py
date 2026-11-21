@@ -374,7 +374,7 @@ async def migrate(db) -> None:
                     continue
                 raise
         await db.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (path.name, utc_now()),
         )
     _remember_migrated(db)
