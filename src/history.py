@@ -1777,6 +1777,7 @@ ORDER BY detected_at DESC, id DESC
 LIMIT ?
 """
 
+# idx_metric_alerts_detected is (detected_at, id). The page walks that order and stops at LIMIT.
 ALERTS_FEED_SQL = """
 SELECT artists.name AS artist_name, metric_alerts.artist_id, metric_alerts.provider,
        metric_alerts.metric, metric_alerts.window, metric_alerts.delta, metric_alerts.delta_pct,

@@ -239,8 +239,9 @@ def _release_statement(artist_ids: list[int], start_day: str, end_exclusive: str
 def _chart_statement(artist_ids: list[int], start_day: str, end_day: str) -> tuple[str, tuple]:
     """Chart rows in the window that have no earlier stored date for that title.
 
-    ``chart_entries (artist_id, chart_date)`` serves the outer range and the
-    existence check. Ordered oldest-first so the row cap keeps the debut day.
+    The existence check seeks
+    ``(artist_id, chart_source, territory, track_or_album_name, chart_date)``
+    and stops at the first older row. Ordered oldest-first so the row cap keeps the debut day.
     """
     sources = ", ".join("'" + source + "'" for source in CHART_SOURCES)
     sql = f"""

@@ -74,4 +74,47 @@ describe("read budget", () => {
     expect(latest).toContain("metric_latest");
     expect(latest).not.toContain("SCAN");
   });
+
+  it("adds the read indexes on a database that already has 0015 without replaying the snapshot backfill", async () => {
+    const db = new DatabaseSync(":memory:");
+    const store = sqliteStore(db);
+    await migrate(store);
+    for (const name of [
+      "idx_chart_entries_title_date",
+      "idx_metric_alerts_detected",
+      "idx_metric_latest_value",
+      "idx_playlist_artist_first",
+    ]) {
+      db.exec(`DROP INDEX ${name}`);
+    }
+    db.prepare("DELETE FROM schema_migrations WHERE version = ?").run("0016_read_indexes.sql");
+    const seen: string[] = [];
+    const wrapped: Store = {
+      async all(sql, params) {
+        return store.all(sql, params);
+      },
+      async first(sql, params) {
+        return store.first(sql, params);
+      },
+      async batch(statements) {
+        for (const statement of statements) seen.push(statement.sql);
+        return store.batch(statements);
+      },
+    };
+    await migrate(wrapped);
+    const names = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map(
+      (row) => row.name,
+    );
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "idx_chart_entries_title_date",
+        "idx_metric_alerts_detected",
+        "idx_metric_latest_value",
+        "idx_playlist_artist_first",
+      ]),
+    );
+    expect(seen.some((sql) => sql.includes("INSERT INTO metric_latest"))).toBe(false);
+    expect(seen.some((sql) => sql.includes("metric_snapshots"))).toBe(false);
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = ?").get("0016_read_indexes.sql")).toBeTruthy();
+  });
 });

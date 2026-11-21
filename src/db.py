@@ -258,7 +258,7 @@ class D1Database:
 
 # Bump this when a new file is added under src/migrations. A database that
 # already has this version skips the per-file probes.
-LATEST_MIGRATION = "0015_seen_without_rewrite.sql"
+LATEST_MIGRATION = "0016_read_indexes.sql"
 
 # One successful migrate per database object (or its D1 binding). The next
 # request on that isolate does not read schema_migrations again.
