@@ -223,6 +223,42 @@ def test_a_second_migrate_checks_one_version(tmp_path):
     assert calls == [(LATEST_MIGRATION,)]
 
 
+def test_stale_latest_migration_insert_does_not_throw():
+    database = SqliteDatabase(":memory:")
+
+    async def run():
+        await migrate(database)
+        recorded = await database.query_one(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?",
+            (LATEST_MIGRATION,),
+        )
+        assert recorded["n"] == 1
+
+        # Each isolate has its own database object. A stale read still says 0016 is
+        # missing, so both take the insert path after the row is already recorded.
+        def stale():
+            class StaleLatest:
+                async def query_one(self, sql, params=()):
+                    if "schema_migrations" in sql and params and params[0] == LATEST_MIGRATION:
+                        return None
+                    return await database.query_one(sql, params)
+
+                def __getattr__(self, name):
+                    return getattr(database, name)
+
+            return StaleLatest()
+
+        await migrate(stale())
+        await migrate(stale())
+        after = await database.query_one(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?",
+            (LATEST_MIGRATION,),
+        )
+        assert after["n"] == 1
+
+    asyncio.run(run())
+
+
 def test_demo_login_survives_a_d1_read_limit_and_real_users_do_not(monkeypatch, tmp_path):
     path = tmp_path / "outage.sqlite"
     monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
