@@ -2,7 +2,7 @@
 
 Public release times and post times for an artist, on Cloudflare Python Workers (FastAPI).
 
-The product difference is the timestamp itself: exact when a source publishes a clock time, and still exact about precision when it does not. Partial dates are not turned into fake hours, and missing numbers are shown as unavailable.
+The product difference is the timestamp itself: exact when a source publishes a clock time, and still exact about precision when it does not. Partial dates are not turned into fake hours, and missing numbers are shown as unavailable. A viewer can switch those clocks to a local timezone. The default remains UTC.
 
 ## What each source does
 
@@ -116,7 +116,7 @@ Paste the id into the commented `kv_namespaces` block in `wrangler.jsonc` (bindi
 
 Finished successful responses for `/timing` (including `.csv` and `.json`), `/digest` (including `.csv` and `.json`), `/compare` and `/compare.csv`, `/dashboard`, `/artist/<id>`, and `/artist/<id>/calendar` are kept for 5 minutes (`PAGE_CACHE_TTL` in `src/page_cache.py`). A repeat GET is served from that copy and does not read D1 or render the template. The first copy is an in-isolate LRU capped at 2 MiB total and 512 KiB per response (8 entries). A response over that size is rendered and not stored. The second copy is the Workers Cache API (`caches.default`) under a synthetic URL, so an isolate restart can still hit when that API is available. There is no KV binding for these pages.
 
-The cache key is a version, the full path, the full query string sorted by name, and the signed-in user (`d1:<id>` or `memory:<id>`, read from the validated session). Anonymous requests use `anon`. The raw session cookie is not in the key. Two users never share an entry, and a signed-in page is never served to an anonymous request.
+The cache key is a version, the full path, the full query string sorted by name, the signed-in user (`d1:<id>` or `memory:<id>`, read from the validated session), and the viewer timezone (`UTC`, or an allowlisted IANA name from the `tz` query or the `aa_tz` cookie). Anonymous requests use `anon`. The raw session cookie is not in the key. Two users never share an entry, a signed-in page is never served to an anonymous request, and one viewer's zone is never served to another.
 
 Only a GET that finished with status 200 and no `Set-Cookie` is stored. `/login`, `/logout`, `/signup`, `/register`, POST, redirects, and any 503 or other error are not stored. A body that says data is temporarily unavailable, or that contains a CSRF token or a flash message, is not stored. These pages include the signed-in user (or a watchlist), so the client is sent `Cache-Control: private, max-age=60`. A response that was not stored is `Cache-Control: no-store`. Neither value is `public`. `X-AA-Cache` is `hit` or `miss`.
 
@@ -159,7 +159,7 @@ Audience charts plot only exact integers (monthly listeners, followers, subscrib
 ## Caveats
 
 - MusicBrainz dates are calendar dates. The weekday chart uses day-level dates only. The catalog sample is the first 100 release groups and 100 official releases.
-- iTunes `releaseDate` is an absolute UTC time. On the US storefront it is often midnight Pacific (07:00 or 08:00 UTC). That spike is the storefront convention, not fan activity. Cloudflare egress is often answered with HTTP 429 or 403. The dashboard then shows cached albums, the public shelf, or asks you to try again shortly. A crawl records the 403 and skips iTunes for 30 minutes instead of fetching the shelf. There is no authenticated Apple API. Awaiting a JS promise from inside `except`, `finally`, or while that exception is still propagating raises `SystemError: Cannot enter a promising task from inside another running promising task` and fails the whole crawl.
+- iTunes `releaseDate` is an absolute UTC time. On the US storefront it is often midnight Pacific (07:00 or 08:00 UTC). That spike is the storefront convention, not fan activity. A local zone converts that clock and still shows the UTC value beside it. Cloudflare egress is often answered with HTTP 429 or 403. The dashboard then shows cached albums, the public shelf, or asks you to try again shortly. A crawl records the 403 and skips iTunes for 30 minutes instead of fetching the shelf. There is no authenticated Apple API. Awaiting a JS promise from inside `except`, `finally`, or while that exception is still propagating raises `SystemError: Cannot enter a promising task from inside another running promising task` and fails the whole crawl.
 - Providers run concurrently after MusicBrainz has returned URL relations. Each source has a 15 second timeout. The MusicBrainz catalog (release groups and releases) overlaps the other providers.
 - Spotify's public artist page lists albums and singles with a year. That year is kept. The page's monthly listener count is shown only when Spotify prints it. The crawler stores the Popular shelf (track id and name). Play counts on that shelf are not a 0–100 popularity score, so popularity stays empty unless `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` are both set on the crawler. Those secrets call the official top-tracks endpoint and fill popularity and album name. They are not required. Undocumented anonymous Web API token endpoints are not called. The artist page lists the stored tracks and does not keep a second comma-joined top-track metric.
 - YouTube charts the 50 most recent public uploads. Search costs quota; channel ids from MusicBrainz avoid a search when they exist.
@@ -168,11 +168,16 @@ Audience charts plot only exact integers (monthly listeners, followers, subscrib
 - Scraping public Instagram and TikTok HTML may still conflict with those sites' terms even when the request is logged-out, identified, cached, and rate-limited. Treat those two cards as best-effort.
 - There is no artist OAuth. This is a public-data view, closer to a timestamp-focused Chartmetric than to a creator login.
 
+## Viewer timezone
+
+The header has a time zone selector. `?tz=` takes an IANA name from a fixed list of music-market zones plus UTC (New York, Los Angeles, London, Seoul, Lagos, and the others in `src/timezones.py`). An unknown value is UTC and does not raise. The choice is stored in the `aa_tz` cookie. Nothing is written to D1, and no migration is involved.
+
+Only an exact clock (`precision == time`) is converted, using IANA daylight-saving rules. A day, month, or year is not given an hour and does not move to another weekday. Hour and weekday charts are labeled with the zone, for example `Hour of day (America/New_York, DST-aware)`. The UTC time stays visible next to the local one. `/timing` and `/digest` CSV and JSON keep their UTC fields and add the local time beside them. The 5-minute page cache key includes the zone.
+
 ## Next steps
 
-- Accounts are still in memory. Crawl history uses the bound D1 database.
+- Registered accounts are stored in D1 (`users`). The in-memory user list is only the demo fallback when D1 is not bound.
 - Add a new file under `src/migrations/` for any schema change. Do not edit `0001_crawl.sql`.
 - Turn on the KV `CACHE` binding in production.
 - Add the YouTube secret so that card goes live. Spotify already reads public pages without a secret.
-- Let a viewer switch Apple's clock between UTC and the storefront timezone.
 - Page further back through TikTok and Instagram than the public embed pages allow.

@@ -171,8 +171,8 @@
         <article class="bg-slate-800 border border-slate-700 rounded-2xl p-4" data-timing="{{ artist.id }}" data-hour-total="{{ artist.hour_total }}" data-weekday-total="{{ artist.weekday_total }}">
             <h3 class="font-semibold mb-2">{{ artist.name }}</h3>
             {% if artist.hour_bars %}
-            <p class="text-xs text-slate-500 mb-1">Hour of day, UTC{% if artist.hour_summary %} · {{ artist.hour_summary }}{% endif %}</p>
-            <div class="compare-hours" role="img" aria-label="UTC hour counts for {{ artist.name }}">
+            <p class="text-xs text-slate-500 mb-1">Hour of day ({{ zone_label }}){% if artist.hour_summary %} · {{ artist.hour_summary }}{% endif %}</p>
+            <div class="compare-hours" role="img" aria-label="Hour of day ({{ zone_label }}) for {{ artist.name }}">
                 {% for bar in artist.hour_bars %}
                 <div data-artist="{{ artist.id }}" data-hour="{{ bar.hour }}" data-count="{{ bar.count }}" title="{{ bar.label }}: {{ bar.count }}">
                     <span style="height: {{ bar.height }}%; background: {{ artist.color }}"></span>

@@ -1,16 +1,16 @@
 <section id="posting-patterns" class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
     <h2 class="font-semibold mb-1">Posting times</h2>
-    <p class="text-xs text-slate-400 mb-3">UTC hours and weekdays from the latest stored exact timestamps: Instagram, TikTok, YouTube, and Apple releaseDate. Year, month, and day-only rows are excluded. Apple’s US storefront time is often midnight Pacific, so a spike at 07:00 or 08:00 UTC is that convention. First seen is this app’s clock and is not used here.</p>
+    <p class="text-xs text-slate-400 mb-3">Hours and weekdays from the latest stored exact timestamps: Instagram, TikTok, YouTube, and Apple releaseDate. Year, month, and day-only rows are excluded and are not given a clock. Apple’s US storefront time is often midnight Pacific, so the UTC value stays next to the local clock. A spike at 07:00 or 08:00 UTC is that convention. First seen is this app’s clock and is not used here.</p>
     {% if history.posting.available %}
     <p class="text-sm text-slate-300">{{ history.posting.summary }}</p>
-    <p class="text-xs text-slate-500 mt-1">{{ history.posting.exact_count }} exact timestamps · buckets are UTC</p>
+    <p class="text-xs text-slate-500 mt-1">{{ history.posting.exact_count }} exact timestamps · {{ history.posting.timezone_label }}</p>
     {% if history.posting.sources %}
     <p class="text-xs text-slate-400 mt-1">
         {% for row in history.posting.sources %}{{ row.label }} {{ row.count }}{% if not loop.last %} · {% endif %}{% endfor %}
     </p>
     {% endif %}
-    <h3 class="text-sm font-medium mt-4 mb-2">Hour of day (UTC)</h3>
-    <div class="flex items-end gap-px h-24 min-w-0 border-b border-slate-700" role="img" aria-label="Exact timestamps by UTC hour">
+    <h3 class="text-sm font-medium mt-4 mb-2">{{ history.posting.hour_heading }}</h3>
+    <div class="flex items-end gap-px h-24 min-w-0 border-b border-slate-700" role="img" aria-label="{{ history.posting.hour_heading }}">
         {% for bar in history.posting.hour_bars %}
         <div class="flex-1 rounded-sm {% if bar.count %}bg-emerald-400/80{% endif %}" style="height: {{ bar.height }}%" title="{{ bar.label }} · {{ bar.count }}"></div>
         {% endfor %}
@@ -25,7 +25,7 @@
         {% endfor %}
     </ul>
     {% endif %}
-    <h3 class="text-sm font-medium mt-4 mb-2">Weekday (UTC)</h3>
+    <h3 class="text-sm font-medium mt-4 mb-2">{{ history.posting.weekday_heading }}</h3>
     <p class="text-xs text-slate-500 mb-2">Counted from the same exact timestamps. A weekday with no row stays at 0.</p>
     <ul class="posting-week grid grid-cols-7 gap-1 text-center text-sm">
         {% for bar in history.posting.weekday_bars %}

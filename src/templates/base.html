@@ -22,6 +22,9 @@
         .nav-link:hover { color: #6ee7b7; }
         .nav-user { color: #c5d0de; max-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
         .nav-cta { white-space: nowrap; flex: 0 0 auto; background: #10b981; color: #042f24; font-weight: 650; border-radius: 0.5rem; padding: 0.4rem 0.75rem; }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+        .tz-form { display: flex; align-items: center; gap: 0.35rem; flex: 0 0 auto; }
+        .tz-select { background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.5rem; font-size: 0.75rem; padding: 0.3rem 0.4rem; max-width: 8.5rem; }
         main.site-main { overflow-x: clip; }
         main section, .source-card, .page-head { min-width: 0; max-width: 100%; }
         main section > h2, main section > div > h2 { font-size: 1rem; font-weight: 650; letter-spacing: -0.015em; color: #f8fafc; }
@@ -141,6 +144,23 @@
                         <a href="/register" class="nav-cta">Get Started</a>
                     {% endif %}
                 </div>
+                {% set current_zone = viewer_zone(request) if request is defined else "UTC" %}
+                <form method="get" action="{{ request.url.path if request is defined else '/' }}" class="tz-form">
+                    {% if request is defined %}
+                    {% for key, value in request.query_params.multi_items() %}
+                    {% if key in ('a', 'b', 'c', 'd', 'metric', 'q', 'scope', 'days', 'kind', 'threshold', 'page', 'sort', 'window', 'provider', 'date', 'year', 'month', 'from', 'artist') %}
+                    <input type="hidden" name="{{ key }}" value="{{ value }}">
+                    {% endif %}
+                    {% endfor %}
+                    {% endif %}
+                    <label class="sr-only" for="viewer-tz">Time zone</label>
+                    <select id="viewer-tz" name="tz" class="tz-select" aria-label="Time zone" onchange="this.form.submit()">
+                        {% for zone in tz_choices %}
+                        <option value="{{ zone.name }}" {% if zone.name == current_zone %}selected{% endif %}>{{ zone.label }}</option>
+                        {% endfor %}
+                    </select>
+                    <button type="submit" class="sr-only">Set time zone</button>
+                </form>
             </div>
         </div>
     </nav>

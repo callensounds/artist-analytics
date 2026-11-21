@@ -7,6 +7,8 @@ import re
 from calendar import monthrange
 from datetime import datetime, timezone
 
+from timezones import UTC, hour_heading, normalize_tz, shift, weekday_heading, zone_label
+
 WEEKDAYS = [
     "Monday",
     "Tuesday",
@@ -296,7 +298,36 @@ def _dataset(platform: str, label: str, data: list[int]) -> dict | None:
     }
 
 
-def build_patterns(sources: list[dict]) -> dict:
+def _pattern_moment(item: dict) -> datetime | None:
+    """Exact clock on an item already in memory. A missing stamp is not guessed from the hour."""
+    if item.get("precision") != "time":
+        return None
+    moment = parse_utc(str(item.get("sort_key") or ""))
+    if moment is not None:
+        return moment
+    display = str(item.get("display") or "")
+    if display.endswith(" UTC") and ":" in display:
+        core = display[:-4].strip()
+        if " · " in core:
+            core = core.split(" · ")[-1].strip()
+        if len(core) >= 16:
+            return parse_utc(core[:16].replace(" ", "T") + ":00Z")
+    return None
+
+
+def _pattern_day(item: dict, moment: datetime | None, tz: str) -> int | None:
+    """Weekday index. Exact times use the viewer clock. A date with no clock stays on its day."""
+    if moment is not None:
+        local = moment if tz == UTC else shift(moment, tz)
+        return local.weekday()
+    name = item.get("weekday")
+    if name in WEEKDAYS:
+        return WEEKDAYS.index(name)
+    return None
+
+
+def build_patterns(sources: list[dict], tz: str = UTC) -> dict:
+    zone = normalize_tz(tz)
     release_hours: dict[str, list[int]] = {}
     social_hours: dict[str, list[int]] = {}
     weekdays: dict[str, list[int]] = {}
@@ -305,18 +336,32 @@ def build_patterns(sources: list[dict]) -> dict:
         platform = source["platform"]
         for item in source.get("items") or []:
             precision = item.get("precision")
-            if precision in {"time", "day"} and item.get("weekday"):
-                bucket = weekdays.setdefault(platform, empty_weekdays())
-                bucket[WEEKDAYS.index(item["weekday"])] += 1
-            if precision == "time" and item.get("hour_utc") is not None:
-                target = release_hours if platform in RELEASE_PLATFORMS else social_hours
-                if platform not in RELEASE_PLATFORMS and platform not in SOCIAL_PLATFORMS:
-                    target = social_hours
-                bucket = target.setdefault(platform, empty_hours())
-                bucket[int(item["hour_utc"])] += 1
+            moment = _pattern_moment(item)
+            if precision in {"time", "day"}:
+                day_index = _pattern_day(item, moment if precision == "time" else None, zone)
+                if day_index is not None:
+                    bucket = weekdays.setdefault(platform, empty_weekdays())
+                    bucket[day_index] += 1
+            if precision != "time":
+                continue
+            if moment is not None:
+                hour = moment.hour if zone == UTC else shift(moment, zone).hour
+            elif zone == UTC and item.get("hour_utc") is not None:
+                hour = int(item["hour_utc"])
+            else:
+                continue
+            target = release_hours if platform in RELEASE_PLATFORMS else social_hours
+            if platform not in RELEASE_PLATFORMS and platform not in SOCIAL_PLATFORMS:
+                target = social_hours
+            bucket = target.setdefault(platform, empty_hours())
+            bucket[hour] += 1
     return {
         "hour_labels": hour_labels(),
         "weekday_labels": WEEKDAYS,
+        "hour_heading": hour_heading(zone),
+        "weekday_heading": weekday_heading(zone),
+        "timezone": zone,
+        "timezone_label": zone_label(zone),
         "release_hours": [
             row
             for platform, counts in release_hours.items()
@@ -335,8 +380,10 @@ def build_patterns(sources: list[dict]) -> dict:
     }
 
 
-def build_insights(sources: list[dict]) -> list[str]:
+def build_insights(sources: list[dict], tz: str = UTC) -> list[str]:
+    zone = normalize_tz(tz)
     insights: list[str] = []
+    hour_names = [f"{hour:02d}:00 UTC" for hour in range(24)] if zone == UTC else [f"{hour:02d}:00" for hour in range(24)]
     for source in sources:
         items = source.get("items") or []
         hours = empty_hours()
@@ -344,13 +391,18 @@ def build_insights(sources: list[dict]) -> list[str]:
         partial = 0
         for item in items:
             precision = item.get("precision")
-            if precision == "time" and item.get("hour_utc") is not None:
+            moment = _pattern_moment(item) if precision == "time" else None
+            if moment is not None:
+                hours[moment.hour if zone == UTC else shift(moment, zone).hour] += 1
+            elif precision == "time" and zone == UTC and item.get("hour_utc") is not None:
                 hours[int(item["hour_utc"])] += 1
-            if precision in {"time", "day"} and item.get("weekday"):
-                days[WEEKDAYS.index(item["weekday"])] += 1
+            if precision in {"time", "day"}:
+                day_index = _pattern_day(item, moment if precision == "time" else None, zone)
+                if day_index is not None:
+                    days[day_index] += 1
             elif precision in {"month", "year"}:
                 partial += 1
-        hour_peak = peak(hours, [f"{hour:02d}:00 UTC" for hour in range(24)])
+        hour_peak = peak(hours, hour_names)
         if hour_peak:
             insights.append(
                 f"{source['label']} peaks at {hour_peak['label']} "
@@ -420,20 +472,23 @@ def stated_precision(raw: str, stated: str | None) -> str:
     return key
 
 
-def build_posting_patterns(rows: list[dict] | None, *, minimum: int = POSTING_MIN_EXACT) -> dict:
-    """UTC hour and weekday counts from Exact time rows only.
+def build_posting_patterns(rows: list[dict] | None, *, minimum: int = POSTING_MIN_EXACT, tz: str = UTC) -> dict:
+    """Hour and weekday counts from Exact time rows only.
 
     Instagram, TikTok, YouTube, and Apple releaseDate qualify. A year, month, or
     day-only value is excluded. A date with no clock is not turned into 00:00.
     Below `minimum` exact timestamps the buckets stay empty so a sample of one
-    is not drawn as a pattern.
+    is not drawn as a pattern. ``tz`` rebuckets those exact clocks. It does not
+    read the database. The default is UTC.
     """
+    zone = normalize_tz(tz)
     floor = minimum if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0 else POSTING_MIN_EXACT
     hours = empty_hours()
     days = empty_weekdays()
     per_source = {source: 0 for source in POSTING_SOURCES}
     exact = 0
     excluded = 0
+    stamps: list[dict] = []
     allowed = set(POSTING_SOURCES)
     for row in rows or []:
         if not isinstance(row, dict):
@@ -451,17 +506,26 @@ def build_posting_patterns(rows: list[dict] | None, *, minimum: int = POSTING_MI
             excluded += 1
             continue
         moment = moment.astimezone(timezone.utc)
-        hours[moment.hour] += 1
-        days[moment.weekday()] += 1
+        if zone == UTC:
+            hour = moment.hour
+            day = moment.weekday()
+        else:
+            local = shift(moment, zone)
+            hour = local.hour
+            day = local.weekday()
+        hours[hour] += 1
+        days[day] += 1
         per_source[source] += 1
         exact += 1
+        stamps.append({"source": source, "published_at": published})
     available = exact >= floor
     public_hours = hours if available else empty_hours()
     public_days = days if available else empty_weekdays()
     hour_heights = _bar_heights(public_hours)
     day_heights = _bar_heights(public_days)
+    hour_text = " UTC" if zone == UTC else ""
     hour_bars = [
-        {"label": f"{hour:02d}:00 UTC", "count": public_hours[hour], "height": hour_heights[hour]}
+        {"label": f"{hour:02d}:00{hour_text}", "count": public_hours[hour], "height": hour_heights[hour]}
         for hour in range(24)
     ]
     weekday_bars = [
@@ -503,7 +567,11 @@ def build_posting_patterns(rows: list[dict] | None, *, minimum: int = POSTING_MI
         "exact_count": exact,
         "excluded_count": excluded,
         "minimum": floor,
-        "timezone": "UTC",
+        "timezone": zone,
+        "timezone_label": zone_label(zone),
+        "hour_heading": hour_heading(zone),
+        "weekday_heading": weekday_heading(zone),
+        "exact_stamps": stamps if available else [],
         "reason": reason,
         "summary": " ".join(summary_parts),
         "hour_labels": hour_labels(),
@@ -747,9 +815,11 @@ def _release_timestamp(precision: str, moment: datetime | None, place: tuple) ->
 
 
 def _datetime_attr(item: dict) -> str:
-    stamp = str(item.get("timestamp") or "")
+    stamp = str(item.get("utc_timestamp") or item.get("timestamp") or "")
+    if " · " in stamp:
+        stamp = stamp.split(" · ")[-1].strip()
     if len(stamp) >= 16 and stamp.endswith(" UTC"):
-        date, clock = stamp[:-4].split(" ", 1)
+        date, clock = stamp[:-4].rsplit(" ", 1)
         if len(date) == 10 and len(clock) == 5:
             return f"{date}T{clock}:00Z"
     if len(stamp) == 10:

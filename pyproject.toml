@@ -9,6 +9,8 @@ dependencies = [
     "python-dateutil",
     "pytz",
     "itsdangerous",
+    # IANA data for zoneinfo. Pyodide has no system zone database.
+    "tzdata",
 ]
 
 [dependency-groups]

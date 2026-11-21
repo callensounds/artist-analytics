@@ -44,8 +44,8 @@
 
 <div class="grid lg:grid-cols-2 gap-6 mb-6">
     <section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700">
-        <h2 class="font-semibold mb-1">Release clock times</h2>
-        <p class="text-xs text-slate-400 mb-3">Apple Music is the exact release clock. Its US storefront time is often midnight Pacific, so a spike at 07:00 or 08:00 UTC is that convention. Spotify and MusicBrainz stay at the precision they publish.</p>
+        <h2 class="font-semibold mb-1">{{ patterns.hour_heading or "Hour of day (UTC)" }}</h2>
+        <p class="text-xs text-slate-400 mb-3">Apple Music is the exact release clock. Its US storefront time is often midnight Pacific, so a spike at 07:00 or 08:00 UTC is that convention, and the UTC time stays next to the local clock. Spotify and MusicBrainz stay at the precision they publish. A date with no clock is not moved.</p>
         {% if patterns.release_hours %}
         <div class="chart-frame relative h-56"><canvas id="releaseHourChart"></canvas></div>
         {% else %}
@@ -54,7 +54,7 @@
     </section>
     <section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700">
         <h2 class="font-semibold mb-1">Post clock times</h2>
-        <p class="text-xs text-slate-400 mb-3">YouTube, Instagram, and TikTok timestamps, grouped by UTC hour.</p>
+        <p class="text-xs text-slate-400 mb-3">YouTube, Instagram, and TikTok timestamps, grouped by {{ patterns.timezone_label or "UTC" }}.</p>
         {% if patterns.social_hours %}
         <div class="chart-frame relative h-56"><canvas id="socialHourChart"></canvas></div>
         {% else %}
@@ -64,8 +64,8 @@
 </div>
 
 <section class="min-w-0 bg-slate-800 rounded-2xl p-5 border border-slate-700 mb-6">
-    <h2 class="font-semibold mb-1">Day of week</h2>
-    <p class="text-xs text-slate-400 mb-3">Counted only when the source published at least a full calendar day.</p>
+    <h2 class="font-semibold mb-1">{{ patterns.weekday_heading or "Weekday (UTC)" }}</h2>
+    <p class="text-xs text-slate-400 mb-3">Exact times use the selected clock. A date with no clock stays on its published weekday. A month or a year is left out.</p>
     {% if patterns.weekdays %}
     <div class="chart-frame relative h-56"><canvas id="weekdayChart"></canvas></div>
     {% else %}

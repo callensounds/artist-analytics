@@ -32,6 +32,8 @@ from diag import diagnose
 from export_csv import load_export_rows, render_export_csv
 from graph import load_related_graph
 from analytics import (
+    WEEKDAYS,
+    build_patterns,
     empty_posting_patterns,
     empty_release_calendar,
     ensure_month_nav,
@@ -39,7 +41,10 @@ from analytics import (
     normalize_name,
     parse_calendar_month,
     parse_calendar_period,
+    parse_utc,
 )
+from timezones import TZ_CHOICES, format_zoned, resolved_tz_from_scope, shift, tz_cookie_header
+from viewer_tz import present_history
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from db import log_read_failure
 from history import (
@@ -201,11 +206,63 @@ class ReleaseHeavyMemory:
 app.add_middleware(HeavyResponseCache, is_heavy=heavy_request_path)
 app.add_middleware(ReleaseHeavyMemory)
 
+
+class RememberTimezone:
+    """Remember ``?tz=`` in a cookie. Added outside the page cache so a stored
+    response stays cacheable and the client still receives Set-Cookie.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            scope["viewer_tz"] = resolved_tz_from_scope(scope)
+            cookie = tz_cookie_header(scope)
+        except Exception:
+            scope["viewer_tz"] = "UTC"
+            cookie = None
+        if not cookie:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_cookie(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                already = False
+                for name, value in headers:
+                    raw_name = name if isinstance(name, bytes) else str(name).encode("latin-1", "replace")
+                    raw_value = value if isinstance(value, bytes) else str(value).encode("latin-1", "replace")
+                    if raw_name.lower() == b"set-cookie" and b"aa_tz=" in raw_value:
+                        already = True
+                        break
+                if not already:
+                    headers.append((b"set-cookie", cookie))
+                message = dict(message)
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cookie)
+
+
+app.add_middleware(RememberTimezone)
+
 # Keep templates next to this module. The Worker bundle includes src/, not the repo root,
 # so a ../templates path exists locally and 500s on every HTML route after deploy.
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 _CSS_PATH = Path(__file__).resolve().parent / "static" / "app.css"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+
+def _template_zone(request: Request) -> str:
+    return request.scope.get("viewer_tz") or "UTC"
+
+
+templates.env.globals["viewer_zone"] = _template_zone
+templates.env.globals["tz_choices"] = TZ_CHOICES
 
 # Browsers request /favicon.ico even when a page also links an icon.
 _FAVICON_SVG = (
@@ -341,7 +398,11 @@ def _metric_number(metric: dict) -> str | None:
     return str(metric.get("value"))
 
 
-def render_source_cards(sources: list[dict] | None) -> str:
+def _request_tz(request: Request) -> str:
+    return request.scope.get("viewer_tz") or "UTC"
+
+
+def render_source_cards(sources: list[dict] | None, tz: str = "UTC") -> str:
     """Source cards are plain strings. Jinja compiling that loop was the slow template step."""
     parts = ['<div class="source-grid">']
     for source in sources or []:
@@ -404,9 +465,16 @@ def render_source_cards(sources: list[dict] | None) -> str:
                 if url:
                     title = f'<a href="{html.escape(str(url), quote=True)}">{title}</a>'
                 detail = html.escape(str(item.get("detail") or item.get("kind") or ""))
-                display = html.escape(str(item.get("display") or ""))
+                display_text = str(item.get("display") or "")
+                weekday_name = str(item.get("weekday")) if item.get("weekday") else ""
+                if tz != "UTC" and item.get("precision") == "time":
+                    moment = parse_utc(str(item.get("sort_key") or ""))
+                    if moment is not None:
+                        display_text = format_zoned(moment, tz)
+                        weekday_name = WEEKDAYS[shift(moment, tz).weekday()]
+                display = html.escape(display_text)
                 precision = html.escape(str(item.get("precision_label") or ""))
-                weekday = html.escape(str(item.get("weekday"))) if item.get("weekday") else ""
+                weekday = html.escape(weekday_name) if weekday_name else ""
                 clock = f"{precision} · {weekday}" if weekday else precision
                 parts.append(
                     '<div class="source-item"><div class="min-w-0">'
@@ -898,6 +966,7 @@ async def _digest_view(request: Request, user: dict, threshold: str) -> dict:
                 user_id=_digest_user_id(request, user),
                 threshold=threshold,
                 now=datetime.now(timezone.utc),
+                tz=_request_tz(request),
             ),
             GROWTH_READ_TIMEOUT_S,
         )
@@ -959,6 +1028,7 @@ async def _timing_view(request: Request, user: dict, scope: str, days: str, kind
             scope=chosen_scope,
             days=chosen_days,
             kind=chosen_kind,
+            tz=_request_tz(request),
         )
     try:
         view = await asyncio.wait_for(
@@ -969,6 +1039,7 @@ async def _timing_view(request: Request, user: dict, scope: str, days: str, kind
                 days=chosen_days,
                 kind=chosen_kind,
                 now=datetime.now(timezone.utc),
+                tz=_request_tz(request),
             ),
             GROWTH_READ_TIMEOUT_S,
         )
@@ -980,6 +1051,7 @@ async def _timing_view(request: Request, user: dict, scope: str, days: str, kind
             scope=chosen_scope,
             days=chosen_days,
             kind=chosen_kind,
+            tz=_request_tz(request),
         )
     # The read is finished. Drop the binding before the template or export encodes the view.
     db = None
@@ -1174,6 +1246,7 @@ async def compare_page(
                 metric=metric,
                 query=q,
                 user_id=int(user["id"]) if request.session.get("auth") == "d1" else None,
+                tz=_request_tz(request),
             ),
             GROWTH_READ_TIMEOUT_S,
         )
@@ -1417,6 +1490,7 @@ async def artist_calendar(request: Request, key: str, year: str | None = None, m
         history["calendar"] = focus_release_month(calendar, selected_year, selected_month, artist_id)
     else:
         history["calendar"] = ensure_month_nav(calendar, artist_id)
+    history = present_history(history, _request_tz(request))
     return templates.TemplateResponse(
         request,
         "calendar.html",
@@ -1441,6 +1515,7 @@ async def artist_page(request: Request, key: str):
     subtitle = "Stored crawl history. This page does not fetch providers."
     if crawled:
         subtitle = f"Last crawled {crawled}. " + subtitle
+    history = present_history(history, _request_tz(request))
     return templates.TemplateResponse(
         request,
         "artist.html",
@@ -1451,7 +1526,7 @@ async def artist_page(request: Request, key: str):
             "subtitle": subtitle,
             "message": "",
             "history": history,
-            "deezer_card": render_source_cards([history["deezer"]]) if history.get("deezer") else "",
+            "deezer_card": render_source_cards([history["deezer"]], _request_tz(request)) if history.get("deezer") else "",
             "can_watch": request.session.get("auth") == "d1",
         },
     )
@@ -1462,6 +1537,7 @@ async def dashboard(request: Request, artist: str | None = None):
     user = await get_current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
+    tz = _request_tz(request)
     query = (artist or "").strip() or user["artist_name"]
     if len(query) > 120:
         query = query[:120]
@@ -1523,12 +1599,12 @@ async def dashboard(request: Request, artist: str | None = None):
             cards = plan["cards"] if not failed else cards_from_history(
                 history, plan["clocks"], now, [], youtube_key=youtube_key
             )
-            bundle = assemble_bundle(cards, None, [], stored_only=not failed and not live)
+            bundle = assemble_bundle(cards, None, [], stored_only=not failed and not live, tz=tz)
             if failed:
                 bundle["insights"] = ["The live refresh failed. Stored counts are shown."] + bundle["insights"]
                 bundle["insights"] = bundle["insights"][:8]
         else:
-            bundle = assemble_bundle(plan["cards"], live_bundle, live, stored_only=False)
+            bundle = assemble_bundle(plan["cards"], live_bundle, live, stored_only=False, tz=tz)
     for source in bundle.get("sources") or []:
         items = source.get("items") or []
         if len(items) > 20:
@@ -1540,6 +1616,9 @@ async def dashboard(request: Request, artist: str | None = None):
         await enqueue_task
     except Exception:
         pass
+    if tz != "UTC" and (bundle.get("patterns") or {}).get("timezone") != tz:
+        bundle["patterns"] = build_patterns(bundle.get("sources") or [], tz)
+    history = present_history(history, tz)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -1547,7 +1626,7 @@ async def dashboard(request: Request, artist: str | None = None):
             "user": user,
             "query": query,
             "sources": bundle["sources"],
-            "source_cards": render_source_cards(bundle["sources"]),
+            "source_cards": render_source_cards(bundle["sources"], tz),
             "patterns": bundle.get("patterns") or {
                 "release_hours": [],
                 "social_hours": [],
