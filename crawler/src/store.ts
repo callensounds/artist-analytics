@@ -589,7 +589,7 @@ export async function migrate(store: Store): Promise<void> {
       }
       await store.batch([
         {
-          sql: "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+          sql: "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
           params: [LATEST_MIGRATION, utcNow()],
         },
       ]);
@@ -631,7 +631,7 @@ export async function migrate(store: Store): Promise<void> {
   const have = new Set(applied.map((row) => row.version));
   const stamp = utcNow();
   const missing = MIGRATION_VERSIONS.filter((version) => !have.has(version)).map((version) => ({
-    sql: "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    sql: "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     params: [version, stamp],
   }));
   if (missing.length) await store.batch(missing);
