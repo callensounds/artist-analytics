@@ -290,8 +290,10 @@ def test_chart_summary_sql_uses_the_artist_index_and_stays_bounded():
     def detail(rows):
         return " ".join(str(row.get("detail") or "") for row in rows)
 
-    assert "idx_chart_entries_artist" in detail(summary)
-    assert "idx_chart_entries_artist" in detail(points)
+    assert "idx_chart_entries_title_date" in detail(summary)
+    assert "idx_chart_entries_title_date" in detail(points)
+    assert "SCAN chart_entries" not in detail(summary)
+    assert "SCAN chart_entries" not in detail(points)
     assert "sqlite_autoindex_chart_entries_1" in detail(latest)
     assert "sqlite_autoindex_chart_entries_1" in detail(on_date)
 

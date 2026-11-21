@@ -125,7 +125,8 @@ def test_digest_query_plans_seek_indexes(tmp_path):
     assert "idx_user_artists_user" in _plan(database, watch_sql, watch_params)
     fallback_sql, fallback_params = fallback_statement()
     fallback_plan = _plan(database, fallback_sql, fallback_params)
-    assert "metric_latest" in fallback_plan
+    assert "idx_metric_latest_value" in fallback_plan
+    assert "SCAN metric_latest" not in fallback_plan
     assert "metric_snapshots" not in fallback_plan
     snapshot_plans = 0
     for sql, params in report_statements([4, 6], NOW):
@@ -137,14 +138,18 @@ def test_digest_query_plans_seek_indexes(tmp_path):
         elif "musicbrainz_releases" in sql:
             assert "idx_mb_releases_artist" in plan
         elif "chart_entries" in sql:
-            assert "idx_chart_entries_artist" in plan
+            assert "idx_chart_entries_title_date" in plan
+            assert "sqlite_autoindex_chart_entries_1" not in plan
+            assert "SCAN chart_entries" not in plan
         elif "playlist_appearances" in sql:
-            assert "idx_playlist_artist_seen" in plan
+            assert "idx_playlist_artist_first" in plan
+            assert "SCAN playlist_appearances" not in plan
         elif "metric_alerts" in sql:
             assert "idx_metric_alerts_artist" in plan
     assert snapshot_plans == len(METRICS) * 2
     legacy_sql, legacy_params = _playlist_legacy_statement([4], window["start_stamp"], window["now_stamp"])
-    assert "idx_playlist_artist_seen" in _plan(database, legacy_sql, legacy_params)
+    assert "idx_playlist_artist_first" in _plan(database, legacy_sql, legacy_params)
+    assert "SCAN playlist_appearances" not in _plan(database, legacy_sql, legacy_params)
 
 
 def _metric(doc: dict, source: str, name: str) -> dict:

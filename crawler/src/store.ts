@@ -389,7 +389,21 @@ export function seenCutoff(now: Date, keepAliveMs = SEEN_KEEP_ALIVE_MS): string 
   return utcNow(new Date(now.getTime() - keepAliveMs));
 }
 
-export const LATEST_MIGRATION = "0015_seen_without_rewrite.sql";
+export const LATEST_MIGRATION = "0016_read_indexes.sql";
+
+// Same statements as src/migrations/0016_read_indexes.sql.
+// Applied on a database that already has 0015, without replaying the 0011 backfill.
+const READ_INDEX_SQL = [
+  `CREATE INDEX IF NOT EXISTS idx_chart_entries_title_date
+    ON chart_entries (artist_id, chart_source, territory, track_or_album_name, chart_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_metric_alerts_detected
+    ON metric_alerts (detected_at, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_metric_latest_value
+    ON metric_latest (source, metric, value)`,
+  `CREATE INDEX IF NOT EXISTS idx_playlist_artist_first
+    ON playlist_appearances (artist_id, first_seen_at)
+    WHERE playlist_id != '' AND playlist_name != ''`,
+];
 
 const MIGRATION_VERSIONS = [
   "0001_crawl.sql",
@@ -406,6 +420,7 @@ const MIGRATION_VERSIONS = [
   "0012_deezer.sql",
   "0013_deezer_playlists.sql",
   "0014_track_stats.sql",
+  "0015_seen_without_rewrite.sql",
   LATEST_MIGRATION,
 ];
 
@@ -553,14 +568,34 @@ async function ensureColumn(store: Store, table: string, column: string, ddl: st
 export async function migrate(store: Store): Promise<void> {
   const key = migrateKey(store);
   if (migrated.has(key)) return;
+  let versionsReadable = false;
   try {
     const latest = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [LATEST_MIGRATION]);
     if (latest) {
       migrated.add(key);
       return;
     }
+    versionsReadable = true;
   } catch {
     // schema_migrations does not exist on a brand new database.
+  }
+  if (versionsReadable) {
+    const previous = await store.first("SELECT version FROM schema_migrations WHERE version = ?", [
+      "0015_seen_without_rewrite.sql",
+    ]);
+    if (previous) {
+      for (const sql of READ_INDEX_SQL) {
+        await store.batch([{ sql, params: [] }]);
+      }
+      await store.batch([
+        {
+          sql: "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+          params: [LATEST_MIGRATION, utcNow()],
+        },
+      ]);
+      migrated.add(key);
+      return;
+    }
   }
   for (const statement of SCHEMA.split(";").map((part) => part.trim()).filter(Boolean)) {
     await store.batch([{ sql: statement, params: [] }]);
@@ -587,6 +622,9 @@ export async function migrate(store: Store): Promise<void> {
     "ALTER TABLE playlist_crawls ADD COLUMN absences_marked_at TEXT",
   );
   for (const sql of READ_BUDGET_SQL) {
+    await store.batch([{ sql, params: [] }]);
+  }
+  for (const sql of READ_INDEX_SQL) {
     await store.batch([{ sql, params: [] }]);
   }
   const applied = await store.all<{ version: string }>("SELECT version FROM schema_migrations");
