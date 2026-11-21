@@ -121,6 +121,12 @@ def test_csv_keeps_exact_values_and_caps_each_section():
             "release_type": "",
             "external_id": "",
             "album_name": "",
+            "best_post_slot_local": "",
+            "best_post_slot_utc": "",
+            "best_post_n": "0",
+            "best_release_slot_local": "",
+            "best_release_slot_utc": "",
+            "best_release_n": "0",
         }
     ]
     assert "1.2M" not in text

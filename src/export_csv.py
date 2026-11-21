@@ -6,6 +6,7 @@ import csv
 import io
 
 from history import _whole_number, popularity_score
+from timezones import UTC
 
 # Newest rows only. Each section stops at this cap.
 EXPORT_ROW_CAP = 5000
@@ -30,6 +31,12 @@ COLUMNS = (
     "release_type",
     "external_id",
     "album_name",
+    "best_post_slot_local",
+    "best_post_slot_utc",
+    "best_post_n",
+    "best_release_slot_local",
+    "best_release_slot_utc",
+    "best_release_n",
 )
 
 _METRIC_SQL = """
@@ -180,10 +187,19 @@ def _blank(value) -> str:
     return str(value)
 
 
-def _row(section: str, **fields: object) -> list:
+def _row(section: str, shared: dict[str, str] | None = None, **fields: object) -> list:
     values = {key: _blank(value) for key, value in fields.items()}
+    if shared:
+        values.update(shared)
     values["section"] = section
     return [values.get(column, "") for column in COLUMNS]
+
+
+def _best_cells(sightings: list[dict], releases: list[dict] | None, tz: str) -> dict[str, str]:
+    """Slot columns from the sightings and releases this export already read."""
+    from best_time import export_fields
+
+    return export_fields({"sightings": sightings, "releases": releases or []}, tz)
 
 
 def _chart_position(value: object) -> int | None:
@@ -217,11 +233,18 @@ def render_export_csv(
     charts: list[dict] | None = None,
     playlists: list[dict] | None = None,
     track_stats: list[dict] | None = None,
+    tz: str = UTC,
 ) -> str:
-    """One CSV. A metric is included only when value is an exact integer."""
+    """One CSV. A metric is included only when value is an exact integer.
+
+    Best-time columns are computed from the sightings and releases already
+    passed in. This does not read the database.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(COLUMNS)
+    header_end = buffer.tell()
+    shared = _best_cells(sightings, releases, tz)
     for row in metrics:
         number = _whole_number(row.get("value"))
         if number is None:
@@ -229,6 +252,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "metric",
+                shared,
                 captured_at=row.get("captured_at"),
                 provider=row.get("source"),
                 metric=row.get("metric"),
@@ -239,6 +263,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "sighting",
+                shared,
                 provider=row.get("source"),
                 title=row.get("title"),
                 kind=row.get("kind"),
@@ -252,6 +277,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "related",
+                shared,
                 provider="spotify",
                 first_seen_at=row.get("first_seen_at"),
                 last_seen_at=row.get("last_seen_at"),
@@ -265,6 +291,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "release",
+                shared,
                 provider="musicbrainz",
                 title=row.get("title"),
                 published_at=row.get("released_at"),
@@ -280,6 +307,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "track",
+                shared,
                 provider=row.get("source") or "spotify",
                 title=row.get("track_name") or row.get("title"),
                 value="" if score is None else score,
@@ -300,6 +328,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "chart_entries",
+                shared,
                 captured_at=chart_date,
                 provider=source,
                 metric="position",
@@ -321,6 +350,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "playlist",
+                shared,
                 provider=row.get("source") or "",
                 title=title,
                 value="" if followers is None else followers,
@@ -344,6 +374,7 @@ def render_export_csv(
         writer.writerow(
             _row(
                 "track_stat",
+                shared,
                 captured_at=captured,
                 provider=row.get("source"),
                 metric=metric,
@@ -352,6 +383,8 @@ def render_export_csv(
                 external_id=external,
             )
         )
+    if buffer.tell() == header_end:
+        writer.writerow(_row("best_time", shared))
     return buffer.getvalue()
 
 
