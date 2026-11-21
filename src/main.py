@@ -44,6 +44,7 @@ from analytics import (
     parse_utc,
 )
 from timezones import TZ_CHOICES, format_zoned, resolved_tz_from_scope, shift, tz_cookie_header
+from best_time import best_time
 from viewer_tz import present_history
 from dashboard_refresh import assemble_bundle, cards_from_history, load_dashboard_plan, queued_bundle
 from db import log_read_failure
@@ -1311,6 +1312,7 @@ async def export_artist_csv(request: Request, key: str):
         rows.get("charts") or [],
         rows.get("playlists") or [],
         rows.get("track_stats") or [],
+        tz=_request_tz(request),
     )
     filename = f"artist-{int(artist['id'])}.csv"
     return Response(
@@ -1515,7 +1517,8 @@ async def artist_page(request: Request, key: str):
     subtitle = "Stored crawl history. This page does not fetch providers."
     if crawled:
         subtitle = f"Last crawled {crawled}. " + subtitle
-    history = present_history(history, _request_tz(request))
+    tz = _request_tz(request)
+    history = present_history(history, tz)
     return templates.TemplateResponse(
         request,
         "artist.html",
@@ -1526,7 +1529,8 @@ async def artist_page(request: Request, key: str):
             "subtitle": subtitle,
             "message": "",
             "history": history,
-            "deezer_card": render_source_cards([history["deezer"]], _request_tz(request)) if history.get("deezer") else "",
+            "best_time": best_time(history, tz),
+            "deezer_card": render_source_cards([history["deezer"]], tz) if history.get("deezer") else "",
             "can_watch": request.session.get("auth") == "d1",
         },
     )
