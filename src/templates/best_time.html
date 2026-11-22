@@ -8,9 +8,13 @@
     {% endif %}
     {% if series.slot %}
     <p class="text-sm text-slate-100">Most common weekday and hour: {{ series.slot.display }}</p>
+    {% elif series.slot_message %}
+    <p class="text-sm text-slate-400">{{ series.slot_message }}</p>
     {% endif %}
     {% if series.hour %}
     <p class="text-sm text-slate-100">Most common hour: {{ series.hour.display }}</p>
+    {% elif series.hour_message %}
+    <p class="text-sm text-slate-400">{{ series.hour_message }}</p>
     {% endif %}
     {% if series.engagement %}
     <p class="text-sm text-slate-300">{{ series.engagement.text }}</p>

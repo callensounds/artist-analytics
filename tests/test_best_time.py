@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import main
-from best_time import BASIS, SLOT_MIN_EXACT, best_time, export_fields
+from best_time import BASIS, MIN_WINNER_COUNT, SLOT_MIN_EXACT, best_time, export_fields
 from crawl import reset_pool
 from db import SqliteDatabase, migrate
 from export_csv import render_export_csv
@@ -74,6 +74,7 @@ def test_insufficient_sample_has_no_slot():
     assert "weekday and hour" in four["posts"]["message"]
     assert MODAL_MIN_EXACT == 3
     assert SLOT_MIN_EXACT == 5
+    assert MIN_WINNER_COUNT == 2
 
     three = best_time(_history(_posts(_weeks(start, 3))), "UTC")
     assert three["posts"]["hour"] is not None
@@ -124,19 +125,25 @@ def test_dst_shifts_each_event_and_does_not_use_one_offset():
     assert winter["posts"]["hour"]["utc_hour"] == 23
     assert "18:00-19:00" in winter["posts"]["hour"]["display"]
 
-    mixed = best_time(
-        _history(_posts(_weeks(july, 4) + _weeks(january, 4))),
-        "America/New_York",
+    mixed_history = _history(_posts(_weeks(july, 4) + _weeks(january, 4)))
+    mixed = best_time(mixed_history, "America/New_York")
+    mixed_posts = mixed["posts"]
+    # Summer is 19:00 local and winter is 18:00 local, four each. UTC is a
+    # single 23:00 peak, but the viewer clock is tied, so nothing is named.
+    assert mixed_posts["n"] == 8
+    assert mixed_posts["hour"] is None
+    assert mixed_posts["slot"] is None
+    assert mixed_posts["engagement"] is None
+    assert mixed_posts["hour_message"] == "Not enough signal: 2 hours tied at 4 of 8 exact posts."
+    assert mixed_posts["slot_message"] == (
+        "Not enough signal: 2 weekday-and-hour slots tied at 4 of 8 exact posts."
     )
-    mixed_hour = mixed["posts"]["hour"]
-    assert mixed["posts"]["n"] == 8
-    assert mixed_hour["utc_hour"] == 23
-    assert mixed_hour["utc_count"] == 8
-    assert mixed_hour["local_hour"] == 18
-    assert mixed_hour["count"] == 4
-    assert mixed_hour["tied"] is True
-    assert "tied" in mixed_hour["display"]
-    assert "=" not in mixed_hour["display"]
+    assert "23:00" not in mixed_posts["hour_message"]
+    assert "18:00" not in mixed_posts["hour_message"]
+    mixed_fields = export_fields(mixed_history, "America/New_York")
+    assert mixed_fields["best_post_slot_local"] == ""
+    assert mixed_fields["best_post_slot_utc"] == ""
+    assert mixed_fields["best_post_n"] == "8"
 
 
 def test_utc_viewer_does_not_invent_a_local_offset():
@@ -152,22 +159,173 @@ def test_utc_viewer_does_not_invent_a_local_offset():
     assert best_time(_history(_posts(_weeks(start, 5))), "not-a-zone")["timezone"] == "UTC"
 
 
-def test_ties_pick_the_earliest_hour_and_say_so():
+def test_tied_clocks_are_not_announced():
     monday = datetime(2026, 1, 5, tzinfo=timezone.utc)
     early = _weeks(monday.replace(hour=2), 3)
     late = _weeks(monday.replace(hour=5), 3)
-    result = best_time(_history(_posts(early + late)), "UTC")
-    slot = result["posts"]["slot"]
-    hour = result["posts"]["hour"]
-    assert result["posts"]["n"] == 6
-    assert slot["local_hour"] == 2
-    assert slot["utc_hour"] == 2
+    rows = _posts(early + late)
+    for row in rows[:3]:
+        row["views"] = 30
+    history = _history(rows)
+    posts = best_time(history, "UTC")["posts"]
+    assert posts["n"] == 6
+    assert posts["slot"] is None
+    assert posts["hour"] is None
+    assert posts["engagement"] is None
+    assert posts["hour_message"] == "Not enough signal: 2 hours tied at 3 of 6 exact posts."
+    assert posts["slot_message"] == (
+        "Not enough signal: 2 weekday-and-hour slots tied at 3 of 6 exact posts."
+    )
+    assert "02:00" not in posts["hour_message"]
+    assert "05:00" not in posts["slot_message"]
+    fields = export_fields(history, "UTC")
+    assert fields["best_post_slot_local"] == ""
+    assert fields["best_post_slot_utc"] == ""
+    assert fields["best_post_n"] == "6"
+    assert "tied" not in fields["best_post_slot_local"]
+
+
+def test_distinct_hours_have_no_signal_and_empty_csv_cells():
+    start = datetime(2026, 1, 5, 0, 30, tzinfo=timezone.utc)
+    moments = [start + timedelta(days=index, hours=index) for index in range(8)]
+    rows = _posts(moments)
+    for row in rows:
+        row["views"] = 40
+    history = _history(rows)
+    posts = best_time(history, "UTC")["posts"]
+    assert posts["n"] == 8
+    assert posts["status"] == "ok"
+    assert posts["message"] == ""
+    assert posts["hour"] is None
+    assert posts["slot"] is None
+    assert posts["engagement"] is None
+    assert posts["hour_message"] == "Not enough signal: no hour repeats across 8 exact posts."
+    assert posts["slot_message"] == (
+        "Not enough signal: no weekday-and-hour slot repeats across 8 exact posts."
+    )
+    assert "00:00" not in posts["hour_message"]
+    assert "Mon" not in posts["slot_message"]
+    fields = export_fields(history, "UTC")
+    assert fields["best_post_slot_local"] == ""
+    assert fields["best_post_slot_utc"] == ""
+    assert fields["best_post_n"] == "8"
+    assert "tied" not in "".join(fields.values())
+    release_rows = [
+        {"title": f"Release {index}", "released_at": _stamp(moment), "precision": "time"}
+        for index, moment in enumerate(moments)
+    ]
+    releases = best_time(_history(releases=release_rows), "UTC")["releases"]
+    assert releases["hour"] is None
+    assert releases["slot"] is None
+    assert releases["hour_message"] == "Not enough signal: no hour repeats across 8 exact releases."
+    assert releases["slot_message"] == (
+        "Not enough signal: no weekday-and-hour slot repeats across 8 exact releases."
+    )
+    release_fields = export_fields({"sightings": [], "releases": release_rows}, "UTC")
+    assert release_fields["best_release_slot_local"] == ""
+    assert release_fields["best_release_slot_utc"] == ""
+    assert release_fields["best_release_n"] == "8"
+
+
+def test_tie_at_two_suppresses_the_hour_and_the_slot():
+    monday = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    moments = (
+        _weeks(monday.replace(hour=2), 2)
+        + _weeks(monday.replace(hour=9), 2)
+        + [monday.replace(hour=14) + timedelta(weeks=4)]
+    )
+    posts = best_time(_history(_posts(moments)), "UTC")["posts"]
+    assert posts["n"] == 5
+    assert posts["hour"] is None
+    assert posts["slot"] is None
+    assert posts["engagement"] is None
+    assert posts["message"] == ""
+    assert posts["hour_message"] == "Not enough signal: 2 hours tied at 2 of 5 exact posts."
+    assert posts["slot_message"] == (
+        "Not enough signal: 2 weekday-and-hour slots tied at 2 of 5 exact posts."
+    )
+    assert "02:00" not in posts["hour_message"]
+    assert "09:00" not in posts["slot_message"]
+
+
+def test_unique_winner_with_three_of_twelve_is_shown():
+    winners = _weeks(datetime(2026, 1, 5, 13, 15, tzinfo=timezone.utc), 3)
+    others = [
+        datetime(2026, 3, 2, hour, 10, tzinfo=timezone.utc) + timedelta(days=hour)
+        for hour in range(9)
+    ]
+    history = _history(_posts(winners + others))
+    posts = best_time(history, "UTC")["posts"]
+    assert posts["n"] == 12
+    assert posts["hour_message"] == ""
+    assert posts["slot_message"] == ""
+    hour = posts["hour"]
+    slot = posts["slot"]
+    assert hour["local_hour"] == 13
+    assert hour["utc_hour"] == 13
+    assert hour["count"] == 3
+    assert hour["total"] == 12
+    assert hour["tied"] is False
+    assert hour["utc_tied"] is False
+    assert hour["display"] == "13:00-14:00 UTC · 3 of 12 exact posts"
     assert slot["local_weekday"] == "Monday"
-    assert slot["tied"] is True
-    assert hour["tied"] is True
-    assert "tied" in slot["display"]
-    assert "02:00-03:00" in slot["display"]
-    assert "05:00-06:00" not in slot["local_label"]
+    assert slot["local_label"] == "Mon 13:00-14:00"
+    assert slot["utc_label"] == "Mon 13:00-14:00"
+    assert slot["tied"] is False
+    assert slot["display"] == "Mon 13:00-14:00 UTC · 3 of 12 exact posts"
+    fields = export_fields(history, "UTC")
+    assert fields["best_post_slot_local"] == "Mon 13:00-14:00"
+    assert fields["best_post_slot_utc"] == "Mon 13:00-14:00"
+    assert fields["best_post_n"] == "12"
+    assert "tied" not in fields["best_post_slot_local"]
+
+    pair = _weeks(datetime(2026, 1, 5, 4, 15, tzinfo=timezone.utc), 2)
+    pair.append(datetime(2026, 1, 5, 11, 15, tzinfo=timezone.utc) + timedelta(weeks=2))
+    shown = best_time(_history(_posts(pair)), "UTC")["posts"]
+    assert shown["n"] == 3
+    assert shown["hour"]["count"] == 2
+    assert shown["hour"]["local_hour"] == 4
+    assert shown["hour"]["display"] == "04:00-05:00 UTC · 2 of 3 exact posts"
+    assert shown["hour_message"] == ""
+    assert shown["slot"] is None
+
+
+def test_local_peak_is_kept_when_utc_has_no_single_peak():
+    summer = _weeks(datetime(2026, 7, 15, 0, 30, tzinfo=timezone.utc), 3)
+    winter = _weeks(datetime(2026, 1, 14, 1, 30, tzinfo=timezone.utc), 3)
+    history = _history(_posts(summer + winter))
+    posts = best_time(history, "America/New_York")["posts"]
+    assert posts["n"] == 6
+    hour = posts["hour"]
+    slot = posts["slot"]
+    assert hour["local_hour"] == 20
+    assert hour["count"] == 6
+    assert hour["utc_hour"] is None
+    assert hour["utc_label"] == ""
+    assert hour["utc_count"] is None
+    assert hour["tied"] is False
+    assert hour["utc_tied"] is True
+    assert hour["aligned"] is False
+    assert hour["display"] == (
+        "20:00-21:00 America/New_York (6 of 6 exact posts). The UTC clock has no single peak."
+    )
+    assert "00:00-01:00" not in hour["display"]
+    assert "01:00-02:00" not in hour["display"]
+    assert "tied" not in hour["display"]
+    assert slot["local_weekday"] == "Tuesday"
+    assert slot["local_label"] == "Tue 20:00-21:00"
+    assert slot["utc_label"] == ""
+    assert slot["utc_hour"] is None
+    assert slot["utc_tied"] is True
+    assert slot["display"] == (
+        "Tue 20:00-21:00 America/New_York (6 of 6 exact posts). The UTC clock has no single peak."
+    )
+    assert "Wed" not in slot["display"]
+    fields = export_fields(history, "America/New_York")
+    assert fields["best_post_slot_local"] == "Tue 20:00-21:00"
+    assert fields["best_post_slot_utc"] == ""
+    assert fields["best_post_n"] == "6"
+    assert "tied" not in fields["best_post_slot_local"]
 
 
 def test_posts_ignore_apple_and_reuse_exact_stamps_without_double_counting():
@@ -394,6 +552,8 @@ def test_artist_page_renders_the_card_without_extra_d1_statements(monkeypatch, t
     assert "Audience growth" in plain.text
     posts = plain_card.split('id="best-time-posts"', 1)[1].split('id="best-time-releases"', 1)[0]
     assert "Most common weekday and hour" in posts
+    assert "Not enough signal" not in posts
+    assert "tied, 1 of" not in plain_card
     assert len(statements) == 6, statements
     assert batches == [17, 17], batches
     assert writes == []
@@ -434,6 +594,58 @@ def test_artist_page_renders_the_card_without_extra_d1_statements(monkeypatch, t
     failed_card = _card(failed.text)
     assert "Not enough exact timestamps (n=0) to suggest a time." in failed_card
     assert "Best time to post / release" in failed.text
+
+    reset_pool()
+    monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
+
+
+def test_artist_page_says_not_enough_signal_when_every_hour_is_distinct(monkeypatch, tmp_path):
+    path = tmp_path / "best-time-signal.sqlite"
+    monkeypatch.setenv("ARTIST_ANALYTICS_SQLITE", str(path))
+    reset_pool()
+    database = SqliteDatabase(str(path))
+    start = datetime(2026, 1, 5, 0, 15, tzinfo=timezone.utc)
+
+    async def seed():
+        await migrate(database)
+        await database.execute(
+            """
+            INSERT INTO artists (name, normalized_name, origin, tracked, created_at)
+            VALUES ('Cara', 'cara', 'search', 1, '2026-01-01T00:00:00Z')
+            """
+        )
+        cara = int((await database.query_one("SELECT id FROM artists WHERE normalized_name = 'cara'"))["id"])
+        for index in range(8):
+            moment = start + timedelta(days=index, hours=index)
+            await database.execute(
+                """
+                INSERT INTO content_sightings (
+                    artist_id, source, external_id, title, kind, published_at, precision, first_seen_at
+                ) VALUES (?, 'instagram', ?, 'Clip', 'post', ?, 'time', '2026-01-01T00:00:00Z')
+                """,
+                (cara, f"ig-{index}", _stamp(moment)),
+            )
+        return cara
+
+    cara = asyncio.run(seed())
+    client = TestClient(main.app)
+    logged = client.post(
+        "/login",
+        data={"email": "artist@demo.com", "password": "demo123"},
+        follow_redirects=False,
+    )
+    assert logged.status_code == 303
+    page = client.get(f"/artist/{cara}")
+    assert page.status_code == 200
+    card = _card(page.text)
+    posts = card.split('id="best-time-posts"', 1)[1].split('id="best-time-releases"', 1)[0]
+    assert "Not enough signal: no hour repeats across 8 exact posts." in posts
+    assert "Not enough signal: no weekday-and-hour slot repeats across 8 exact posts." in posts
+    assert "Most common hour" not in posts
+    assert "Most common weekday and hour" not in posts
+    assert "00:00-01:00" not in posts
+    assert "tied, 1 of" not in card
+    assert "Median" not in posts
 
     reset_pool()
     monkeypatch.delenv("ARTIST_ANALYTICS_SQLITE", raising=False)
