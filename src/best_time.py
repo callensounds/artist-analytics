@@ -3,19 +3,24 @@
 No database access and no writes. Each exact timestamp is shifted on its own,
 so a July instant and a January instant do not share a fixed offset. A date
 with no clock is counted as excluded and is not given an hour. The result is
-a frequency of stored clocks, not an engagement score.
+a frequency of stored clocks, not an engagement score. A clock is named only
+when one bucket is strictly ahead and holds at least two events. A tie, or a
+top count of one, is not a peak and is not given a time.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from analytics import WEEKDAYS, WEEKDAY_SHORT, classify_date, parse_utc, peak
+from analytics import WEEKDAYS, WEEKDAY_SHORT, classify_date, parse_utc
 from timezones import UTC, normalize_tz, shift, zone_label
 from timing import HOUR_NOTE, MODAL_MIN_EXACT
 
 # A weekday-and-hour slot needs a wider sample than a single hour.
 SLOT_MIN_EXACT = 5
+# One bucket must be strictly ahead by at least this many events. A tie, or a
+# top count below this, is not announced as a most common clock.
+MIN_WINNER_COUNT = 2
 POST_SOURCES = frozenset({"instagram", "tiktok", "youtube"})
 # The artist page and the CSV export already cap their lists. This stops a
 # caller from walking a longer list than those reads return.
@@ -70,18 +75,12 @@ def export_fields(history: dict | None, tz: str | None = None) -> dict[str, str]
 
 
 def _csv_slot(series: dict, side: str) -> str:
+    """A slot cell. Empty when that side has no unique peak."""
     slot = series.get("slot")
     if not slot:
         return ""
-    if side == "local":
-        label = slot["local_label"]
-        tied = slot["tied"]
-    else:
-        label = slot["utc_label"]
-        tied = slot["utc_tied"]
-    if tied:
-        return f"{label} tied"
-    return label
+    label = slot["local_label"] if side == "local" else slot.get("utc_label")
+    return label or ""
 
 
 def _bounded(rows) -> list:
@@ -204,18 +203,48 @@ def _note_pair(table: list[int], index: int, utc_index: int) -> None:
         table[index] = -1
 
 
-def _winner(counts: list[int]) -> dict | None:
-    """Earliest index wins a tie, the same rule as ``analytics.peak``."""
-    found = peak(counts, [str(index) for index in range(len(counts))])
-    if found is None:
+def _top_count(counts: list[int]) -> tuple[int, int, int]:
+    """Total events, the highest bucket, and how many buckets share that height."""
+    total = sum(counts)
+    if total <= 0:
+        return 0, 0, 0
+    top = max(counts)
+    shared = sum(1 for count in counts if count == top)
+    return total, top, shared
+
+
+def _signaled_winner(counts: list[int]) -> dict | None:
+    """The unique top bucket, when it has been seen at least ``MIN_WINNER_COUNT`` times."""
+    total, top, shared = _top_count(counts)
+    if top < MIN_WINNER_COUNT or shared != 1:
         return None
-    top = found["count"]
     return {
-        "index": int(found["label"]),
+        "index": counts.index(top),
         "count": top,
-        "total": found["total"],
-        "tied": sum(1 for count in counts if count == top) > 1,
+        "total": total,
     }
+
+
+def _plural_unit(unit: str, count: int) -> str:
+    if count == 1:
+        return unit
+    if unit == "hour":
+        return "hours"
+    return f"{unit}s"
+
+
+def _no_signal_message(counts: list[int], unit: str, noun: str) -> str:
+    """Why a clock is withheld. Counts only: no hour or weekday is named."""
+    total, top, shared = _top_count(counts)
+    if top < MIN_WINNER_COUNT:
+        return f"Not enough signal: no {unit} repeats across {total} exact {noun}."
+    label = _plural_unit(unit, shared)
+    return f"Not enough signal: {shared} {label} tied at {top} of {total} exact {noun}."
+
+
+def _utc_is_tied(counts: list[int]) -> bool:
+    _total, top, shared = _top_count(counts)
+    return top >= MIN_WINNER_COUNT and shared > 1
 
 
 def _span(hour: int) -> str:
@@ -252,54 +281,47 @@ def _clock_text(
     zone: str,
     *,
     aligned: bool,
-    local_tied: bool,
-    utc_tied: bool,
     local_count: int,
-    utc_count: int,
+    utc_count: int | None,
     total: int,
     noun: str,
     utc_suffix: str,
 ) -> str:
+    """Viewer clock first. A UTC side with no unique peak is not given a time."""
     local_share = _share(local_count, total, noun)
-    utc_share = _share(utc_count, total, noun)
     if zone == UTC:
         body = f"{utc_label} {utc_suffix}".rstrip()
-        if local_tied or utc_tied:
-            return f"{body} (tied, {utc_share})"
-        return f"{body} · {utc_share}"
+        return f"{body} · {local_share}"
+    if utc_count is None:
+        return f"{local_label} {zone} ({local_share}). The UTC clock has no single peak."
+    utc_share = _share(utc_count, total, noun)
     if aligned and local_count == utc_count:
         body = f"{local_label} {zone} = {utc_label} {utc_suffix}".rstrip()
-        if local_tied or utc_tied:
-            return f"{body} (tied, {local_share})"
         return f"{body} · {local_share}"
-    local_bit = f"{local_label} {zone}"
     utc_bit = f"{utc_label} {utc_suffix}".rstrip()
-    if local_tied:
-        local_bit += " (tied)"
-    if utc_tied:
-        utc_bit += " (tied)"
-    return f"{local_bit} ({local_share}). {utc_bit} ({utc_share})."
+    return f"{local_label} {zone} ({local_share}). {utc_bit} ({utc_share})."
 
 
-def _hour_result(local_hours, utc_hours, hour_pair, zone: str, noun: str) -> dict | None:
-    local = _winner(local_hours)
-    utc = _winner(utc_hours)
-    if local is None or utc is None:
-        return None
+def _hour_result(local_hours, utc_hours, hour_pair, zone: str, noun: str) -> tuple[dict | None, str]:
+    local = _signaled_winner(local_hours)
+    if local is None:
+        return None, _no_signal_message(local_hours, "hour", noun)
+    utc = _signaled_winner(utc_hours)
     paired = hour_pair[local["index"]]
-    aligned = paired >= 0 and paired == utc["index"]
+    aligned = utc is not None and paired >= 0 and paired == utc["index"]
     local_label = _span(local["index"])
-    utc_label = _span(utc["index"])
+    utc_label = _span(utc["index"]) if utc is not None else ""
+    utc_count = utc["count"] if utc is not None else None
     return {
         "local_hour": local["index"],
-        "utc_hour": utc["index"],
+        "utc_hour": utc["index"] if utc is not None else None,
         "count": local["count"],
-        "utc_count": utc["count"],
+        "utc_count": utc_count,
         "total": local["total"],
-        "tied": local["tied"],
-        "utc_tied": utc["tied"],
+        "tied": False,
+        "utc_tied": _utc_is_tied(utc_hours),
         "share": _share(local["count"], local["total"], noun),
-        "utc_share": _share(utc["count"], utc["total"], noun),
+        "utc_share": _share(utc["count"], utc["total"], noun) if utc is not None else "",
         "local_label": local_label,
         "utc_label": utc_label,
         "aligned": aligned,
@@ -308,42 +330,52 @@ def _hour_result(local_hours, utc_hours, hour_pair, zone: str, noun: str) -> dic
             utc_label,
             zone,
             aligned=aligned,
-            local_tied=local["tied"],
-            utc_tied=utc["tied"],
             local_count=local["count"],
-            utc_count=utc["count"],
+            utc_count=utc_count,
             total=local["total"],
             noun=noun,
             utc_suffix="UTC",
         ),
-    }
+    }, ""
 
 
-def _slot_result(local_slots, utc_slots, slot_pair, zone: str, noun: str) -> dict | None:
-    local = _winner(local_slots)
-    utc = _winner(utc_slots)
-    if local is None or utc is None:
-        return None
+def _slot_result(local_slots, utc_slots, slot_pair, zone: str, noun: str) -> tuple[dict | None, str]:
+    local = _signaled_winner(local_slots)
+    if local is None:
+        return None, _no_signal_message(local_slots, "weekday-and-hour slot", noun)
+    utc = _signaled_winner(utc_slots)
     local_day, local_hour = divmod(local["index"], 24)
-    utc_day, utc_hour = divmod(utc["index"], 24)
-    paired = slot_pair[local["index"]]
-    aligned = paired >= 0 and paired == utc["index"]
     local_label = f"{WEEKDAY_SHORT[local_day]} {_span(local_hour)}"
-    utc_label = f"{WEEKDAY_SHORT[utc_day]} {_span(utc_hour)}"
+    if utc is None:
+        utc_hour = None
+        utc_label = ""
+        utc_count = None
+        utc_share = ""
+        utc_weekday = None
+        utc_weekday_short = None
+    else:
+        utc_day, utc_hour = divmod(utc["index"], 24)
+        utc_label = f"{WEEKDAY_SHORT[utc_day]} {_span(utc_hour)}"
+        utc_count = utc["count"]
+        utc_share = _share(utc["count"], utc["total"], noun)
+        utc_weekday = WEEKDAYS[utc_day]
+        utc_weekday_short = WEEKDAY_SHORT[utc_day]
+    paired = slot_pair[local["index"]]
+    aligned = utc is not None and paired >= 0 and paired == utc["index"]
     return {
         "local_weekday": WEEKDAYS[local_day],
         "local_weekday_short": WEEKDAY_SHORT[local_day],
         "local_hour": local_hour,
-        "utc_weekday": WEEKDAYS[utc_day],
-        "utc_weekday_short": WEEKDAY_SHORT[utc_day],
+        "utc_weekday": utc_weekday,
+        "utc_weekday_short": utc_weekday_short,
         "utc_hour": utc_hour,
         "count": local["count"],
-        "utc_count": utc["count"],
+        "utc_count": utc_count,
         "total": local["total"],
-        "tied": local["tied"],
-        "utc_tied": utc["tied"],
+        "tied": False,
+        "utc_tied": _utc_is_tied(utc_slots),
         "share": _share(local["count"], local["total"], noun),
-        "utc_share": _share(utc["count"], utc["total"], noun),
+        "utc_share": utc_share,
         "local_label": local_label,
         "utc_label": utc_label,
         "aligned": aligned,
@@ -352,15 +384,13 @@ def _slot_result(local_slots, utc_slots, slot_pair, zone: str, noun: str) -> dic
             utc_label,
             zone,
             aligned=aligned,
-            local_tied=local["tied"],
-            utc_tied=utc["tied"],
             local_count=local["count"],
-            utc_count=utc["count"],
+            utc_count=utc_count,
             total=local["total"],
             noun=noun,
             utc_suffix="UTC",
         ),
-    }
+    }, ""
 
 
 def _median_line(view_buckets, like_buckets, hour_index: int, zone: str, label: str) -> dict | None:
@@ -419,8 +449,14 @@ def _summarize(events, zone: str, noun: str, *, excluded: int, engagement: bool)
                 view_buckets[local_hour].append(found[1])
             elif found is not None:
                 like_buckets[local_hour].append(found[1])
-    hour = _hour_result(local_hours, utc_hours, hour_pair, zone, noun) if n >= MODAL_MIN_EXACT else None
-    slot = _slot_result(local_slots, utc_slots, slot_pair, zone, noun) if n >= SLOT_MIN_EXACT else None
+    hour = None
+    hour_message = ""
+    slot = None
+    slot_message = ""
+    if n >= MODAL_MIN_EXACT:
+        hour, hour_message = _hour_result(local_hours, utc_hours, hour_pair, zone, noun)
+    if n >= SLOT_MIN_EXACT:
+        slot, slot_message = _slot_result(local_slots, utc_slots, slot_pair, zone, noun)
     if n >= SLOT_MIN_EXACT:
         status = "ok"
         message = ""
@@ -430,6 +466,7 @@ def _summarize(events, zone: str, noun: str, *, excluded: int, engagement: bool)
             message = f"Not enough exact timestamps (n={n}) to suggest a time."
         else:
             message = f"Not enough exact timestamps (n={n}) to suggest a weekday and hour."
+    # The median describes the announced hour. A withheld hour has no line.
     median = None
     if engagement and hour is not None:
         median = _median_line(view_buckets, like_buckets, hour["local_hour"], zone, hour["local_label"])
@@ -440,5 +477,7 @@ def _summarize(events, zone: str, noun: str, *, excluded: int, engagement: bool)
         "message": message,
         "slot": slot,
         "hour": hour,
+        "slot_message": slot_message,
+        "hour_message": hour_message,
         "engagement": median,
     }
